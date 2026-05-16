@@ -28,7 +28,7 @@ async function getRendererOrThrow(rendererQuery, timeoutMs, rendererIp) {
     if (!byIp) {
       throw new Error(`Could not resolve renderer at ${rendererIp}.`);
     }
-    return { renderer: byIp, renderers: [byIp] };
+    return { renderer: byIp, renderers: [byIp], rendererAddress: rendererIp };
   }
 
   const renderers = await discoverRenderers(timeoutMs);
@@ -42,7 +42,16 @@ async function getRendererOrThrow(rendererQuery, timeoutMs, rendererIp) {
     throw new Error(`Renderer not found: "${rendererQuery}". Available: ${names}`);
   }
 
-  return { renderer, renderers };
+  // Extract IP from renderer's device description location URL
+  let rendererAddress = null;
+  if (renderer.location) {
+    const urlMatch = renderer.location.match(/http:\/\/([^:]+):/);
+    if (urlMatch) {
+      rendererAddress = urlMatch[1];
+    }
+  }
+
+  return { renderer, renderers, rendererAddress };
 }
 
 function validateDirectoryOrThrow(directoryPath) {
@@ -469,10 +478,28 @@ program
       const mediaDirs = await resolveInitialMediaDirectories(options.dir);
       const isFirstRun = mediaDirs.length === 0;
 
+      // Discover renderer first to determine correct network interface
+      const { renderer, rendererAddress } = await getRendererOrThrow(
+        options.renderer,
+        Number(options.timeout),
+        options.rendererIp,
+      );
+
+      // Auto-detect media server host if not provided
+      let mediaHost = options.host;
+      if (!mediaHost && rendererAddress && rendererAddress !== 'localhost') {
+        const { getLocalIPForRenderer } = require('./utils/network');
+        const detectedHost = getLocalIPForRenderer(rendererAddress);
+        if (detectedHost) {
+          mediaHost = detectedHost;
+          console.log(`Auto-detected media server host: ${mediaHost} (on same subnet as ${rendererAddress})`);
+        }
+      }
+
       mediaServer = new MediaServer({
         rootDirs: mediaDirs,
         port: Number(options.port),
-        host: options.host,
+        host: mediaHost,
         transcoding: {
           enabled: options.transcode,
           forceTranscode: options.forceTranscode,
@@ -482,11 +509,6 @@ program
       });
 
       const mediaInfo = await mediaServer.start();
-      const { renderer } = await getRendererOrThrow(
-        options.renderer,
-        Number(options.timeout),
-        options.rendererIp,
-      );
 
       uiServer = createCastUiServer({
         mediaServer,

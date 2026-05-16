@@ -28,6 +28,36 @@ function getLocalIPv4() {
   return '127.0.0.1';
 }
 
+function getLocalIPForRenderer(rendererIp) {
+  if (!rendererIp || rendererIp === 'localhost' || rendererIp === '127.0.0.1') {
+    return null;
+  }
+
+  const interfaces = os.networkInterfaces();
+  const rendererOctets = rendererIp.split('.');
+  if (rendererOctets.length !== 4) {
+    return null;
+  }
+
+  const rendererSubnet = rendererOctets.slice(0, 3).join('.');
+
+  // Find a local IP on the same subnet as the renderer
+  for (const iface of Object.values(interfaces)) {
+    for (const address of iface || []) {
+      if (address.family === 'IPv4' && !address.internal) {
+        const localOctets = address.address.split('.');
+        const localSubnet = localOctets.slice(0, 3).join('.');
+        if (localSubnet === rendererSubnet) {
+          return address.address;
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
 module.exports = {
   getLocalIPv4,
+  getLocalIPForRenderer,
 };
