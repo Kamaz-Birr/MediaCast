@@ -22,14 +22,15 @@ function extractMovieTitle(filename) {
   return cleaned;
 }
 
-function fetchFromTmdb(movieTitle) {
+function fetchFromTmdb(title, isSeries = false) {
   const apiKey = process.env.TMDB_API_KEY || 'REDACTED_TMDB_KEY';
   if (!apiKey) {
     return Promise.resolve(null);
   }
 
-  const encodedTitle = encodeURIComponent(movieTitle);
-  const url = `https://api.themoviedb.org/3/search/movie?api_key=${apiKey}&query=${encodedTitle}`;
+  const encodedTitle = encodeURIComponent(title);
+  const typePath = isSeries ? 'tv' : 'movie';
+  const url = `https://api.themoviedb.org/3/search/${typePath}?api_key=${apiKey}&query=${encodedTitle}`;
 
   return new Promise((resolve) => {
     https
@@ -44,8 +45,10 @@ function fetchFromTmdb(movieTitle) {
             const result = parsed.results && parsed.results[0];
             if (result && result.poster_path) {
               resolve({
-                title: result.title,
-                year: result.release_date ? result.release_date.split('-')[0] : null,
+                title: isSeries ? result.name : result.title,
+                year: isSeries
+                  ? (result.first_air_date ? result.first_air_date.split('-')[0] : null)
+                  : (result.release_date ? result.release_date.split('-')[0] : null),
                 posterUrl: `https://image.tmdb.org/t/p/w400${result.poster_path}`,
                 plot: result.overview || null,
                 imdbRating: null,
@@ -65,14 +68,15 @@ function fetchFromTmdb(movieTitle) {
   });
 }
 
-function fetchFromOmdb(movieTitle) {
+function fetchFromOmdb(title, isSeries = false) {
   const apiKey = process.env.OMDB_API_KEY || 'REDACTED_OMDB_KEY';
   if (!apiKey) {
     return Promise.resolve(null);
   }
 
-  const encodedTitle = encodeURIComponent(movieTitle);
-  const url = `https://www.omdbapi.com/?apikey=${apiKey}&t=${encodedTitle}&type=movie`;
+  const encodedTitle = encodeURIComponent(title);
+  const omdbType = isSeries ? 'series' : 'movie';
+  const url = `https://www.omdbapi.com/?apikey=${apiKey}&t=${encodedTitle}&type=${omdbType}`;
 
   return new Promise((resolve) => {
     https
@@ -107,26 +111,132 @@ function fetchFromOmdb(movieTitle) {
   });
 }
 
+function fetchEpisodeFromTmdb(seriesTitle, seasonNumber, episodeNumber) {
+  const apiKey = process.env.TMDB_API_KEY || 'REDACTED_TMDB_KEY';
+  if (!apiKey || !Number.isFinite(seasonNumber) || !Number.isFinite(episodeNumber)) {
+    return Promise.resolve(null);
+  }
+
+  const encodedTitle = encodeURIComponent(seriesTitle);
+  const searchUrl = `https://api.themoviedb.org/3/search/tv?api_key=${apiKey}&query=${encodedTitle}`;
+
+  return new Promise((resolve) => {
+    https
+      .get(searchUrl, (res) => {
+        let data = '';
+        res.on('data', (chunk) => {
+          data += chunk;
+        });
+        res.on('end', () => {
+          try {
+            const parsed = JSON.parse(data);
+            const show = parsed.results && parsed.results[0];
+            if (!show || !show.id) {
+              resolve(null);
+              return;
+            }
+
+            const detailsUrl = `https://api.themoviedb.org/3/tv/${show.id}/season/${seasonNumber}/episode/${episodeNumber}?api_key=${apiKey}`;
+            https
+              .get(detailsUrl, (detailsRes) => {
+                let detailsData = '';
+                detailsRes.on('data', (chunk) => {
+                  detailsData += chunk;
+                });
+                detailsRes.on('end', () => {
+                  try {
+                    const episode = JSON.parse(detailsData);
+                    if (episode && episode.name) {
+                      resolve({
+                        title: episode.name,
+                        year: episode.air_date ? episode.air_date.split('-')[0] : null,
+                        posterUrl: episode.still_path ? `https://image.tmdb.org/t/p/w500${episode.still_path}` : null,
+                        plot: episode.overview || null,
+                        imdbRating: episode.vote_average ? String(Math.round(episode.vote_average * 10) / 10) : null,
+                      });
+                    } else {
+                      resolve(null);
+                    }
+                  } catch {
+                    resolve(null);
+                  }
+                });
+              })
+              .on('error', () => {
+                resolve(null);
+              });
+          } catch {
+            resolve(null);
+          }
+        });
+      })
+      .on('error', () => {
+        resolve(null);
+      });
+  });
+}
+
+function fetchEpisodeFromOmdb(seriesTitle, seasonNumber, episodeNumber) {
+  const apiKey = process.env.OMDB_API_KEY || 'REDACTED_OMDB_KEY';
+  if (!apiKey || !Number.isFinite(seasonNumber) || !Number.isFinite(episodeNumber)) {
+    return Promise.resolve(null);
+  }
+
+  const encodedTitle = encodeURIComponent(seriesTitle);
+  const url = `https://www.omdbapi.com/?apikey=${apiKey}&t=${encodedTitle}&Season=${seasonNumber}&Episode=${episodeNumber}`;
+
+  return new Promise((resolve) => {
+    https
+      .get(url, (res) => {
+        let data = '';
+        res.on('data', (chunk) => {
+          data += chunk;
+        });
+        res.on('end', () => {
+          try {
+            const parsed = JSON.parse(data);
+            if (parsed.Response === 'True') {
+              resolve({
+                title: parsed.Title || null,
+                year: parsed.Released && parsed.Released !== 'N/A' ? String(parsed.Released).trim().slice(-4) : null,
+                posterUrl: parsed.Poster && parsed.Poster !== 'N/A' ? parsed.Poster : null,
+                plot: parsed.Plot && parsed.Plot !== 'N/A' ? parsed.Plot : null,
+                imdbRating: parsed.imdbRating && parsed.imdbRating !== 'N/A' ? parsed.imdbRating : null,
+              });
+            } else {
+              resolve(null);
+            }
+          } catch {
+            resolve(null);
+          }
+        });
+      })
+      .on('error', () => {
+        resolve(null);
+      });
+  });
+}
+
 function getPlaceholderPosterUrl() {
   // Return a data URI for a placeholder poster image (100x150 gradient)
   return 'data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 300 450%22%3E%3Cdefs%3E%3ClinearGradient id=%22grad%22 x1=%220%25%22 y1=%220%25%22 x2=%22100%25%22 y2=%22100%25%22%3E%3Cstop offset=%220%25%22 style=%22stop-color:%238B7355;stop-opacity:1%22 /%3E%3Cstop offset=%22100%25%22 style=%22stop-color:%23D2B48C;stop-opacity:1%22 /%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width=%22300%22 height=%22450%22 fill=%22url(%23grad)%22/%3E%3Ctext x=%2250%25%22 y=%2250%25%22 dominant-baseline=%22middle%22 text-anchor=%22middle%22 font-size=%2224%22 fill=%22%23fff%22 font-family=%22Arial%22%3E[No Poster]%3C/text%3E%3C/svg%3E';
 }
 
-async function fetchMovieMetadata(movieTitle) {
-  const cacheKey = movieTitle.toLowerCase();
+async function fetchTitleMetadata(title, isSeries = false) {
+  const cacheKey = `${isSeries ? 'series' : 'movie'}:${title.toLowerCase()}`;
 
   if (metadataCache.has(cacheKey)) {
     return metadataCache.get(cacheKey);
   }
 
   // TMDB is preferred for poster availability, OMDB for IMDb rating and plot.
-  const tmdbMetadata = await fetchFromTmdb(movieTitle);
-  const omdbMetadata = await fetchFromOmdb(movieTitle);
+  const tmdbMetadata = await fetchFromTmdb(title, isSeries);
+  const omdbMetadata = await fetchFromOmdb(title, isSeries);
 
   let metadata = null;
   if (tmdbMetadata || omdbMetadata) {
     metadata = {
-      title: (tmdbMetadata && tmdbMetadata.title) || (omdbMetadata && omdbMetadata.title) || movieTitle,
+      title: (tmdbMetadata && tmdbMetadata.title) || (omdbMetadata && omdbMetadata.title) || title,
       year: (tmdbMetadata && tmdbMetadata.year) || (omdbMetadata && omdbMetadata.year) || null,
       posterUrl: (tmdbMetadata && tmdbMetadata.posterUrl) || (omdbMetadata && omdbMetadata.posterUrl) || getPlaceholderPosterUrl(),
       plot: (omdbMetadata && omdbMetadata.plot) || (tmdbMetadata && tmdbMetadata.plot) || null,
@@ -139,7 +249,7 @@ async function fetchMovieMetadata(movieTitle) {
   if (!metadata) {
     // Return placeholder if no metadata found from either API
     const placeholder = {
-      title: movieTitle,
+      title,
       posterUrl: getPlaceholderPosterUrl(),
       plot: null,
       imdbRating: null,
@@ -150,6 +260,35 @@ async function fetchMovieMetadata(movieTitle) {
     metadataCache.set(cacheKey, placeholder);
     return placeholder;
   }
+
+  metadataCache.set(cacheKey, metadata);
+  return metadata;
+}
+
+async function fetchMovieMetadata(movieTitle) {
+  return fetchTitleMetadata(movieTitle, false);
+}
+
+async function fetchSeriesMetadata(seriesTitle) {
+  return fetchTitleMetadata(seriesTitle, true);
+}
+
+async function fetchEpisodeMetadata(seriesTitle, seasonNumber, episodeNumber, fallbackTitle = null) {
+  const cacheKey = `episode:${seriesTitle.toLowerCase()}:s${seasonNumber}:e${episodeNumber}`;
+  if (metadataCache.has(cacheKey)) {
+    return metadataCache.get(cacheKey);
+  }
+
+  const tmdbEpisode = await fetchEpisodeFromTmdb(seriesTitle, seasonNumber, episodeNumber);
+  const omdbEpisode = await fetchEpisodeFromOmdb(seriesTitle, seasonNumber, episodeNumber);
+
+  const metadata = {
+    title: (omdbEpisode && omdbEpisode.title) || (tmdbEpisode && tmdbEpisode.title) || fallbackTitle || `Episode ${episodeNumber}`,
+    year: (omdbEpisode && omdbEpisode.year) || (tmdbEpisode && tmdbEpisode.year) || null,
+    posterUrl: (omdbEpisode && omdbEpisode.posterUrl) || (tmdbEpisode && tmdbEpisode.posterUrl) || null,
+    plot: (omdbEpisode && omdbEpisode.plot) || (tmdbEpisode && tmdbEpisode.plot) || null,
+    imdbRating: (omdbEpisode && omdbEpisode.imdbRating) || null,
+  };
 
   metadataCache.set(cacheKey, metadata);
   return metadata;
@@ -173,6 +312,8 @@ async function fetchMetadataForLibrary(mediaItems) {
 
 module.exports = {
   fetchMovieMetadata,
+  fetchSeriesMetadata,
+  fetchEpisodeMetadata,
   fetchMetadataForLibrary,
   extractMovieTitle,
 };

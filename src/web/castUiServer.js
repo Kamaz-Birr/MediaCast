@@ -3,7 +3,12 @@ const fs = require('fs');
 const path = require('path');
 const { buildDidlLite } = require('../dlna/metadata');
 const { setAvTransportUri, play, stop, getTransportInfo } = require('../upnp/soap');
-const { fetchMovieMetadata, extractMovieTitle } = require('./metadataFetcher');
+const {
+  fetchMovieMetadata,
+  fetchSeriesMetadata,
+  fetchEpisodeMetadata,
+  extractMovieTitle,
+} = require('./metadataFetcher');
 
 function sendJson(res, statusCode, payload) {
   res.statusCode = statusCode;
@@ -27,6 +32,95 @@ function isLikelyMovie(media) {
   const ext = path.extname(media.filePath).toLowerCase();
   const videoExts = new Set(['.mp4', '.mkv', '.avi', '.mov', '.m4v', '.ts', '.m2ts', '.mts']);
   return videoExts.has(ext);
+}
+
+const CATEGORY_MOVIES = 'movies';
+const CATEGORY_TV_SHOWS = 'tv-shows';
+const CATEGORY_ANIME_MOVIES = 'anime-movies';
+const CATEGORY_ANIME_SHOWS = 'anime-shows';
+
+function splitPathParts(filePath) {
+  return path.resolve(filePath).split(/[\\/]+/).filter(Boolean);
+}
+
+function categoryFromPath(filePath) {
+  const parts = splitPathParts(filePath);
+  const lowerParts = parts.map((part) => part.toLowerCase());
+
+  if (lowerParts.includes('anime shows')) {
+    return CATEGORY_ANIME_SHOWS;
+  }
+  if (lowerParts.includes('tv shows')) {
+    return CATEGORY_TV_SHOWS;
+  }
+  if (lowerParts.includes('anime')) {
+    return CATEGORY_ANIME_MOVIES;
+  }
+  if (lowerParts.includes('movies')) {
+    return CATEGORY_MOVIES;
+  }
+
+  return CATEGORY_MOVIES;
+}
+
+function extractSeriesName(filePath, category) {
+  const parts = splitPathParts(filePath);
+  const lowerParts = parts.map((part) => part.toLowerCase());
+  const folderName = category === CATEGORY_ANIME_SHOWS ? 'anime shows' : 'tv shows';
+  const index = lowerParts.indexOf(folderName);
+
+  if (index >= 0 && parts[index + 1]) {
+    return safeBasename(parts[index + 1]);
+  }
+
+  return safeBasename(path.basename(path.dirname(filePath)));
+}
+
+function extractSeasonEpisodeInfo(filePath) {
+  const filename = path.basename(filePath, path.extname(filePath));
+  const normalized = filename.replace(/[._-]+/g, ' ');
+
+  let seasonNumber = null;
+  let episodeNumber = null;
+
+  let match = normalized.match(/\bS(\d{1,2})\s*E(\d{1,3})\b/i);
+  if (match) {
+    seasonNumber = Number(match[1]);
+    episodeNumber = Number(match[2]);
+  } else {
+    match = normalized.match(/\b(\d{1,2})x(\d{1,3})\b/i);
+    if (match) {
+      seasonNumber = Number(match[1]);
+      episodeNumber = Number(match[2]);
+    } else {
+      const parent = path.basename(path.dirname(filePath));
+      const seasonFromFolder = parent.match(/season\s*(\d{1,2})/i);
+      if (seasonFromFolder) {
+        seasonNumber = Number(seasonFromFolder[1]);
+      }
+
+      const episodeFromName = normalized.match(/\bE(?:pisode)?\s*(\d{1,3})\b/i)
+        || normalized.match(/\b(?:Ep|Episode)\s*(\d{1,3})\b/i);
+      if (episodeFromName) {
+        episodeNumber = Number(episodeFromName[1]);
+      }
+    }
+  }
+
+  const seasonLabel = Number.isFinite(seasonNumber)
+    ? `Season ${String(seasonNumber).padStart(2, '0')}`
+    : 'Season Unknown';
+
+  const seasonSort = Number.isFinite(seasonNumber) ? seasonNumber : 999;
+  const episodeSort = Number.isFinite(episodeNumber) ? episodeNumber : 9999;
+
+  return {
+    seasonLabel,
+    seasonNumber,
+    episodeNumber,
+    seasonSort,
+    episodeSort,
+  };
 }
 
 function buildPageHtml(rendererName) {
@@ -109,6 +203,38 @@ function buildPageHtml(rendererName) {
       flex-wrap: wrap;
     }
 
+    .categories {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 16px;
+    }
+
+    .category-btn {
+      border: 1px solid var(--stroke);
+      border-radius: 999px;
+      background: rgba(15, 23, 42, 0.62);
+      color: var(--text);
+      padding: 10px 14px;
+      font-size: 0.82rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      cursor: pointer;
+      transition: all 160ms ease;
+    }
+
+    .category-btn.active {
+      background: rgba(251, 146, 60, 0.18);
+      border-color: rgba(251, 146, 60, 0.8);
+      color: #fed7aa;
+    }
+
+    .category-btn:hover {
+      border-color: rgba(255, 255, 255, 0.45);
+      transform: translateY(-1px);
+    }
+
     .neu-btn {
       background: rgba(255, 255, 255, 0.03);
       box-shadow: 6px 6px 12px rgba(0, 0, 0, 0.4), -6px -6px 12px rgba(255, 255, 255, 0.04);
@@ -138,6 +264,10 @@ function buildPageHtml(rendererName) {
 
     .neu-btn.danger {
       color: #fca5a5;
+    }
+
+    .neu-btn.secondary {
+      color: #93c5fd;
     }
 
     .status {
@@ -274,6 +404,53 @@ function buildPageHtml(rendererName) {
       color: #64748b;
     }
 
+    .group-section {
+      width: 100%;
+      margin-bottom: 34px;
+    }
+
+    .group-title {
+      margin: 0 0 14px;
+      color: #cbd5e1;
+      font-size: 1.3rem;
+      font-weight: 800;
+      letter-spacing: 0.01em;
+    }
+
+    .group-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 20px;
+    }
+
+    .episodes-block {
+      width: 100%;
+      margin-top: 20px;
+      padding-top: 16px;
+      border-top: 1px solid rgba(148, 163, 184, 0.25);
+    }
+
+    .episodes-title {
+      margin: 0 0 12px;
+      color: #cbd5e1;
+      font-size: 1.05rem;
+      font-weight: 700;
+      letter-spacing: 0.01em;
+    }
+
+    .season-section {
+      margin: 0 0 26px;
+    }
+
+    .season-title {
+      margin: 0 0 12px;
+      color: #93c5fd;
+      font-size: 1rem;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+    }
+
     @media (max-width: 920px) {
       body { padding: 14px; }
       .topbar { align-items: flex-start; }
@@ -297,20 +474,45 @@ function buildPageHtml(rendererName) {
       <div class="controls">
         <button class="neu-btn" id="refreshBtn">Rescan Library</button>
         <button class="neu-btn" id="addFolderBtn">Add Media Folder</button>
+        <button class="neu-btn secondary" id="backBtn" style="display:none">Back</button>
         <button class="neu-btn danger" id="stopBtn">Stop Cast</button>
       </div>
     </header>
+
+    <div class="categories" id="categoryTabs">
+      <button class="category-btn active" data-category="movies">Movies</button>
+      <button class="category-btn" data-category="tv-shows">TV Shows</button>
+      <button class="category-btn" data-category="anime-movies">Anime Movies</button>
+      <button class="category-btn" data-category="anime-shows">Anime Shows</button>
+    </div>
 
     <div class="status" id="statusBox">Loading media library...</div>
     <section id="grid" class="grid"></section>
   </div>
 
   <script>
+    const CATEGORY_LABELS = {
+      'movies': 'Movies',
+      'tv-shows': 'TV Shows',
+      'anime-movies': 'Anime Movies',
+      'anime-shows': 'Anime Shows',
+    };
+
+    let currentCategory = 'movies';
+    let currentGroupedData = [];
+    let selectedShowName = null;
+    let expandedSeasonName = null;
     const statusBox = document.getElementById('statusBox');
     const grid = document.getElementById('grid');
+    const categoryTabs = document.getElementById('categoryTabs');
     const refreshBtn = document.getElementById('refreshBtn');
     const addFolderBtn = document.getElementById('addFolderBtn');
+    const backBtn = document.getElementById('backBtn');
     const stopBtn = document.getElementById('stopBtn');
+
+    function isShowCategory(category) {
+      return category === 'tv-shows' || category === 'anime-shows';
+    }
 
     function setStatus(message, isError) {
       statusBox.textContent = message;
@@ -331,7 +533,7 @@ function buildPageHtml(rendererName) {
       return value.toFixed(value >= 10 || unit === 0 ? 0 : 1) + ' ' + units[unit];
     }
 
-    function createEmptyState(noFolders) {
+    function createEmptyState(noFolders, category) {
       const empty = document.createElement('div');
       empty.className = 'empty';
 
@@ -341,13 +543,15 @@ function buildPageHtml(rendererName) {
 
       const main = document.createElement('div');
       main.className = 'main';
-      main.textContent = noFolders ? 'Your library is empty' : 'No movies found';
+      main.textContent = noFolders
+        ? 'Your library is empty'
+        : 'No titles found in ' + (CATEGORY_LABELS[category] || 'this category');
 
       const sub = document.createElement('div');
       sub.className = 'sub';
       sub.textContent = noFolders
         ? 'Click "Add Media Folder" to select your default media directory.'
-        : 'Click "Rescan Library" to refresh your selected media folders.';
+        : 'Place files under the expected folder names (Movies, TV Shows, Anime, Anime Shows) and click "Rescan Library".';
 
       empty.appendChild(icon);
       empty.appendChild(main);
@@ -376,15 +580,7 @@ function buildPageHtml(rendererName) {
       }
     }
 
-    function renderItems(items, noFolders) {
-      grid.innerHTML = '';
-
-      if (!items.length) {
-        grid.appendChild(createEmptyState(noFolders));
-        return;
-      }
-
-      for (const item of items) {
+    function createMovieCard(item) {
         const card = document.createElement('article');
         card.className = 'movie-card';
 
@@ -441,33 +637,358 @@ function buildPageHtml(rendererName) {
 
         card.addEventListener('click', () => castItem(item, playButton));
         card.appendChild(overlay);
-        grid.appendChild(card);
+        return card;
+    }
+
+    function getGroupRepresentative(group) {
+      if (!group) return null;
+      if (Array.isArray(group.seasons) && group.seasons.length > 0) {
+        for (const season of group.seasons) {
+          if (season.items && season.items.length > 0) {
+            return season.items[0];
+          }
+        }
       }
+      return (group.items && group.items[0]) || null;
+    }
+
+    function getGroupEpisodeCount(group) {
+      if (!group) return 0;
+      if (Array.isArray(group.seasons) && group.seasons.length > 0) {
+        return group.seasons.reduce((total, season) => total + ((season.items || []).length), 0);
+      }
+      return (group.items || []).length;
+    }
+
+    function getSeasonRepresentative(season) {
+      return (season && season.items && season.items[0]) || null;
+    }
+
+    function setBackButton(visible, label) {
+      backBtn.style.display = visible ? 'inline-flex' : 'none';
+      backBtn.textContent = label || 'Back';
+    }
+
+    function createShowCard(group) {
+      const representative = getGroupRepresentative(group);
+      const card = document.createElement('article');
+      card.className = 'movie-card';
+
+      const posterUrl = group.posterUrl || (representative && representative.posterUrl);
+      if (posterUrl) {
+        const img = document.createElement('img');
+        img.src = posterUrl;
+        img.alt = group.displayTitle || group.name;
+        img.onerror = () => {
+          img.remove();
+          const fallback = document.createElement('div');
+          fallback.className = 'placeholder';
+          fallback.textContent = '▶';
+          card.insertBefore(fallback, card.firstChild);
+        };
+        card.appendChild(img);
+      } else {
+        const fallback = document.createElement('div');
+        fallback.className = 'placeholder';
+        fallback.textContent = '▶';
+        card.appendChild(fallback);
+      }
+
+      const overlay = document.createElement('div');
+      overlay.className = 'movie-overlay';
+
+      const title = document.createElement('h3');
+      title.className = 'movie-title';
+      title.textContent = group.displayTitle || group.name;
+
+      const meta = document.createElement('div');
+      meta.className = 'movie-meta';
+      const metaParts = [];
+      if (group.year || (representative && representative.year)) metaParts.push(group.year || representative.year);
+      if (group.imdbRating || (representative && representative.imdbRating)) {
+        metaParts.push('IMDb ' + (group.imdbRating || representative.imdbRating) + '/10');
+      }
+      metaParts.push(getGroupEpisodeCount(group) + ' episodes');
+      meta.textContent = metaParts.join(' • ');
+
+      const plot = document.createElement('p');
+      plot.className = 'movie-plot';
+      plot.textContent = group.plot || (representative && representative.plot) || 'No synopsis available for this show.';
+
+      const viewButton = document.createElement('button');
+      viewButton.className = 'neu-btn';
+      viewButton.textContent = 'View';
+      viewButton.addEventListener('click', (event) => {
+        event.stopPropagation();
+        selectedShowName = group.name;
+        expandedSeasonName = null;
+        renderSelectedShowPage();
+      });
+
+      overlay.appendChild(title);
+      overlay.appendChild(meta);
+      overlay.appendChild(plot);
+      overlay.appendChild(viewButton);
+
+      card.addEventListener('click', () => {
+        selectedShowName = group.name;
+        expandedSeasonName = null;
+        renderSelectedShowPage();
+      });
+      card.appendChild(overlay);
+      return card;
+    }
+
+    function createSeasonCard(showName, season) {
+      const representative = getSeasonRepresentative(season);
+      const card = document.createElement('article');
+      card.className = 'movie-card';
+
+      if (representative && representative.posterUrl) {
+        const img = document.createElement('img');
+        img.src = representative.posterUrl;
+        img.alt = season.name;
+        img.onerror = () => {
+          img.remove();
+          const fallback = document.createElement('div');
+          fallback.className = 'placeholder';
+          fallback.textContent = '▶';
+          card.insertBefore(fallback, card.firstChild);
+        };
+        card.appendChild(img);
+      } else {
+        const fallback = document.createElement('div');
+        fallback.className = 'placeholder';
+        fallback.textContent = '▶';
+        card.appendChild(fallback);
+      }
+
+      const overlay = document.createElement('div');
+      overlay.className = 'movie-overlay';
+
+      const title = document.createElement('h3');
+      title.className = 'movie-title';
+      title.textContent = season.name;
+
+      const meta = document.createElement('div');
+      meta.className = 'movie-meta';
+      meta.textContent = ((season.items || []).length) + ' episodes';
+
+      const plot = document.createElement('p');
+      plot.className = 'movie-plot';
+      plot.textContent = expandedSeasonName === season.name
+        ? 'Click to hide episodes.'
+        : 'Click to view all episodes in this season.';
+
+      const viewButton = document.createElement('button');
+      viewButton.className = 'neu-btn';
+      viewButton.textContent = 'Episodes';
+      viewButton.addEventListener('click', (event) => {
+        event.stopPropagation();
+        expandedSeasonName = expandedSeasonName === season.name ? null : season.name;
+        renderSelectedShowPage();
+      });
+
+      overlay.appendChild(title);
+      overlay.appendChild(meta);
+      overlay.appendChild(plot);
+      overlay.appendChild(viewButton);
+
+      card.addEventListener('click', () => {
+        expandedSeasonName = expandedSeasonName === season.name ? null : season.name;
+        renderSelectedShowPage();
+      });
+      card.appendChild(overlay);
+      return card;
+    }
+
+    function renderItems(items, noFolders, category, container) {
+      const target = container || grid;
+      target.innerHTML = '';
+
+      if (!items.length) {
+        target.appendChild(createEmptyState(noFolders, category));
+        return;
+      }
+
+      for (const item of items) {
+        target.appendChild(createMovieCard(item));
+      }
+    }
+
+    function renderGroupedItems(groups, noFolders, category) {
+      grid.innerHTML = '';
+
+      if (!groups.length) {
+        grid.appendChild(createEmptyState(noFolders, category));
+        return;
+      }
+
+      for (const group of groups) {
+        grid.appendChild(createShowCard(group));
+      }
+    }
+
+    function renderSelectedShowPage() {
+      if (!selectedShowName) {
+        renderGroupedItems(currentGroupedData, false, currentCategory);
+        setBackButton(false);
+        return;
+      }
+
+      const selected = currentGroupedData.find((group) => group.name === selectedShowName);
+      if (!selected) {
+        selectedShowName = null;
+        renderGroupedItems(currentGroupedData, false, currentCategory);
+        setBackButton(false);
+        return;
+      }
+
+      setBackButton(true, 'Back to ' + (CATEGORY_LABELS[currentCategory] || 'Shows'));
+      grid.innerHTML = '';
+
+      const section = document.createElement('section');
+      section.className = 'group-section';
+
+      const showTitle = document.createElement('h2');
+      showTitle.className = 'group-title';
+      showTitle.textContent = selected.displayTitle || selected.name;
+      section.appendChild(showTitle);
+
+      const seasonGrid = document.createElement('div');
+      seasonGrid.className = 'group-grid';
+      const seasons = Array.isArray(selected.seasons) ? selected.seasons : [];
+      for (const season of seasons) {
+        seasonGrid.appendChild(createSeasonCard(selected.name, season));
+      }
+      section.appendChild(seasonGrid);
+
+      if (expandedSeasonName) {
+        const expandedSeason = seasons.find((season) => season.name === expandedSeasonName);
+        if (expandedSeason) {
+          const episodesBlock = document.createElement('div');
+          episodesBlock.className = 'episodes-block';
+
+          const episodesTitle = document.createElement('h3');
+          episodesTitle.className = 'episodes-title';
+          episodesTitle.textContent = expandedSeason.name + ' Episodes';
+
+          const episodesGrid = document.createElement('div');
+          episodesGrid.className = 'group-grid';
+          for (const item of (expandedSeason.items || [])) {
+            episodesGrid.appendChild(createMovieCard(item));
+          }
+
+          episodesBlock.appendChild(episodesTitle);
+          episodesBlock.appendChild(episodesGrid);
+          section.appendChild(episodesBlock);
+        }
+      }
+
+      grid.appendChild(section);
+      const seasonCount = seasons.length;
+      const episodeCount = getGroupEpisodeCount(selected);
+      setStatus('Viewing ' + selected.name + ' • ' + seasonCount + ' season(s) • ' + episodeCount + ' episode(s).');
+    }
+
+    function countGroupedItems(groups) {
+      return (groups || []).reduce((total, group) => {
+        if (Array.isArray(group.seasons) && group.seasons.length > 0) {
+          return total + group.seasons.reduce((seasonTotal, season) => seasonTotal + ((season.items || []).length), 0);
+        }
+        return total + ((group.items || []).length);
+      }, 0);
+    }
+
+    function syncActiveCategoryButton() {
+      const buttons = categoryTabs.querySelectorAll('[data-category]');
+      buttons.forEach((button) => {
+        button.classList.toggle('active', button.dataset.category === currentCategory);
+      });
     }
 
     async function loadLibrary(forceRefresh = false) {
       setStatus(forceRefresh ? 'Refreshing media library...' : 'Loading media library...');
       try {
-        const url = forceRefresh ? '/api/library?refresh=1' : '/api/library';
+        const params = new URLSearchParams({ category: currentCategory });
+        if (forceRefresh) {
+          params.set('refresh', '1');
+        }
+        const url = '/api/library?' + params.toString();
         const response = await fetch(url);
         const result = await response.json();
         if (!response.ok || !result.ok) {
           throw new Error(result.error || ('HTTP ' + response.status));
         }
 
-        renderItems(result.items, result.noFolders);
+        const hasGroups = Array.isArray(result.groups) && result.groups.length > 0;
+
+        if (hasGroups) {
+          currentGroupedData = result.groups;
+          if (isShowCategory(currentCategory)) {
+            if (selectedShowName) {
+              renderSelectedShowPage();
+            } else {
+              renderGroupedItems(result.groups, result.noFolders, currentCategory);
+            }
+          } else {
+            renderGroupedItems(result.groups, result.noFolders, currentCategory);
+          }
+        } else {
+          currentGroupedData = [];
+          renderItems(result.items || [], result.noFolders, currentCategory);
+        }
+
         if (result.noFolders) {
           setStatus('No media folder selected. Click "Add Media Folder" to choose your default folder.');
         } else {
-          setStatus('Found ' + result.items.length + ' movie(s). Select one to cast.');
+          const total = hasGroups
+            ? countGroupedItems(result.groups)
+            : (result.items || []).length;
+          const categoryName = CATEGORY_LABELS[currentCategory] || 'Titles';
+          if (isShowCategory(currentCategory)) {
+            setStatus('Showing ' + (result.groups || []).length + ' show(s) in ' + categoryName + '.');
+          } else {
+            setStatus('Showing ' + total + ' item(s) in ' + categoryName + '.');
+          }
         }
       } catch (error) {
-        renderItems([], false);
+        currentGroupedData = [];
+        selectedShowName = null;
+        expandedSeasonName = null;
+        setBackButton(false);
+        renderItems([], false, currentCategory);
         setStatus('Library load failed: ' + error.message, true);
       }
     }
 
     refreshBtn.addEventListener('click', () => loadLibrary(true));
+
+    categoryTabs.addEventListener('click', (event) => {
+      const button = event.target.closest('[data-category]');
+      if (!button) {
+        return;
+      }
+      currentCategory = button.dataset.category;
+      selectedShowName = null;
+      expandedSeasonName = null;
+      setBackButton(false);
+      syncActiveCategoryButton();
+      loadLibrary(false);
+    });
+
+    backBtn.addEventListener('click', () => {
+      if (!selectedShowName) {
+        setBackButton(false);
+        return;
+      }
+      selectedShowName = null;
+      expandedSeasonName = null;
+      renderGroupedItems(currentGroupedData, false, currentCategory);
+      const categoryName = CATEGORY_LABELS[currentCategory] || 'Shows';
+      setStatus('Back to ' + categoryName + '. Showing ' + currentGroupedData.length + ' show(s).');
+      setBackButton(false);
+    });
 
     addFolderBtn.addEventListener('click', async () => {
       addFolderBtn.disabled = true;
@@ -524,6 +1045,8 @@ function buildPageHtml(rendererName) {
       }
     });
 
+    setBackButton(false);
+    syncActiveCategoryButton();
     loadLibrary(false);
   </script>
 </body>
@@ -603,6 +1126,7 @@ function createCastUiServer({
       return {
         id: item.id,
         name: safeBasename(item.name),
+        filePath: item.filePath,
         mimeType: item.mimeType,
         size,
       };
@@ -610,8 +1134,7 @@ function createCastUiServer({
 
   const metadataMap = new Map();
 
-  const getMovieItemsWithMetadata = async () => {
-    const items = getMovieItems();
+  const enrichItemsWithMetadata = async (items) => {
     const result = [];
 
     for (const item of items) {
@@ -621,28 +1144,148 @@ function createCastUiServer({
           ...metadataMap.get(item.id),
         });
       } else {
-        const movieTitle = extractMovieTitle(item.name);
-        const metadata = await fetchMovieMetadata(movieTitle);
+        const category = categoryFromPath(item.filePath);
+        const showName = category === CATEGORY_TV_SHOWS || category === CATEGORY_ANIME_SHOWS
+          ? extractSeriesName(item.filePath, category)
+          : null;
+        const seasonInfo = (category === CATEGORY_TV_SHOWS || category === CATEGORY_ANIME_SHOWS)
+          ? extractSeasonEpisodeInfo(item.filePath)
+          : null;
+        const isShowCategory = category === CATEGORY_TV_SHOWS || category === CATEGORY_ANIME_SHOWS;
+        const searchTitle = showName || extractMovieTitle(item.name);
+        const displayTitle = showName
+          ? safeBasename(path.basename(item.name, path.extname(item.name)).replace(/[._]+/g, ' ').trim())
+          : searchTitle;
+
+        const metadata = isShowCategory
+          ? await fetchSeriesMetadata(searchTitle)
+          : await fetchMovieMetadata(searchTitle);
+        const episodeMetadata = (isShowCategory
+          && seasonInfo
+          && Number.isFinite(seasonInfo.seasonNumber)
+          && Number.isFinite(seasonInfo.episodeNumber))
+          ? await fetchEpisodeMetadata(searchTitle, seasonInfo.seasonNumber, seasonInfo.episodeNumber, displayTitle)
+          : null;
+
+        const episodeTitle = (episodeMetadata && episodeMetadata.title) || displayTitle;
+        const episodePoster = (episodeMetadata && episodeMetadata.posterUrl) || metadata.posterUrl;
+        const episodePlot = (episodeMetadata && episodeMetadata.plot) || metadata.plot;
+        const episodeRating = (episodeMetadata && episodeMetadata.imdbRating) || metadata.imdbRating;
+        const episodeYear = (episodeMetadata && episodeMetadata.year) || metadata.year;
         const enriched = {
           ...item,
-          movieTitle,
-          posterUrl: metadata.posterUrl,
-          year: metadata.year,
-          plot: metadata.plot,
-          imdbRating: metadata.imdbRating,
+          movieTitle: episodeTitle,
+          showName,
+          showDisplayTitle: isShowCategory ? (metadata.title || showName) : null,
+          showPosterUrl: isShowCategory ? metadata.posterUrl : null,
+          showPlot: isShowCategory ? metadata.plot : null,
+          showImdbRating: isShowCategory ? metadata.imdbRating : null,
+          showYear: isShowCategory ? metadata.year : null,
+          seasonLabel: seasonInfo ? seasonInfo.seasonLabel : null,
+          seasonNumber: seasonInfo ? seasonInfo.seasonNumber : null,
+          episodeNumber: seasonInfo ? seasonInfo.episodeNumber : null,
+          seasonSort: seasonInfo ? seasonInfo.seasonSort : null,
+          episodeSort: seasonInfo ? seasonInfo.episodeSort : null,
+          posterUrl: episodePoster,
+          year: episodeYear,
+          plot: episodePlot,
+          imdbRating: episodeRating,
         };
         metadataMap.set(item.id, {
-          movieTitle,
-          posterUrl: metadata.posterUrl,
-          year: metadata.year,
-          plot: metadata.plot,
-          imdbRating: metadata.imdbRating,
+          movieTitle: episodeTitle,
+          showName,
+          showDisplayTitle: isShowCategory ? (metadata.title || showName) : null,
+          showPosterUrl: isShowCategory ? metadata.posterUrl : null,
+          showPlot: isShowCategory ? metadata.plot : null,
+          showImdbRating: isShowCategory ? metadata.imdbRating : null,
+          showYear: isShowCategory ? metadata.year : null,
+          seasonLabel: seasonInfo ? seasonInfo.seasonLabel : null,
+          seasonNumber: seasonInfo ? seasonInfo.seasonNumber : null,
+          episodeNumber: seasonInfo ? seasonInfo.episodeNumber : null,
+          seasonSort: seasonInfo ? seasonInfo.seasonSort : null,
+          episodeSort: seasonInfo ? seasonInfo.episodeSort : null,
+          posterUrl: episodePoster,
+          year: episodeYear,
+          plot: episodePlot,
+          imdbRating: episodeRating,
         });
         result.push(enriched);
       }
     }
 
     return result;
+  };
+
+  const getCategoryPayload = async (category) => {
+    const items = getMovieItems().filter((item) => categoryFromPath(item.filePath) === category);
+    const enrichedItems = await enrichItemsWithMetadata(items);
+
+    if (category === CATEGORY_TV_SHOWS || category === CATEGORY_ANIME_SHOWS) {
+      const groupsMap = new Map();
+
+      for (const item of enrichedItems) {
+        const showKey = item.showName || 'Unknown Show';
+        if (!groupsMap.has(showKey)) {
+          groupsMap.set(showKey, new Map());
+        }
+
+        const seasonKey = item.seasonLabel || 'Season Unknown';
+        const seasonsMap = groupsMap.get(showKey);
+        if (!seasonsMap.has(seasonKey)) {
+          seasonsMap.set(seasonKey, []);
+        }
+        seasonsMap.get(seasonKey).push(item);
+      }
+
+      const groups = Array.from(groupsMap.entries())
+        .sort((a, b) => a[0].localeCompare(b[0]))
+        .map(([name, seasonsMap]) => {
+          const seasons = Array.from(seasonsMap.entries())
+            .map(([seasonName, itemsInSeason]) => {
+              const sortedItems = [...itemsInSeason].sort((a, b) => {
+                const seasonA = Number.isFinite(a.seasonSort) ? a.seasonSort : 999;
+                const seasonB = Number.isFinite(b.seasonSort) ? b.seasonSort : 999;
+                if (seasonA !== seasonB) {
+                  return seasonA - seasonB;
+                }
+
+                const epA = Number.isFinite(a.episodeSort) ? a.episodeSort : 9999;
+                const epB = Number.isFinite(b.episodeSort) ? b.episodeSort : 9999;
+                if (epA !== epB) {
+                  return epA - epB;
+                }
+
+                return (a.movieTitle || '').localeCompare(b.movieTitle || '');
+              });
+
+              const first = sortedItems[0] || {};
+              return {
+                name: seasonName,
+                seasonSort: Number.isFinite(first.seasonSort) ? first.seasonSort : 999,
+                items: sortedItems,
+              };
+            })
+            .sort((a, b) => a.seasonSort - b.seasonSort || a.name.localeCompare(b.name));
+
+          const firstWithPoster = enrichedItems.find((item) => (item.showName || 'Unknown Show') === name)
+            || {};
+
+          return {
+            name,
+            displayTitle: (firstWithPoster.showDisplayTitle || firstWithPoster.showName || name),
+            posterUrl: firstWithPoster.showPosterUrl || firstWithPoster.posterUrl || null,
+            year: firstWithPoster.showYear || firstWithPoster.year || null,
+            plot: firstWithPoster.showPlot || firstWithPoster.plot || null,
+            imdbRating: firstWithPoster.showImdbRating || firstWithPoster.imdbRating || null,
+            seasons,
+            items: [],
+          };
+        });
+
+      return { items: [], groups };
+    }
+
+    return { items: enrichedItems, groups: [] };
   };
 
   async function handleRequest(req, res) {
@@ -661,12 +1304,17 @@ function createCastUiServer({
           await mediaServer.buildLibrary();
           metadataMap.clear();
         }
+        const category = String(parsed.searchParams.get('category') || CATEGORY_MOVIES);
         const noFolders = mediaServer.getRootDirs().length === 0;
-        const items = noFolders ? [] : await getMovieItemsWithMetadata();
+        const payload = noFolders
+          ? { items: [], groups: [] }
+          : await getCategoryPayload(category);
         sendJson(res, 200, {
           ok: true,
           noFolders,
-          items,
+          category,
+          items: payload.items,
+          groups: payload.groups,
         });
       } catch (error) {
         sendJson(res, 500, {
