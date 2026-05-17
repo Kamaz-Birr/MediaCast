@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const { buildDidlLite } = require('../dlna/metadata');
 const { setAvTransportUri, play, stop, getTransportInfo } = require('../upnp/soap');
+const { discoverRenderers } = require('../upnp/discovery');
 const {
   fetchMovieMetadata,
   fetchSeriesMetadata,
@@ -46,34 +47,47 @@ function splitPathParts(filePath) {
 function categoryFromPath(filePath) {
   const parts = splitPathParts(filePath);
   const lowerParts = parts.map((part) => part.toLowerCase());
+  const hasPart = (phrase) => lowerParts.some((part) => part === phrase || part.includes(phrase));
 
-  if (lowerParts.includes('anime shows')) {
+  if (hasPart('anime shows')) {
     return CATEGORY_ANIME_SHOWS;
   }
-  if (lowerParts.includes('tv shows')) {
+  if (hasPart('tv shows')) {
     return CATEGORY_TV_SHOWS;
   }
-  if (lowerParts.includes('anime')) {
+  if (hasPart('anime')) {
     return CATEGORY_ANIME_MOVIES;
   }
-  if (lowerParts.includes('movies')) {
+  if (hasPart('movies')) {
     return CATEGORY_MOVIES;
   }
 
   return CATEGORY_MOVIES;
 }
 
+function normalizeSeriesFolderName(input) {
+  const cleaned = String(input || '')
+    .replace(/[._]+/g, ' ')
+    .replace(/\b(?:tv\s*shows?)\b/gi, ' ')
+    .replace(/\banime\s*shows?\b/gi, ' ')
+    .replace(/\bseason\s*\d{1,2}\b/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return cleaned || String(input || '').trim();
+}
+
 function extractSeriesName(filePath, category) {
   const parts = splitPathParts(filePath);
   const lowerParts = parts.map((part) => part.toLowerCase());
   const folderName = category === CATEGORY_ANIME_SHOWS ? 'anime shows' : 'tv shows';
-  const index = lowerParts.indexOf(folderName);
+  const index = lowerParts.findIndex((part) => part === folderName || part.includes(folderName));
 
   if (index >= 0 && parts[index + 1]) {
-    return safeBasename(parts[index + 1]);
+    return normalizeSeriesFolderName(safeBasename(parts[index + 1]));
   }
 
-  return safeBasename(path.basename(path.dirname(filePath)));
+  return normalizeSeriesFolderName(safeBasename(path.basename(path.dirname(filePath))));
 }
 
 function extractSeasonEpisodeInfo(filePath) {
@@ -123,6 +137,67 @@ function extractSeasonEpisodeInfo(filePath) {
   };
 }
 
+function extractSeriesTitleFromEpisodeName(fileName) {
+  const baseName = path.basename(String(fileName || ''), path.extname(String(fileName || '')));
+  const normalized = baseName.replace(/[._]+/g, ' ');
+  const match = normalized.match(/^(.*?)(?:\bS\d{1,2}\s*E\d{1,3}\b|\b\d{1,2}x\d{1,3}\b)/i);
+  if (!match || !match[1]) {
+    return '';
+  }
+
+  return match[1]
+    .replace(/[-:]+\s*$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function metadataLooksResolved(metadata) {
+  if (!metadata || typeof metadata !== 'object') {
+    return false;
+  }
+
+  return Boolean(
+    metadata.tmdbId
+    || metadata.imdbId
+    || metadata.plot
+    || metadata.imdbRating
+    || metadata.year,
+  );
+}
+
+async function fetchSeriesMetadataWithFallback(candidates) {
+  const uniqueCandidates = Array.from(new Set((Array.isArray(candidates) ? candidates : [])
+    .map((item) => String(item || '').trim())
+    .filter((item) => item.length > 0)));
+
+  let firstMetadata = null;
+  for (const candidate of uniqueCandidates) {
+    const metadata = await fetchSeriesMetadata(candidate);
+    if (!firstMetadata) {
+      firstMetadata = metadata;
+    }
+    if (metadataLooksResolved(metadata)) {
+      return {
+        metadata,
+        matchedTitle: candidate,
+      };
+    }
+  }
+
+  return {
+    metadata: firstMetadata || {
+      title: uniqueCandidates[0] || 'Unknown Show',
+      posterUrl: null,
+      plot: null,
+      imdbRating: null,
+      year: null,
+      tmdbId: null,
+      imdbId: null,
+    },
+    matchedTitle: uniqueCandidates[0] || 'Unknown Show',
+  };
+}
+
 function buildPageHtml(rendererName) {
   return `<!doctype html>
 <html lang="en">
@@ -159,6 +234,20 @@ function buildPageHtml(rendererName) {
         radial-gradient(circle at 85% 82%, rgba(249, 115, 22, 0.1) 0, transparent 35%),
         linear-gradient(160deg, #0b1222 0%, #0f172a 55%, #121f37 100%);
       padding: 24px;
+    }
+
+    .button-row {
+      display: flex;
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    .neu-btn.watched, .neu-btn.secondary.watched {
+      background: #22c55e;
+      color: #fff;
+      border-color: #22c55e;
+      font-weight: 700;
+      box-shadow: 0 2px 8px 0 rgba(34,197,94,0.12);
     }
 
     .app {
@@ -201,6 +290,132 @@ function buildPageHtml(rendererName) {
       display: flex;
       gap: 10px;
       flex-wrap: wrap;
+    }
+
+    .renderer-dropdown {
+      position: relative;
+      min-width: 280px;
+      display: inline-block;
+    }
+
+    .renderer-dropdown-btn {
+      min-height: 46px;
+      min-width: 280px;
+      background: rgba(255, 255, 255, 0.03);
+      color: var(--text);
+      border-radius: 1rem;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      padding: 10px 14px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      backdrop-filter: blur(10px);
+      outline: none;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      width: 100%;
+      cursor: pointer;
+      transition: border-color 0.18s, box-shadow 0.18s;
+    }
+
+    .renderer-dropdown-btn[aria-expanded="true"] {
+      border-color: rgba(96, 165, 250, 0.85);
+      box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.22);
+    }
+
+    .dropdown-arrow {
+      margin-left: 10px;
+      font-size: 1.1em;
+      transition: transform 0.28s cubic-bezier(.4, 2, .6, 1);
+    }
+
+    .renderer-dropdown-btn[aria-expanded="true"] .dropdown-arrow {
+      transform: rotate(-180deg);
+    }
+
+    .renderer-dropdown-menu {
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: 110%;
+      background: rgba(30, 41, 59, 0.98);
+      border-radius: 1rem;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.18);
+      margin: 0;
+      padding: 0.5em 0;
+      list-style: none;
+      z-index: 100;
+      opacity: 0;
+      transform: translateY(-10px) scale(0.985);
+      transform-origin: top center;
+      pointer-events: none;
+      transition: opacity 0.38s cubic-bezier(0.2, 0.9, 0.2, 1), transform 0.38s cubic-bezier(0.2, 0.9, 0.2, 1);
+      max-height: 320px;
+      overflow-y: auto;
+      will-change: opacity, transform;
+    }
+
+    .renderer-dropdown-menu.open {
+      opacity: 1;
+      transform: translateY(0) scaleY(1);
+      pointer-events: auto;
+    }
+
+    .renderer-dropdown-menu li {
+      padding: 12px 18px;
+      color: var(--text);
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.18s;
+      border: none;
+      background: none;
+      outline: none;
+      font-size: 1rem;
+      display: flex;
+      align-items: center;
+      opacity: 0;
+      transform: translateX(-10px);
+    }
+
+    .renderer-dropdown-menu.open li {
+      animation: renderer-dropdown-item-in 360ms cubic-bezier(0.16, 0.84, 0.34, 1) forwards;
+      animation-delay: calc(var(--item-index, 0) * 24ms);
+    }
+
+    @keyframes renderer-dropdown-item-in {
+      from {
+        opacity: 0;
+        transform: translateX(-12px);
+      }
+      to {
+        opacity: 1;
+        transform: translateX(0);
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .renderer-dropdown-menu,
+      .renderer-dropdown-menu li,
+      .dropdown-arrow {
+        transition: none;
+        animation: none;
+      }
+
+      .renderer-dropdown-menu li {
+        opacity: 1;
+        transform: none;
+      }
+    }
+
+    .renderer-dropdown-menu li.selected {
+      background: rgba(96, 165, 250, 0.13);
+      color: #bae6fd;
+    }
+
+    .renderer-dropdown-menu li:hover {
+      background: rgba(251, 146, 60, 0.13);
+      color: #fed7aa;
     }
 
     .categories {
@@ -305,9 +520,20 @@ function buildPageHtml(rendererName) {
       flex-shrink: 0;
     }
 
+    .movie-card.watched-media {
+      filter: grayscale(0.95);
+      opacity: 0.78;
+      box-shadow: 0 12px 24px rgba(15, 23, 42, 0.6);
+    }
+
     .movie-card:hover {
       transform: scale(1.03);
       box-shadow: 0 28px 56px rgba(30, 64, 175, 0.25);
+    }
+
+    .movie-card.watched-media:hover {
+      transform: scale(1.015);
+      box-shadow: 0 18px 30px rgba(15, 23, 42, 0.68);
     }
 
     .movie-card img {
@@ -347,6 +573,25 @@ function buildPageHtml(rendererName) {
 
     .movie-card:hover .movie-overlay {
       opacity: 1;
+    }
+
+    .watched-check {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      width: 34px;
+      height: 34px;
+      border-radius: 999px;
+      background: #16a34a;
+      color: #ffffff;
+      display: grid;
+      place-items: center;
+      font-size: 20px;
+      font-weight: 900;
+      z-index: 9;
+      border: 2px solid #ffffff;
+      box-shadow: 0 6px 14px rgba(0, 0, 0, 0.42);
+      pointer-events: none;
     }
 
     .movie-title {
@@ -469,9 +714,17 @@ function buildPageHtml(rendererName) {
     <header class="topbar">
       <div class="brand">
         <h1>NovaBox</h1>
-        <div class="subtitle">Target Renderer: <strong>${rendererName}</strong></div>
+        <div class="subtitle">Target Renderer: <strong id="targetRendererName">${rendererName}</strong></div>
       </div>
       <div class="controls">
+        <div class="renderer-dropdown">
+          <button id="rendererDropdownBtn" class="renderer-dropdown-btn" aria-haspopup="listbox" aria-expanded="false">
+            <span id="rendererDropdownLabel">${rendererName}</span>
+            <span class="dropdown-arrow">▼</span>
+          </button>
+          <ul id="rendererDropdownMenu" class="renderer-dropdown-menu" tabindex="-1" role="listbox" aria-label="Select target renderer"></ul>
+        </div>
+        <button class="neu-btn secondary" id="refreshRenderersBtn">Refresh Renderers</button>
         <button class="neu-btn" id="refreshBtn">Rescan Library</button>
         <button class="neu-btn" id="addFolderBtn">Add Media Folder</button>
         <button class="neu-btn secondary" id="backBtn" style="display:none">Back</button>
@@ -502,9 +755,16 @@ function buildPageHtml(rendererName) {
     let currentGroupedData = [];
     let selectedShowName = null;
     let expandedSeasonName = null;
+    let currentRendererName = '${rendererName}';
+    const watchedItemIds = new Set();
     const statusBox = document.getElementById('statusBox');
     const grid = document.getElementById('grid');
     const categoryTabs = document.getElementById('categoryTabs');
+    const targetRendererName = document.getElementById('targetRendererName');
+    const rendererDropdownBtn = document.getElementById('rendererDropdownBtn');
+    const rendererDropdownMenu = document.getElementById('rendererDropdownMenu');
+    const rendererDropdownLabel = document.getElementById('rendererDropdownLabel');
+    const refreshRenderersBtn = document.getElementById('refreshRenderersBtn');
     const refreshBtn = document.getElementById('refreshBtn');
     const addFolderBtn = document.getElementById('addFolderBtn');
     const backBtn = document.getElementById('backBtn');
@@ -519,6 +779,135 @@ function buildPageHtml(rendererName) {
       statusBox.style.borderColor = isError ? 'rgba(239, 68, 68, 0.7)' : 'rgba(255, 255, 255, 0.1)';
       statusBox.style.color = isError ? '#fecaca' : '#f8fafc';
       statusBox.style.background = isError ? 'rgba(127, 29, 29, 0.45)' : 'rgba(30, 41, 59, 0.7)';
+    }
+
+    function setCurrentRendererName(name) {
+      currentRendererName = String(name || '').trim() || 'Unknown Renderer';
+      if (targetRendererName) {
+        targetRendererName.textContent = currentRendererName;
+      }
+      if (rendererDropdownLabel) {
+        rendererDropdownLabel.textContent = currentRendererName;
+      }
+    }
+
+    function formatRendererLabel(item) {
+      if (!item || typeof item !== 'object') {
+        return 'Unknown Renderer';
+      }
+      const friendly = item.friendlyName || 'Unknown Renderer';
+      const details = [item.modelName, item.manufacturer].filter(Boolean).join(' • ');
+      return details ? (friendly + ' (' + details + ')') : friendly;
+    }
+
+    async function loadRenderers(forceRefresh = false) {
+      try {
+        const params = new URLSearchParams();
+        if (forceRefresh) {
+          params.set('refresh', '1');
+        }
+
+        const url = '/api/renderers' + (params.toString() ? ('?' + params.toString()) : '');
+        const response = await fetch(url);
+        const result = await response.json();
+        if (!response.ok || !result.ok) {
+          throw new Error(result.error || ('HTTP ' + response.status));
+        }
+
+        const renderers = Array.isArray(result.renderers) ? result.renderers : [];
+        rendererDropdownMenu.innerHTML = '';
+
+        if (!renderers.length) {
+          const emptyItem = document.createElement('li');
+          emptyItem.textContent = 'No renderers found';
+          emptyItem.tabIndex = -1;
+          rendererDropdownMenu.appendChild(emptyItem);
+          rendererDropdownBtn.disabled = true;
+          setCurrentRendererName('No Renderer Selected');
+          return;
+        }
+
+        rendererDropdownBtn.disabled = false;
+        const selectedKey = result.selectedKey || (renderers[0] && renderers[0].key) || '';
+
+        renderers.forEach((rendererItem, index) => {
+          const item = document.createElement('li');
+          const key = rendererItem.key || '';
+          item.dataset.key = key;
+          item.textContent = formatRendererLabel(rendererItem);
+          item.tabIndex = 0;
+          item.setAttribute('role', 'option');
+          item.style.setProperty('--item-index', String(index));
+
+          if (key === selectedKey) {
+            item.classList.add('selected');
+          }
+
+          item.addEventListener('click', async () => {
+            await handleRendererPick(key);
+          });
+
+          item.addEventListener('keydown', async (event) => {
+            if (event.key === 'Enter' || event.key === ' ') {
+              event.preventDefault();
+              await handleRendererPick(key);
+            }
+          });
+
+          rendererDropdownMenu.appendChild(item);
+        });
+
+        const selected = renderers.find((entry) => entry.key === selectedKey) || renderers[0];
+        setCurrentRendererName(selected && selected.friendlyName ? selected.friendlyName : '${rendererName}');
+      } catch (error) {
+        setStatus('Renderer list failed: ' + error.message, true);
+      }
+    }
+
+    async function selectRenderer(rendererKey) {
+      const key = String(rendererKey || '').trim();
+      if (!key) {
+        return;
+      }
+
+      const response = await fetch('/api/renderers/select', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.ok) {
+        throw new Error(result.error || ('HTTP ' + response.status));
+      }
+
+      const name = result.renderer && result.renderer.friendlyName
+        ? result.renderer.friendlyName
+        : '${rendererName}';
+      setCurrentRendererName(name);
+      setStatus('Target renderer set to ' + name + '.');
+    }
+
+    function openRendererDropdown() {
+      if (rendererDropdownBtn.disabled) {
+        return;
+      }
+      rendererDropdownBtn.setAttribute('aria-expanded', 'true');
+      rendererDropdownMenu.classList.add('open');
+    }
+
+    function closeRendererDropdown() {
+      rendererDropdownBtn.setAttribute('aria-expanded', 'false');
+      rendererDropdownMenu.classList.remove('open');
+    }
+
+    async function handleRendererPick(key) {
+      try {
+        await selectRenderer(key);
+        closeRendererDropdown();
+        await loadRenderers(false);
+      } catch (error) {
+        setStatus('Renderer select failed: ' + error.message, true);
+      }
     }
 
     function formatSize(bytes) {
@@ -572,11 +961,32 @@ function buildPageHtml(rendererName) {
         if (!response.ok || !result.ok) {
           throw new Error(result.error || ('HTTP ' + response.status));
         }
-        setStatus('Now playing on ${rendererName}: ' + (item.movieTitle || item.name));
+        if (result.rendererName) {
+          setCurrentRendererName(result.rendererName);
+        }
+        setStatus('Now playing on ' + currentRendererName + ': ' + (item.movieTitle || item.name));
       } catch (error) {
         setStatus('Cast failed: ' + error.message, true);
       } finally {
         button.disabled = false;
+      }
+    }
+
+    function setWatchedCardState(card, watchedButton, isWatched) {
+      card.classList.toggle('watched-media', isWatched);
+      watchedButton.classList.toggle('watched', isWatched);
+      watchedButton.textContent = isWatched ? 'Unmark' : 'Watched';
+
+      const existingBadge = card.querySelector('.watched-check');
+      if (isWatched && !existingBadge) {
+        const badge = document.createElement('div');
+        badge.className = 'watched-check';
+        badge.textContent = '✓';
+        card.appendChild(badge);
+      }
+
+      if (!isWatched && existingBadge) {
+        existingBadge.remove();
       }
     }
 
@@ -630,10 +1040,56 @@ function buildPageHtml(rendererName) {
           castItem(item, playButton);
         });
 
+        // Watched button
+        const watchedButton = document.createElement('button');
+        watchedButton.className = 'neu-btn secondary';
+        watchedButton.textContent = 'Watched';
+        watchedButton.addEventListener('click', async (event) => {
+          event.stopPropagation();
+          const watchedKey = item.watchedKey || item.filePath || item.id;
+          if (!watchedKey) {
+            return;
+          }
+
+          const isCurrentlyWatched = watchedItemIds.has(watchedKey);
+          watchedButton.disabled = true;
+          try {
+            const response = await fetch('/api/watched', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ key: watchedKey, watched: !isCurrentlyWatched }),
+            });
+            const result = await response.json();
+            if (!response.ok || !result.ok) {
+              throw new Error(result.error || ('HTTP ' + response.status));
+            }
+
+            if (result.watched) {
+              watchedItemIds.add(watchedKey);
+              setWatchedCardState(card, watchedButton, true);
+            } else {
+              watchedItemIds.delete(watchedKey);
+              setWatchedCardState(card, watchedButton, false);
+            }
+          } catch (error) {
+            setStatus('Watched update failed: ' + error.message, true);
+          } finally {
+            watchedButton.disabled = false;
+          }
+        });
+
+        const buttonRow = document.createElement('div');
+        buttonRow.className = 'button-row';
+        buttonRow.appendChild(playButton);
+        buttonRow.appendChild(watchedButton);
+
         overlay.appendChild(title);
         overlay.appendChild(meta);
         overlay.appendChild(plot);
-        overlay.appendChild(playButton);
+        overlay.appendChild(buttonRow);
+
+        const watchedKey = item.watchedKey || item.filePath || item.id;
+        setWatchedCardState(card, watchedButton, watchedItemIds.has(watchedKey));
 
         card.addEventListener('click', () => castItem(item, playButton));
         card.appendChild(overlay);
@@ -921,6 +1377,14 @@ function buildPageHtml(rendererName) {
           throw new Error(result.error || ('HTTP ' + response.status));
         }
 
+        watchedItemIds.clear();
+        const watchedKeys = Array.isArray(result.watchedKeys) ? result.watchedKeys : [];
+        for (const watchedKey of watchedKeys) {
+          if (typeof watchedKey === 'string' && watchedKey.length > 0) {
+            watchedItemIds.add(watchedKey);
+          }
+        }
+
         const hasGroups = Array.isArray(result.groups) && result.groups.length > 0;
 
         if (hasGroups) {
@@ -963,6 +1427,44 @@ function buildPageHtml(rendererName) {
     }
 
     refreshBtn.addEventListener('click', () => loadLibrary(true));
+
+    refreshRenderersBtn.addEventListener('click', async () => {
+      refreshRenderersBtn.disabled = true;
+      setStatus('Refreshing renderer list...');
+      try {
+        await loadRenderers(true);
+      } finally {
+        refreshRenderersBtn.disabled = false;
+      }
+    });
+
+    rendererDropdownBtn.addEventListener('click', () => {
+      const isOpen = rendererDropdownMenu.classList.contains('open');
+      if (isOpen) {
+        closeRendererDropdown();
+      } else {
+        openRendererDropdown();
+      }
+    });
+
+    rendererDropdownBtn.addEventListener('keydown', (event) => {
+      if (event.key === 'ArrowDown' || event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        openRendererDropdown();
+      }
+    });
+
+    document.addEventListener('click', (event) => {
+      if (!rendererDropdownMenu.contains(event.target) && !rendererDropdownBtn.contains(event.target)) {
+        closeRendererDropdown();
+      }
+    });
+
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') {
+        closeRendererDropdown();
+      }
+    });
 
     categoryTabs.addEventListener('click', (event) => {
       const button = event.target.closest('[data-category]');
@@ -1037,7 +1539,10 @@ function buildPageHtml(rendererName) {
         if (!response.ok || !result.ok) {
           throw new Error(result.error || ('HTTP ' + response.status));
         }
-        setStatus('Playback stopped on renderer.');
+        if (result.rendererName) {
+          setCurrentRendererName(result.rendererName);
+        }
+        setStatus('Playback stopped on ' + currentRendererName + '.');
       } catch (error) {
         setStatus('Stop failed: ' + error.message, true);
       } finally {
@@ -1047,6 +1552,7 @@ function buildPageHtml(rendererName) {
 
     setBackButton(false);
     syncActiveCategoryButton();
+    loadRenderers(true);
     loadLibrary(false);
   </script>
 </body>
@@ -1110,8 +1616,80 @@ function createCastUiServer({
   uiPort = 8787,
   chooseMediaFolder,
   onMediaFoldersChanged,
+  initialWatchedKeys = [],
+  onWatchedKeysChanged,
 }) {
   let server = null;
+  let selectedRenderer = renderer || null;
+  let availableRenderers = selectedRenderer ? [selectedRenderer] : [];
+  const watchedMediaKeys = new Set(
+    (Array.isArray(initialWatchedKeys) ? initialWatchedKeys : [])
+      .map((item) => String(item || '').trim())
+      .filter((item) => item.length > 0),
+  );
+
+  const rendererKey = (item) => String((item && (item.udn || item.location)) || '').trim();
+
+  const toRendererSummary = (item) => ({
+    key: rendererKey(item),
+    friendlyName: safeBasename(item && item.friendlyName ? item.friendlyName : 'Unknown Renderer'),
+    manufacturer: safeBasename(item && item.manufacturer ? item.manufacturer : ''),
+    modelName: safeBasename(item && item.modelName ? item.modelName : ''),
+    udn: safeBasename(item && item.udn ? item.udn : ''),
+    location: item && item.location ? String(item.location) : '',
+  });
+
+  const mergeRendererLists = (items) => {
+    const merged = new Map();
+
+    const addRenderer = (entry) => {
+      if (!entry) {
+        return;
+      }
+      const key = rendererKey(entry);
+      if (!key) {
+        return;
+      }
+      if (!merged.has(key)) {
+        merged.set(key, entry);
+      }
+    };
+
+    (Array.isArray(items) ? items : []).forEach(addRenderer);
+    (Array.isArray(availableRenderers) ? availableRenderers : []).forEach(addRenderer);
+    if (selectedRenderer) {
+      addRenderer(selectedRenderer);
+    }
+
+    availableRenderers = Array.from(merged.values());
+
+    if (selectedRenderer) {
+      const selectedKey = rendererKey(selectedRenderer);
+      if (selectedKey && merged.has(selectedKey)) {
+        selectedRenderer = merged.get(selectedKey);
+      }
+    }
+
+    if (!selectedRenderer && availableRenderers.length > 0) {
+      selectedRenderer = availableRenderers[0];
+    }
+
+    return availableRenderers;
+  };
+
+  const refreshRendererList = async (timeoutMs = 3500) => {
+    const discovered = await discoverRenderers(timeoutMs);
+    return mergeRendererLists(discovered);
+  };
+
+  const findRendererByKey = (key) => {
+    const needle = String(key || '').trim();
+    if (!needle) {
+      return null;
+    }
+
+    return availableRenderers.find((item) => rendererKey(item) === needle) || null;
+  };
 
   const getMovieItems = () => mediaServer.library
     .filter(isLikelyMovie)
@@ -1127,6 +1705,7 @@ function createCastUiServer({
         id: item.id,
         name: safeBasename(item.name),
         filePath: item.filePath,
+        watchedKey: item.filePath,
         mimeType: item.mimeType,
         size,
       };
@@ -1152,19 +1731,24 @@ function createCastUiServer({
           ? extractSeasonEpisodeInfo(item.filePath)
           : null;
         const isShowCategory = category === CATEGORY_TV_SHOWS || category === CATEGORY_ANIME_SHOWS;
-        const searchTitle = showName || extractMovieTitle(item.name);
+        const fallbackSeriesTitle = extractSeriesTitleFromEpisodeName(item.name);
+        const searchTitle = showName || fallbackSeriesTitle || extractMovieTitle(item.name);
         const displayTitle = showName
           ? safeBasename(path.basename(item.name, path.extname(item.name)).replace(/[._]+/g, ' ').trim())
           : searchTitle;
 
+        const seriesResult = isShowCategory
+          ? await fetchSeriesMetadataWithFallback([searchTitle, fallbackSeriesTitle, extractMovieTitle(item.name)])
+          : null;
         const metadata = isShowCategory
-          ? await fetchSeriesMetadata(searchTitle)
+          ? seriesResult.metadata
           : await fetchMovieMetadata(searchTitle);
+        const seriesLookupTitle = isShowCategory ? (seriesResult.matchedTitle || searchTitle) : searchTitle;
         const episodeMetadata = (isShowCategory
           && seasonInfo
           && Number.isFinite(seasonInfo.seasonNumber)
           && Number.isFinite(seasonInfo.episodeNumber))
-          ? await fetchEpisodeMetadata(searchTitle, seasonInfo.seasonNumber, seasonInfo.episodeNumber, displayTitle)
+          ? await fetchEpisodeMetadata(seriesLookupTitle, seasonInfo.seasonNumber, seasonInfo.episodeNumber, displayTitle)
           : null;
 
         const episodeTitle = (episodeMetadata && episodeMetadata.title) || displayTitle;
@@ -1294,7 +1878,64 @@ function createCastUiServer({
     if (req.method === 'GET' && parsed.pathname === '/') {
       res.statusCode = 200;
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
-      res.end(buildPageHtml(safeBasename(renderer.friendlyName || 'Unknown Renderer')));
+      res.end(buildPageHtml(safeBasename((selectedRenderer && selectedRenderer.friendlyName) || 'Unknown Renderer')));
+      return;
+    }
+
+    if (req.method === 'GET' && parsed.pathname === '/api/renderers') {
+      try {
+        if (parsed.searchParams.get('refresh') === '1' || availableRenderers.length === 0) {
+          await refreshRendererList();
+        }
+
+        const selectedKey = rendererKey(selectedRenderer);
+        sendJson(res, 200, {
+          ok: true,
+          selectedKey,
+          renderers: availableRenderers.map(toRendererSummary),
+        });
+      } catch (error) {
+        sendJson(res, 500, {
+          ok: false,
+          error: error.message,
+        });
+      }
+      return;
+    }
+
+    if (req.method === 'POST' && parsed.pathname === '/api/renderers/select') {
+      try {
+        const body = await readRequestBody(req);
+        const payload = JSON.parse(body || '{}');
+        const key = String(payload.key || '').trim();
+
+        let selected = findRendererByKey(key);
+        if (!selected) {
+          await refreshRendererList();
+          selected = findRendererByKey(key);
+        }
+
+        if (!selected) {
+          sendJson(res, 404, {
+            ok: false,
+            error: 'Renderer not found.',
+          });
+          return;
+        }
+
+        selectedRenderer = selected;
+        sendJson(res, 200, {
+          ok: true,
+          selectedKey: rendererKey(selectedRenderer),
+          renderer: toRendererSummary(selectedRenderer),
+          renderers: availableRenderers.map(toRendererSummary),
+        });
+      } catch (error) {
+        sendJson(res, 500, {
+          ok: false,
+          error: error.message,
+        });
+      }
       return;
     }
 
@@ -1315,6 +1956,7 @@ function createCastUiServer({
           category,
           items: payload.items,
           groups: payload.groups,
+          watchedKeys: Array.from(watchedMediaKeys),
         });
       } catch (error) {
         sendJson(res, 500, {
@@ -1337,13 +1979,19 @@ function createCastUiServer({
           return;
         }
 
-        const result = await castMediaItem(renderer, mediaServer, media);
+        if (!selectedRenderer) {
+          sendJson(res, 503, { ok: false, error: 'No renderer selected.' });
+          return;
+        }
+
+        const result = await castMediaItem(selectedRenderer, mediaServer, media);
         sendJson(res, 200, {
           ok: true,
           media: {
             id: media.id,
             name: media.name,
           },
+          rendererName: selectedRenderer.friendlyName || 'Unknown Renderer',
           transportState: result.transportState,
           mediaUrl: result.mediaUrl,
         });
@@ -1358,9 +2006,58 @@ function createCastUiServer({
 
     if (req.method === 'POST' && parsed.pathname === '/api/stop') {
       try {
-        await stop(renderer);
+        if (!selectedRenderer) {
+          sendJson(res, 503, {
+            ok: false,
+            error: 'No renderer selected.',
+          });
+          return;
+        }
+
+        await stop(selectedRenderer);
         sendJson(res, 200, {
           ok: true,
+          rendererName: selectedRenderer.friendlyName || 'Unknown Renderer',
+        });
+      } catch (error) {
+        sendJson(res, 500, {
+          ok: false,
+          error: error.message,
+        });
+      }
+      return;
+    }
+
+    if (req.method === 'POST' && parsed.pathname === '/api/watched') {
+      try {
+        const body = await readRequestBody(req);
+        const payload = JSON.parse(body || '{}');
+        const key = String(payload.key || '').trim();
+        const watched = Boolean(payload.watched);
+
+        if (!key) {
+          sendJson(res, 400, {
+            ok: false,
+            error: 'Missing watched media key.',
+          });
+          return;
+        }
+
+        if (watched) {
+          watchedMediaKeys.add(key);
+        } else {
+          watchedMediaKeys.delete(key);
+        }
+
+        if (typeof onWatchedKeysChanged === 'function') {
+          onWatchedKeysChanged(Array.from(watchedMediaKeys));
+        }
+
+        sendJson(res, 200, {
+          ok: true,
+          key,
+          watched: watchedMediaKeys.has(key),
+          watchedKeys: Array.from(watchedMediaKeys),
         });
       } catch (error) {
         sendJson(res, 500, {

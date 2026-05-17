@@ -49,7 +49,7 @@ function normalizeRootDirectories({ rootDir, rootDirs }) {
 }
 
 class MediaServer {
-  constructor({ rootDir, rootDirs, port = 0, host, transcoding = {} }) {
+  constructor({ rootDir, rootDirs, port = 0, host, transcoding = {}, libraryCache }) {
     this.rootDirs = normalizeRootDirectories({ rootDir, rootDirs });
     // Allow starting with no directories — user can add one via the web UI
 
@@ -69,6 +69,117 @@ class MediaServer {
       audioBitrate: transcoding.audioBitrate || '128k',
     };
     this.activeTranscoders = new Map();
+    this.libraryCache = libraryCache && typeof libraryCache === 'object'
+      ? libraryCache
+      : null;
+  }
+
+  _getRootDirsSignature() {
+    return this.rootDirs
+      .map((dir) => path.resolve(dir).toLowerCase())
+      .sort((a, b) => a.localeCompare(b))
+      .join('|');
+  }
+
+  _applyLibraryFromPaths(filePaths) {
+    const uniqueFiles = Array.from(new Set((filePaths || []).map((item) => path.resolve(item))));
+    this.library = uniqueFiles.map((filePath, index) => ({
+      id: String(index + 1),
+      filePath,
+      name: path.basename(filePath),
+      mimeType: getMimeType(filePath),
+    }));
+    return this.library;
+  }
+
+  _loadLibraryFromCache() {
+    if (!this.libraryCache || typeof this.libraryCache.load !== 'function') {
+      return false;
+    }
+
+    try {
+      const payload = this.libraryCache.load();
+      if (!payload || typeof payload !== 'object') {
+        return false;
+      }
+
+      const expectedSignature = this._getRootDirsSignature();
+      if (String(payload.rootDirsSignature || '') !== expectedSignature) {
+        return false;
+      }
+
+      const entries = Array.isArray(payload.entries) ? payload.entries : [];
+      if (entries.length === 0) {
+        return false;
+      }
+
+      const validFilePaths = [];
+      for (const entry of entries) {
+        const filePath = path.resolve(String(entry && entry.filePath ? entry.filePath : ''));
+        if (!filePath || !fs.existsSync(filePath)) {
+          return false;
+        }
+
+        const stat = fs.statSync(filePath);
+        if (!stat.isFile()) {
+          return false;
+        }
+
+        if (!isSupportedMediaFile(filePath)) {
+          return false;
+        }
+
+        const cachedSize = Number(entry.size);
+        const cachedMtimeMs = Number(entry.mtimeMs);
+        if (!Number.isFinite(cachedSize) || !Number.isFinite(cachedMtimeMs)) {
+          return false;
+        }
+
+        if (stat.size !== cachedSize || Math.abs(stat.mtimeMs - cachedMtimeMs) > 1) {
+          return false;
+        }
+
+        validFilePaths.push(filePath);
+      }
+
+      this._applyLibraryFromPaths(validFilePaths);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  _saveLibraryCache() {
+    if (!this.libraryCache || typeof this.libraryCache.save !== 'function') {
+      return;
+    }
+
+    try {
+      const entries = this.library
+        .map((item) => {
+          try {
+            const stat = fs.statSync(item.filePath);
+            return {
+              filePath: item.filePath,
+              size: stat.size,
+              mtimeMs: stat.mtimeMs,
+            };
+          } catch {
+            return null;
+          }
+        })
+        .filter((item) => item && item.filePath);
+
+      this.libraryCache.save({
+        version: 1,
+        rootDirsSignature: this._getRootDirsSignature(),
+        rootDirs: this.getRootDirs(),
+        savedAt: new Date().toISOString(),
+        entries,
+      });
+    } catch {
+      // Ignore cache write failures.
+    }
   }
 
   async buildLibrary() {
@@ -78,13 +189,8 @@ class MediaServer {
       allFiles.push(...files);
     }
 
-    const uniqueFiles = Array.from(new Set(allFiles.map((item) => path.resolve(item))));
-    this.library = uniqueFiles.map((filePath, index) => ({
-      id: String(index + 1),
-      filePath,
-      name: path.basename(filePath),
-      mimeType: getMimeType(filePath),
-    }));
+    this._applyLibraryFromPaths(allFiles);
+    this._saveLibraryCache();
     return this.library;
   }
 
@@ -325,7 +431,13 @@ class MediaServer {
   }
 
   async start() {
-    await this.buildLibrary();
+    const libraryLoadStartedAt = Date.now();
+    const loadedFromCache = this._loadLibraryFromCache();
+    if (!loadedFromCache) {
+      await this.buildLibrary();
+    }
+    const libraryLoadDurationMs = Date.now() - libraryLoadStartedAt;
+    const libraryLoadSource = loadedFromCache ? 'cache' : 'scan';
 
     this.server = http.createServer((req, res) => {
       const parsed = new URL(req.url, `http://${req.headers.host}`);
@@ -368,6 +480,10 @@ class MediaServer {
       rootDir: this.rootDir,
       rootDirs: this.getRootDirs(),
       librarySize: this.library.length,
+      libraryLoad: {
+        source: libraryLoadSource,
+        durationMs: libraryLoadDurationMs,
+      },
     };
   }
 

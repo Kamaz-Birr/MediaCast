@@ -153,39 +153,89 @@ function getCastUiConfigPath() {
   return path.join(baseDir, 'MediaCast', 'cast-ui.json');
 }
 
-function loadSavedMediaDirectories() {
+function readCastUiConfig() {
   const configPath = getCastUiConfigPath();
   if (!fs.existsSync(configPath)) {
-    return [];
+    return {};
   }
 
   try {
     const raw = fs.readFileSync(configPath, 'utf8');
     const parsed = JSON.parse(raw);
-    const values = Array.isArray(parsed.mediaDirs) ? parsed.mediaDirs : [];
-
-    return values
-      .map((item) => String(item || '').trim())
-      .filter((item) => item.length > 0)
-      .filter((item) => fs.existsSync(item) && fs.statSync(item).isDirectory())
-      .filter((item) => !isAppDirectory(item))
-      .map((item) => path.resolve(item));
+    return parsed && typeof parsed === 'object' ? parsed : {};
   } catch {
-    return [];
+    return {};
   }
 }
 
-function saveMediaDirectories(mediaDirs) {
+function writeCastUiConfig(config) {
   const configPath = getCastUiConfigPath();
   fs.mkdirSync(path.dirname(configPath), { recursive: true });
-
-  const unique = Array.from(new Set(mediaDirs.map((item) => path.resolve(item))))
-    .filter((item) => !isAppDirectory(item));
   fs.writeFileSync(
     configPath,
-    JSON.stringify({ mediaDirs: unique }, null, 2),
+    JSON.stringify(config && typeof config === 'object' ? config : {}, null, 2),
     'utf8',
   );
+}
+
+function updateCastUiConfig(patch) {
+  const existing = readCastUiConfig();
+  writeCastUiConfig({
+    ...existing,
+    ...(patch && typeof patch === 'object' ? patch : {}),
+  });
+}
+
+function loadSavedMediaDirectories() {
+  const parsed = readCastUiConfig();
+  const values = Array.isArray(parsed.mediaDirs) ? parsed.mediaDirs : [];
+
+  return values
+    .map((item) => String(item || '').trim())
+    .filter((item) => item.length > 0)
+    .filter((item) => fs.existsSync(item) && fs.statSync(item).isDirectory())
+    .filter((item) => !isAppDirectory(item))
+    .map((item) => path.resolve(item));
+}
+
+function saveMediaDirectories(mediaDirs) {
+  const unique = Array.from(new Set(mediaDirs.map((item) => path.resolve(item))))
+    .filter((item) => !isAppDirectory(item));
+  updateCastUiConfig({ mediaDirs: unique });
+}
+
+function loadWatchedMediaKeys() {
+  const parsed = readCastUiConfig();
+  const values = Array.isArray(parsed.watchedMediaKeys) ? parsed.watchedMediaKeys : [];
+  return Array.from(new Set(
+    values
+      .map((item) => String(item || '').trim())
+      .filter((item) => item.length > 0),
+  ));
+}
+
+function saveWatchedMediaKeys(watchedMediaKeys) {
+  const normalized = Array.from(new Set(
+    (Array.isArray(watchedMediaKeys) ? watchedMediaKeys : [])
+      .map((item) => String(item || '').trim())
+      .filter((item) => item.length > 0),
+  ));
+  updateCastUiConfig({ watchedMediaKeys: normalized });
+}
+
+function loadMediaLibraryCache() {
+  const parsed = readCastUiConfig();
+  const cache = parsed.mediaLibraryCache;
+  if (!cache || typeof cache !== 'object') {
+    return null;
+  }
+  return cache;
+}
+
+function saveMediaLibraryCache(cache) {
+  updateCastUiConfig({
+    mediaLibraryCache: cache && typeof cache === 'object' ? cache : null,
+  });
 }
 
 async function resolveInitialMediaDirectories(inputDir) {
@@ -500,6 +550,10 @@ program
         rootDirs: mediaDirs,
         port: Number(options.port),
         host: mediaHost,
+        libraryCache: {
+          load: () => loadMediaLibraryCache(),
+          save: (cachePayload) => saveMediaLibraryCache(cachePayload),
+        },
         transcoding: {
           enabled: options.transcode,
           forceTranscode: options.forceTranscode,
@@ -517,6 +571,8 @@ program
         uiPort: Number(options.uiPort),
         chooseMediaFolder: () => resolveMediaDirectory(''),
         onMediaFoldersChanged: (dirs) => saveMediaDirectories(dirs),
+        initialWatchedKeys: loadWatchedMediaKeys(),
+        onWatchedKeysChanged: (keys) => saveWatchedMediaKeys(keys),
       });
 
       const uiInfo = await uiServer.start();
@@ -529,6 +585,13 @@ program
       }
       console.log(`Renderer: ${renderer.friendlyName}`);
       console.log(`Movies indexed: ${mediaServer.library.filter((item) => item.mimeType.startsWith('video/')).length}`);
+      if (mediaInfo.libraryLoad && mediaInfo.libraryLoad.source) {
+        const sourceLabel = mediaInfo.libraryLoad.source === 'cache' ? 'cache' : 'full scan';
+        const duration = Number.isFinite(mediaInfo.libraryLoad.durationMs)
+          ? `${mediaInfo.libraryLoad.durationMs}ms`
+          : 'unknown time';
+        console.log(`Library load: ${sourceLabel} (${duration})`);
+      }
       console.log(`Web app: http://${uiInfo.host}:${uiInfo.port}`);
       if (isFirstRun) {
         console.log('First run: open the web app and click "Add Media Folder" to get started.');
