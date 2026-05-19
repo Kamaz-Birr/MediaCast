@@ -1,7 +1,7 @@
-const { spawn } = require('child_process');
-const { EventEmitter } = require('events');
+import { spawn } from 'child_process';
+import { EventEmitter } from 'events';
 
-class FFmpegTranscoder extends EventEmitter {
+export class FFmpegTranscoder extends EventEmitter {
   constructor(filePath, options = {}) {
     super();
     this.filePath = filePath;
@@ -10,6 +10,7 @@ class FFmpegTranscoder extends EventEmitter {
     this.duration = null;
     this.isRunning = false;
     this.hasError = false;
+    this.subtitlesPath = options.subtitlesPath || null;
   }
 
   start() {
@@ -20,16 +21,41 @@ class FFmpegTranscoder extends EventEmitter {
     const args = [
       '-i',
       this.filePath,
+    ];
+    // Burn in subtitles if present
+    if (this.subtitlesPath) {
+      args.push('-vf', `subtitles='${this.subtitlesPath.replace(/'/g, "'\\''")}'`);
+    }
+
+    // Video encoding options
+    args.push(
       '-c:v',
       this.options.videoCodec || 'libx264',
       '-preset',
       this.options.videoPreset || 'medium',
       '-crf',
       String(this.options.videoCrf || 23),
+    );
+
+    // Add maxrate and bufsize for smoother streaming (default for 4K: 20M)
+    const maxrate = this.options.videoMaxrate || '20M';
+    const bufsize = this.options.videoBufsize || '40M';
+    args.push('-maxrate', maxrate, '-bufsize', bufsize);
+
+    // Keyframe interval (optional, default 2s for 30fps)
+    if (this.options.videoGop) {
+      args.push('-g', String(this.options.videoGop));
+    }
+
+    // Audio encoding options
+    args.push(
       '-c:a',
       this.options.audioCodec || 'aac',
       '-b:a',
       this.options.audioBitrate || '128k',
+    );
+
+    args.push(
       '-c:s',
       'copy',
       '-map',
@@ -39,7 +65,7 @@ class FFmpegTranscoder extends EventEmitter {
       '-movflags',
       'frag_keyframe+empty_moov',
       'pipe:1',
-    ];
+    );
 
     console.log(`[TRANSCODE_SPAWN] ${this.filePath}`);
     console.log(`[TRANSCODE_ARGS] ${args.join(' ')}`);
@@ -154,7 +180,3 @@ class FFmpegTranscoder extends EventEmitter {
     }
   }
 }
-
-module.exports = {
-  FFmpegTranscoder,
-};

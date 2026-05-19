@@ -1,6 +1,6 @@
-const os = require('os');
+import os from 'os';
 
-function getLocalIPv4() {
+export function getLocalIPv4() {
   const interfaces = os.networkInterfaces();
 
   // Prefer non-virtual adapters
@@ -28,7 +28,7 @@ function getLocalIPv4() {
   return '127.0.0.1';
 }
 
-function getLocalIPForRenderer(rendererIp) {
+export function getLocalIPForRenderer(rendererIp) {
   if (!rendererIp || rendererIp === 'localhost' || rendererIp === '127.0.0.1') {
     return null;
   }
@@ -57,7 +57,3 @@ function getLocalIPForRenderer(rendererIp) {
   return null;
 }
 
-module.exports = {
-  getLocalIPv4,
-  getLocalIPForRenderer,
-};

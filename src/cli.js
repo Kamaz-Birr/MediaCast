@@ -1,16 +1,17 @@
 #!/usr/bin/env node
 
-const path = require('path');
-const process = require('process');
-const fs = require('fs');
-const { execFile } = require('child_process');
-const readline = require('readline/promises');
-const os = require('os');
-const { Command } = require('commander');
-const { MediaServer } = require('./dlna/mediaServer');
-const { buildDidlLite } = require('./dlna/metadata');
-const { discoverRenderers, pickRenderer, getRendererByIp } = require('./upnp/discovery');
-const {
+import path from 'path';
+import process from 'process';
+import fs from 'fs';
+import { execFile } from 'child_process';
+import readline from 'readline/promises';
+import os from 'os';
+import { fileURLToPath } from 'url';
+import { Command } from 'commander';
+import { MediaServer } from './dlna/mediaServer.js';
+import { buildDidlLite } from './dlna/metadata.js';
+import { discoverRenderers, pickRenderer, getRendererByIp } from './upnp/discovery.js';
+import {
   setAvTransportUri,
   play,
   pause,
@@ -18,9 +19,13 @@ const {
   setVolume,
   getTransportInfo,
   getCurrentTransportActions,
-} = require('./upnp/soap');
-const { printSupportedFormats } = require('./utils/media');
-const { createCastUiServer } = require('./web/castUiServer');
+} from './upnp/soap.js';
+import { printSupportedFormats } from './utils/media.js';
+import { getLocalIPForRenderer } from './utils/network.js';
+import { createCastUiServer } from './web/castUiServer.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 async function getRendererOrThrow(rendererQuery, timeoutMs, rendererIp) {
   if (rendererIp) {
@@ -223,6 +228,68 @@ function saveWatchedMediaKeys(watchedMediaKeys) {
   updateCastUiConfig({ watchedMediaKeys: normalized });
 }
 
+function loadResumePositions() {
+  const parsed = readCastUiConfig();
+  const source = parsed.resumePositions;
+  if (!source || typeof source !== 'object' || Array.isArray(source)) {
+    return {};
+  }
+
+  const normalized = {};
+  for (const [key, value] of Object.entries(source)) {
+    const itemKey = String(key || '').trim();
+    if (!itemKey || !value || typeof value !== 'object') {
+      continue;
+    }
+
+    const positionSec = Number(value.positionSec);
+    const durationSec = Number(value.durationSec);
+    const progress = Number(value.progress);
+
+    if (!Number.isFinite(positionSec) || positionSec <= 0) {
+      continue;
+    }
+
+    normalized[itemKey] = {
+      positionSec,
+      durationSec: Number.isFinite(durationSec) && durationSec > 0 ? durationSec : null,
+      progress: Number.isFinite(progress) ? progress : null,
+      updatedAt: value.updatedAt || new Date().toISOString(),
+    };
+  }
+
+  return normalized;
+}
+
+function saveResumePositions(resumePositions) {
+  const source = resumePositions && typeof resumePositions === 'object' ? resumePositions : {};
+  const normalized = {};
+
+  for (const [key, value] of Object.entries(source)) {
+    const itemKey = String(key || '').trim();
+    if (!itemKey || !value || typeof value !== 'object') {
+      continue;
+    }
+
+    const positionSec = Number(value.positionSec);
+    const durationSec = Number(value.durationSec);
+    const progress = Number(value.progress);
+
+    if (!Number.isFinite(positionSec) || positionSec <= 0) {
+      continue;
+    }
+
+    normalized[itemKey] = {
+      positionSec,
+      durationSec: Number.isFinite(durationSec) && durationSec > 0 ? durationSec : null,
+      progress: Number.isFinite(progress) ? progress : null,
+      updatedAt: value.updatedAt || new Date().toISOString(),
+    };
+  }
+
+  updateCastUiConfig({ resumePositions: normalized });
+}
+
 function loadMediaLibraryCache() {
   const parsed = readCastUiConfig();
   const cache = parsed.mediaLibraryCache;
@@ -249,13 +316,25 @@ async function resolveInitialMediaDirectories(inputDir) {
     return [explicit];
   }
 
-  // Use saved folders if they exist — no prompt needed
+  // Use saved folders if they exist 
   const saved = loadSavedMediaDirectories();
-  if (saved.length > 0) {
-    return saved;
+  const validDirectories = await Promise.all(
+    saved.map(async (dir) => {
+      try {
+        const stat = await fs.promises.stat(dir);
+        return stat.isDirectory() ? dir : null;
+      } catch {
+        return null;
+      }
+    })
+  );
+
+  const filteredDirectories = validDirectories.filter(Boolean);
+  if (filteredDirectories.length > 0) {
+    return filteredDirectories;
   }
 
-  // First run: no saved folders — start with empty library, user picks via UI
+  // First run: no saved folders 
   return [];
 }
 
@@ -271,7 +350,7 @@ program
   .requiredOption('-f, --file <file>', 'Path to media file')
   .action(async (options) => {
     try {
-      const { probeFile, needsTranscoding } = require('./transcoding/detector');
+      const { probeFile, needsTranscoding } = await import('./transcoding/detector.js');
       const filePath = path.resolve(options.file);
 
       if (!fs.existsSync(filePath)) {
@@ -337,8 +416,12 @@ program
   .option('-h, --host <host>', 'Bind host/IP (defaults to detected local IPv4)')
   .option('--no-transcode', 'Disable FFmpeg transcoding (direct play only)')
   .option('--force-transcode', 'Force all files through FFmpeg H.264+AAC')
+  .option('--subtitle-delay-ms <ms>', 'Shift subtitles by milliseconds (positive delays subtitle, negative advances)', '0')
   .option('--video-preset <preset>', 'FFmpeg video preset (ultrafast, fast, medium, slow)', 'medium')
   .option('--audio-bitrate <bitrate>', 'FFmpeg audio bitrate (e.g., 128k, 192k)', '128k')
+  .option('--video-maxrate <bitrate>', 'FFmpeg video maxrate (e.g., 20M, 10M)', '20M')
+  .option('--video-bufsize <size>', 'FFmpeg video bufsize (e.g., 40M, 20M)', '40M')
+  .option('--video-gop <frames>', 'FFmpeg keyframe interval (GOP, e.g., 60 for 2s at 30fps)')
   .action(async (options) => {
     try {
       const mediaServer = new MediaServer({
@@ -350,6 +433,12 @@ program
           forceTranscode: options.forceTranscode,
           videoPreset: options.videoPreset,
           audioBitrate: options.audioBitrate,
+          videoMaxrate: options.videoMaxrate,
+          videoBufsize: options.videoBufsize,
+          videoGop: options.videoGop,
+        },
+        subtitles: {
+          delayMs: Number(options.subtitleDelayMs),
         },
       });
 
@@ -380,8 +469,12 @@ program
   .option('--renderer-ip <ip>', 'Renderer IP address (bypass SSDP discovery)')
   .option('--no-transcode', 'Disable FFmpeg transcoding (direct play only)')
   .option('--force-transcode', 'Force transcoding to H.264+AAC')
+  .option('--subtitle-delay-ms <ms>', 'Shift subtitles by milliseconds (positive delays subtitle, negative advances)', '0')
   .option('--video-preset <preset>', 'FFmpeg video preset (ultrafast, fast, medium, slow)', 'medium')
   .option('--audio-bitrate <bitrate>', 'FFmpeg audio bitrate (e.g., 128k, 192k)', '128k')
+  .option('--video-maxrate <bitrate>', 'FFmpeg video maxrate (e.g., 20M, 10M)', '20M')
+  .option('--video-bufsize <size>', 'FFmpeg video bufsize (e.g., 40M, 20M)', '40M')
+  .option('--video-gop <frames>', 'FFmpeg keyframe interval (GOP, e.g., 60 for 2s at 30fps)')
   .action(async (options) => {
     try {
       const filePath = path.resolve(options.file);
@@ -396,6 +489,12 @@ program
           forceTranscode: options.forceTranscode,
           videoPreset: options.videoPreset,
           audioBitrate: options.audioBitrate,
+          videoMaxrate: options.videoMaxrate,
+          videoBufsize: options.videoBufsize,
+          videoGop: options.videoGop,
+        },
+        subtitles: {
+          delayMs: Number(options.subtitleDelayMs),
         },
       });
 
@@ -518,8 +617,12 @@ program
   .option('--ui-host <host>', 'Web app host', '127.0.0.1')
   .option('--no-transcode', 'Disable FFmpeg transcoding (direct play only)')
   .option('--force-transcode', 'Force transcoding to H.264+AAC')
+  .option('--subtitle-delay-ms <ms>', 'Shift subtitles by milliseconds (positive delays subtitle, negative advances)', '0')
   .option('--video-preset <preset>', 'FFmpeg video preset (ultrafast, fast, medium, slow)', 'medium')
   .option('--audio-bitrate <bitrate>', 'FFmpeg audio bitrate (e.g., 128k, 192k)', '128k')
+  .option('--video-maxrate <bitrate>', 'FFmpeg video maxrate (e.g., 20M, 10M)', '20M')
+  .option('--video-bufsize <size>', 'FFmpeg video bufsize (e.g., 40M, 20M)', '40M')
+  .option('--video-gop <frames>', 'FFmpeg keyframe interval (GOP, e.g., 60 for 2s at 30fps)')
   .action(async (options) => {
     let mediaServer = null;
     let uiServer = null;
@@ -538,7 +641,6 @@ program
       // Auto-detect media server host if not provided
       let mediaHost = options.host;
       if (!mediaHost && rendererAddress && rendererAddress !== 'localhost') {
-        const { getLocalIPForRenderer } = require('./utils/network');
         const detectedHost = getLocalIPForRenderer(rendererAddress);
         if (detectedHost) {
           mediaHost = detectedHost;
@@ -559,6 +661,12 @@ program
           forceTranscode: options.forceTranscode,
           videoPreset: options.videoPreset,
           audioBitrate: options.audioBitrate,
+          videoMaxrate: options.videoMaxrate,
+          videoBufsize: options.videoBufsize,
+          videoGop: options.videoGop,
+        },
+        subtitles: {
+          delayMs: Number(options.subtitleDelayMs),
         },
       });
 
@@ -573,6 +681,8 @@ program
         onMediaFoldersChanged: (dirs) => saveMediaDirectories(dirs),
         initialWatchedKeys: loadWatchedMediaKeys(),
         onWatchedKeysChanged: (keys) => saveWatchedMediaKeys(keys),
+        initialResumePositions: loadResumePositions(),
+        onResumePositionsChanged: (positions) => saveResumePositions(positions),
       });
 
       const uiInfo = await uiServer.start();
@@ -584,6 +694,9 @@ program
         console.log(`Media folders: ${mediaDirs.join(' | ')}`);
       }
       console.log(`Renderer: ${renderer.friendlyName}`);
+      if (Number(options.subtitleDelayMs) !== 0) {
+        console.log(`Subtitle delay: ${Number(options.subtitleDelayMs)}ms`);
+      }
       console.log(`Movies indexed: ${mediaServer.library.filter((item) => item.mimeType.startsWith('video/')).length}`);
       if (mediaInfo.libraryLoad && mediaInfo.libraryLoad.source) {
         const sourceLabel = mediaInfo.libraryLoad.source === 'cache' ? 'cache' : 'full scan';
@@ -591,6 +704,13 @@ program
           ? `${mediaInfo.libraryLoad.durationMs}ms`
           : 'unknown time';
         console.log(`Library load: ${sourceLabel} (${duration})`);
+        if (mediaInfo.libraryLoad.backgroundRefreshPending) {
+          console.log('Library refresh: running in background; new/changed files will appear shortly.');
+        }
+      }
+      const requestedUiPort = Number(options.uiPort);
+      if (uiInfo.port !== requestedUiPort) {
+        console.log(`Web app port requested: ${requestedUiPort} (occupied, fell back to ${uiInfo.port})`);
       }
       console.log(`Web app: http://${uiInfo.host}:${uiInfo.port}`);
       if (isFirstRun) {
@@ -695,7 +815,6 @@ program
   .description('Show local network interfaces for casting')
   .action(() => {
     try {
-      const os = require('os');
       const interfaces = os.networkInterfaces();
 
       console.log('Local network interfaces:\n');

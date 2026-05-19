@@ -1,35 +1,44 @@
-const http = require('http');
-const fs = require('fs');
-const path = require('path');
-const { getLocalIPv4 } = require('../utils/network');
-const { getMimeType, isSupportedMediaFile, getDlnaProtocolInfo, getDlnaContentFeatures } = require('../utils/media');
-const { shouldTranscode } = require('../transcoding/detector');
-const { FFmpegTranscoder } = require('../transcoding/transcoder');
+import http from 'http';
+import fs from 'fs';
+import path from 'path';
+import zlib from 'zlib';
+import axios from 'axios';
+import { getLocalIPv4 } from '../utils/network.js';
+import { getMimeType, isSupportedMediaFile, getDlnaProtocolInfo, getDlnaContentFeatures } from '../utils/media.js';
+import { shouldTranscode } from '../transcoding/detector.js';
+import { FFmpegTranscoder } from '../transcoding/transcoder.js';
 
-async function walkMedia(rootDir, list = []) {
+export async function walkMedia(rootDir, list = [], batchSize = 50) {
   const entries = await fs.promises.readdir(rootDir, { withFileTypes: true });
+
+  const directories = [];
+  const files = [];
 
   for (const entry of entries) {
     const fullPath = path.join(rootDir, entry.name);
     if (entry.isDirectory()) {
-      await walkMedia(fullPath, list);
-      continue;
+      directories.push(fullPath);
+    } else if (entry.isFile() && isSupportedMediaFile(fullPath)) {
+      files.push(fullPath);
     }
+  }
 
-    if (entry.isFile() && isSupportedMediaFile(fullPath)) {
-      list.push(fullPath);
-    }
+  list.push(...files);
+
+  for (let i = 0; i < directories.length; i += batchSize) {
+    const batch = directories.slice(i, i + batchSize);
+    await Promise.all(batch.map((dir) => walkMedia(dir, list, batchSize)));
   }
 
   return list;
 }
 
-function sendNotFound(res) {
+export function sendNotFound(res) {
   res.statusCode = 404;
   res.end('Not found');
 }
 
-function normalizeRootDirectories({ rootDir, rootDirs }) {
+export function normalizeRootDirectories({ rootDir, rootDirs }) {
   const input = Array.isArray(rootDirs)
     ? rootDirs
     : (rootDir ? [rootDir] : []);
@@ -49,7 +58,7 @@ function normalizeRootDirectories({ rootDir, rootDirs }) {
 }
 
 class MediaServer {
-  constructor({ rootDir, rootDirs, port = 0, host, transcoding = {}, libraryCache }) {
+  constructor({ rootDir, rootDirs, port = 0, host, transcoding = {}, libraryCache, subtitles = {} }) {
     this.rootDirs = normalizeRootDirectories({ rootDir, rootDirs });
     // Allow starting with no directories — user can add one via the web UI
 
@@ -67,12 +76,17 @@ class MediaServer {
       videoCrf: transcoding.videoCrf || 23,
       audioCodec: transcoding.audioCodec || 'aac',
       audioBitrate: transcoding.audioBitrate || '128k',
-    };
+    }
     this.activeTranscoders = new Map();
+    this.backgroundRefreshPromise = null;
     this.libraryCache = libraryCache && typeof libraryCache === 'object'
       ? libraryCache
       : null;
+    this.subtitles = {
+      delayMs: Number.isFinite(Number(subtitles.delayMs)) ? Number(subtitles.delayMs) : 0,
+    };
   }
+
 
   _getRootDirsSignature() {
     return this.rootDirs
@@ -83,16 +97,23 @@ class MediaServer {
 
   _applyLibraryFromPaths(filePaths) {
     const uniqueFiles = Array.from(new Set((filePaths || []).map((item) => path.resolve(item))));
-    this.library = uniqueFiles.map((filePath, index) => ({
-      id: String(index + 1),
-      filePath,
-      name: path.basename(filePath),
-      mimeType: getMimeType(filePath),
-    }));
+    this.library = uniqueFiles.map((filePath, index) => {
+      const dir = path.dirname(filePath);
+      const base = path.basename(filePath, path.extname(filePath));
+      const srtPath = path.join(dir, base + '.srt');
+      const hasSubtitle = fs.existsSync(srtPath);
+      return {
+        id: String(index + 1),
+        filePath,
+        name: path.basename(filePath),
+        mimeType: getMimeType(filePath),
+        hasSubtitle,
+      };
+    });
     return this.library;
   }
 
-  _loadLibraryFromCache() {
+  async _loadLibraryFromCache() {
     if (!this.libraryCache || typeof this.libraryCache.load !== 'function') {
       return false;
     }
@@ -113,72 +134,40 @@ class MediaServer {
         return false;
       }
 
-      const validFilePaths = [];
-      for (const entry of entries) {
-        const filePath = path.resolve(String(entry && entry.filePath ? entry.filePath : ''));
-        if (!filePath || !fs.existsSync(filePath)) {
-          return false;
-        }
+      // Fast startup path: trust cached entries and refresh in background.
+      const cachedFilePaths = entries
+        .map((entry) => path.resolve(String(entry && entry.filePath ? entry.filePath : '')))
+        .filter((filePath) => filePath.length > 0 && isSupportedMediaFile(filePath));
 
-        const stat = fs.statSync(filePath);
-        if (!stat.isFile()) {
-          return false;
-        }
-
-        if (!isSupportedMediaFile(filePath)) {
-          return false;
-        }
-
-        const cachedSize = Number(entry.size);
-        const cachedMtimeMs = Number(entry.mtimeMs);
-        if (!Number.isFinite(cachedSize) || !Number.isFinite(cachedMtimeMs)) {
-          return false;
-        }
-
-        if (stat.size !== cachedSize || Math.abs(stat.mtimeMs - cachedMtimeMs) > 1) {
-          return false;
-        }
-
-        validFilePaths.push(filePath);
+      if (cachedFilePaths.length === 0) {
+        return false;
       }
 
-      this._applyLibraryFromPaths(validFilePaths);
+      this._applyLibraryFromPaths(cachedFilePaths);
       return true;
-    } catch {
+    } catch (error) {
+      console.error('Failed to load library from cache:', error);
       return false;
     }
   }
 
-  _saveLibraryCache() {
+  async _saveLibraryCache() {
     if (!this.libraryCache || typeof this.libraryCache.save !== 'function') {
       return;
     }
 
     try {
-      const entries = this.library
-        .map((item) => {
-          try {
-            const stat = fs.statSync(item.filePath);
-            return {
-              filePath: item.filePath,
-              size: stat.size,
-              mtimeMs: stat.mtimeMs,
-            };
-          } catch {
-            return null;
-          }
-        })
-        .filter((item) => item && item.filePath);
-
-      this.libraryCache.save({
-        version: 1,
+      const payload = {
         rootDirsSignature: this._getRootDirsSignature(),
-        rootDirs: this.getRootDirs(),
-        savedAt: new Date().toISOString(),
-        entries,
-      });
-    } catch {
-      // Ignore cache write failures.
+        entries: this.library.map((item) => ({
+          filePath: item.filePath,
+          size: fs.statSync(item.filePath).size,
+          mtimeMs: fs.statSync(item.filePath).mtimeMs,
+        })),
+      }
+      await this.libraryCache.save(payload);
+    } catch (error) {
+      console.error('Failed to save library cache:', error);
     }
   }
 
@@ -190,8 +179,25 @@ class MediaServer {
     }
 
     this._applyLibraryFromPaths(allFiles);
-    this._saveLibraryCache();
+    await this._saveLibraryCache();
     return this.library;
+  }
+
+  _startBackgroundLibraryRefresh() {
+    if (this.backgroundRefreshPromise || this.rootDirs.length === 0) {
+      return;
+    }
+
+    this.backgroundRefreshPromise = (async () => {
+      try {
+        await this.buildLibrary();
+        console.log(`[Library] Background refresh complete. Indexed ${this.library.length} item(s).`);
+      } catch (error) {
+        console.warn(`[Library] Background refresh failed: ${error.message}`);
+      } finally {
+        this.backgroundRefreshPromise = null;
+      }
+    })();
   }
 
   getRootDirs() {
@@ -238,6 +244,127 @@ class MediaServer {
     return `http://${this.host}:${this.port}/media/${encodeURIComponent(id)}/${encodeURIComponent(fileName)}`;
   }
 
+  _subtitlePathForMedia(media) {
+    const dir = path.dirname(media.filePath);
+    const base = path.basename(media.filePath, path.extname(media.filePath));
+    return path.join(dir, `${base}.srt`);
+  }
+
+  _applySubtitleDelay(subtitleContent, delayMs = 0) {
+    const shift = Number(delayMs);
+    if (!Number.isFinite(shift) || shift === 0) {
+      return subtitleContent;
+    }
+
+    const toMs = (hh, mm, ss, mmm) => (
+      Number(hh) * 3600000
+      + Number(mm) * 60000
+      + Number(ss) * 1000
+      + Number(mmm)
+    );
+
+    const toSrtTime = (totalMs) => {
+      const clamped = Math.max(0, Math.floor(totalMs));
+      const hh = Math.floor(clamped / 3600000);
+      const mm = Math.floor((clamped % 3600000) / 60000);
+      const ss = Math.floor((clamped % 60000) / 1000);
+      const mmm = clamped % 1000;
+
+      const pad2 = (v) => String(v).padStart(2, '0');
+      const pad3 = (v) => String(v).padStart(3, '0');
+      return `${pad2(hh)}:${pad2(mm)}:${pad2(ss)},${pad3(mmm)}`;
+    };
+
+    return subtitleContent.replace(
+      /(\d{2}):(\d{2}):(\d{2}),(\d{3})\s+-->\s+(\d{2}):(\d{2}):(\d{2}),(\d{3})/g,
+      (
+        _,
+        sh,
+        sm,
+        ss,
+        sms,
+        eh,
+        em,
+        es,
+        ems,
+      ) => {
+        const start = toMs(sh, sm, ss, sms) + shift;
+        const end = toMs(eh, em, es, ems) + shift;
+        return `${toSrtTime(start)} --> ${toSrtTime(end)}`;
+      },
+    );
+  }
+
+  async _downloadSubtitleForMedia(media) {
+    const srtPath = this._subtitlePathForMedia(media);
+    if (fs.existsSync(srtPath)) {
+      return srtPath;
+    }
+
+    try {
+      const size = fs.statSync(media.filePath).size;
+      const searchUrl = `https://rest.opensubtitles.org/search/moviebytesize-${size}/sublanguageid-eng`;
+      const searchResponse = await axios.get(searchUrl, {
+        headers: { 'User-Agent': 'TemporaryMediaCast/1.0' },
+        timeout: 7000,
+      });
+
+      const first = Array.isArray(searchResponse.data) ? searchResponse.data[0] : null;
+      if (!first || !first.SubDownloadLink) {
+        return null;
+      }
+
+      console.log(`[Subtitle] Downloading subtitles for: ${media.filePath}`);
+      console.log(`[Subtitle] OpenSubtitles search URL: ${searchUrl}`);
+      if (first && first.SubDownloadLink) {
+        console.log(`[Subtitle] Found subtitle: ${first.SubDownloadLink}`);
+      } else {
+        console.warn(`[Subtitle] No subtitles found for: ${media.filePath}`);
+      }
+
+      const subtitleResponse = await axios.get(first.SubDownloadLink, {
+        responseType: 'arraybuffer',
+        timeout: 10000,
+      });
+
+      const rawBuffer = Buffer.from(subtitleResponse.data);
+      const isGzip = rawBuffer.length >= 2 && rawBuffer[0] === 0x1f && rawBuffer[1] === 0x8b;
+      const subtitleBuffer = isGzip ? zlib.gunzipSync(rawBuffer) : rawBuffer;
+
+      fs.writeFileSync(srtPath, subtitleBuffer);
+      return fs.existsSync(srtPath) ? srtPath : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async getSubtitleUrl(id, options = {}) {
+    if (!this.host || this.host === '127.0.0.1') {
+      throw new Error(
+        'Media server bound to localhost. Renderer cannot access it. Use --host with your computer\'s network IP address.',
+      );
+    }
+
+    const media = this.getMediaById(id);
+    if (!media) {
+      return null;
+    }
+
+    const allowDownload = options.allowDownload !== false;
+    let srtPath = this._subtitlePathForMedia(media);
+
+    if (!fs.existsSync(srtPath) && allowDownload) {
+      srtPath = await this._downloadSubtitleForMedia(media);
+    }
+
+    if (!srtPath || !fs.existsSync(srtPath)) {
+      return null;
+    }
+
+    media.hasSubtitle = true;
+    return `http://${this.host}:${this.port}/subtitles/${encodeURIComponent(String(id))}`;
+  }
+
   async _handleMediaRequest(req, res, media) {
     console.log(`[HTTP] Request for media: ${media.name}`);
 
@@ -260,12 +387,24 @@ class MediaServer {
     try {
       if (willTranscode) {
         console.log(`[TRANSCODE] Starting for ${media.name}`);
+        // Detect .srt file for burn-in
+        const dir = path.dirname(media.filePath);
+        const base = path.basename(media.filePath, path.extname(media.filePath));
+        const srtPath = path.join(dir, base + '.srt');
+        const subtitlesPath = fs.existsSync(srtPath) ? srtPath : null;
+        if (subtitlesPath) {
+          console.log(`[TRANSCODE] Burning in subtitles: ${srtPath}`);
+        }
         const transcoder = new FFmpegTranscoder(media.filePath, {
           videoCodec: this.transcoding.videoCodec,
           videoPreset: this.transcoding.videoPreset,
           videoCrf: this.transcoding.videoCrf,
           audioCodec: this.transcoding.audioCodec,
           audioBitrate: this.transcoding.audioBitrate,
+          videoMaxrate: this.transcoding.videoMaxrate,
+          videoBufsize: this.transcoding.videoBufsize,
+          videoGop: this.transcoding.videoGop,
+          subtitlesPath,
         });
 
         const cacheKey = `${media.id}:${Date.now()}`;
@@ -432,9 +571,11 @@ class MediaServer {
 
   async start() {
     const libraryLoadStartedAt = Date.now();
-    const loadedFromCache = this._loadLibraryFromCache();
+    const loadedFromCache = await this._loadLibraryFromCache();
     if (!loadedFromCache) {
       await this.buildLibrary();
+    } else {
+      this._startBackgroundLibraryRefresh();
     }
     const libraryLoadDurationMs = Date.now() - libraryLoadStartedAt;
     const libraryLoadSource = loadedFromCache ? 'cache' : 'scan';
@@ -445,6 +586,32 @@ class MediaServer {
       if (parsed.pathname === '/library') {
         res.setHeader('Content-Type', 'application/json');
         res.end(JSON.stringify(this.library, null, 2));
+        return;
+      }
+
+      // Serve subtitles: /subtitles/:id
+      if (parsed.pathname.startsWith('/subtitles/')) {
+        const subtitlePath = decodeURIComponent(parsed.pathname.replace('/subtitles/', ''));
+        const subId = subtitlePath.split('/')[0];
+        const media = this.getMediaById(subId);
+        if (!media) {
+          sendNotFound(res);
+          return;
+        }
+        const base = path.basename(media.filePath, path.extname(media.filePath));
+        const srtPath = this._subtitlePathForMedia(media);
+        if (!fs.existsSync(srtPath)) {
+          sendNotFound(res);
+          return;
+        }
+        res.setHeader('Content-Type', 'application/x-subrip; charset=utf-8');
+        res.setHeader('Content-Disposition', `inline; filename="${base}.srt"`);
+        const subtitleContent = fs.readFileSync(srtPath, 'utf8');
+        const subtitleDelayMs = this.subtitles && Number.isFinite(Number(this.subtitles.delayMs))
+          ? Number(this.subtitles.delayMs)
+          : 0;
+        const shiftedContent = this._applySubtitleDelay(subtitleContent, subtitleDelayMs);
+        res.end(shiftedContent);
         return;
       }
 
@@ -483,8 +650,9 @@ class MediaServer {
       libraryLoad: {
         source: libraryLoadSource,
         durationMs: libraryLoadDurationMs,
+        backgroundRefreshPending: Boolean(this.backgroundRefreshPromise),
       },
-    };
+    }
   }
 
   stop() {
@@ -506,6 +674,6 @@ class MediaServer {
   }
 }
 
-module.exports = {
+export {
   MediaServer,
-};
+}

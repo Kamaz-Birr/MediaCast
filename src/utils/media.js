@@ -1,5 +1,5 @@
-const path = require('path');
-const mime = require('mime-types');
+import path from 'path';
+import mime from 'mime-types';
 
 const SUPPORTED_EXTENSIONS = [
   '.mp4',
@@ -15,7 +15,7 @@ const SUPPORTED_EXTENSIONS = [
   '.ts',
 ];
 
-function isSupportedMediaFile(filePath) {
+export function isSupportedMediaFile(filePath) {
   if (/\.d\.ts$/i.test(filePath)) {
     return false;
   }
@@ -23,11 +23,11 @@ function isSupportedMediaFile(filePath) {
   return SUPPORTED_EXTENSIONS.includes(ext);
 }
 
-function getMimeType(filePath) {
+export function getMimeType(filePath) {
   return mime.lookup(filePath) || 'application/octet-stream';
 }
 
-function getDlnaContentFeatures(filePath) {
+export function getDlnaContentFeatures(filePath) {
   const ext = path.extname(filePath).toLowerCase();
   // LG TVs require explicit DLNA.ORG_PN profile names — '*' causes error 714.
   // DLNA.ORG_OP=01 = byte seek + time seek; DLNA.ORG_CI=0 = not converted;
@@ -54,13 +54,13 @@ function getDlnaContentFeatures(filePath) {
   return flags;
 }
 
-function getDlnaProtocolInfo(filePath) {
+export function getDlnaProtocolInfo(filePath) {
   const mimeType = getMimeType(filePath);
   const contentFeatures = getDlnaContentFeatures(filePath);
   return `http-get:*:${mimeType}:${contentFeatures}`;
 }
 
-function mediaKind(filePath) {
+export function mediaKind(filePath) {
   const mimeType = getMimeType(filePath);
   if (mimeType.startsWith('audio/')) {
     return 'audio';
@@ -71,7 +71,7 @@ function mediaKind(filePath) {
   return 'other';
 }
 
-function printSupportedFormats() {
+export function printSupportedFormats() {
   return {
     containers: ['MP4', 'MKV', 'AVI', 'MOV', 'M4V', 'TS'],
     audio: ['MP3', 'AAC', 'M4A', 'WAV', 'FLAC', 'AC3 (renderer dependent passthrough)'],
@@ -86,13 +86,3 @@ function printSupportedFormats() {
     ],
   };
 }
-
-module.exports = {
-  SUPPORTED_EXTENSIONS,
-  isSupportedMediaFile,
-  getMimeType,
-  getDlnaProtocolInfo,
-  getDlnaContentFeatures,
-  mediaKind,
-  printSupportedFormats,
-};

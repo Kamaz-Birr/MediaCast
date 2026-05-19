@@ -1,6 +1,7 @@
-const axios = require('axios');
-const { Client } = require('node-ssdp');
-const { XMLParser } = require('fast-xml-parser');
+import axios from 'axios';
+import pkgSSDP from 'node-ssdp';
+const { Client } = pkgSSDP;
+import { XMLParser } from 'fast-xml-parser';
 
 const parser = new XMLParser({
   ignoreAttributes: false,
@@ -72,12 +73,47 @@ async function parseDeviceDescription(location) {
 }
 
 async function getRendererByIp(ip, port = 1029) {
-  const candidates = [
-    `http://${ip}:${port}/description.xml`,
-    `http://${ip}:${port}/DeviceDescription.xml`,
-    `http://${ip}:${port}/dmr/description.xml`,
-    `http://${ip}:${port}/`,
-  ];
+  const targetIp = String(ip || '').trim();
+  if (!targetIp) {
+    return null;
+  }
+
+  // First pass: use SSDP discovery and match by advertised location host.
+  try {
+    const discovered = await discoverRenderers(3500);
+    const matched = discovered.find((renderer) => {
+      try {
+        return new URL(renderer.location).hostname === targetIp;
+      } catch {
+        return false;
+      }
+    });
+
+    if (matched?.services?.avTransport?.controlUrl) {
+      return matched;
+    }
+  } catch {
+    // Continue to direct HTTP probing fallback.
+  }
+
+  // Fallback: probe common description endpoints across likely ports.
+  const ports = Array.from(new Set([
+    Number(port),
+    80,
+    1400,
+    1029,
+    1527,
+  ].filter((value) => Number.isFinite(value) && value > 0)));
+
+  const candidates = [];
+  for (const candidatePort of ports) {
+    candidates.push(
+      `http://${targetIp}:${candidatePort}/description.xml`,
+      `http://${targetIp}:${candidatePort}/DeviceDescription.xml`,
+      `http://${targetIp}:${candidatePort}/dmr/description.xml`,
+      `http://${targetIp}:${candidatePort}/`,
+    );
+  }
 
   for (const location of candidates) {
     try {
@@ -147,7 +183,7 @@ function pickRenderer(renderers, query) {
   );
 }
 
-module.exports = {
+export {
   discoverRenderers,
   pickRenderer,
   getRendererByIp,

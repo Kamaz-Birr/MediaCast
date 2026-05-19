@@ -1,5 +1,5 @@
-const axios = require('axios');
-const { XMLParser } = require('fast-xml-parser');
+import axios from 'axios';
+import { XMLParser } from 'fast-xml-parser';
 
 const parser = new XMLParser({
   ignoreAttributes: false,
@@ -131,6 +131,35 @@ async function getCurrentTransportActions(renderer) {
   }
 }
 
+async function getPositionInfo(renderer) {
+  try {
+    return await sendSoapAction({
+      controlUrl: renderer.services.avTransport.controlUrl,
+      serviceType: renderer.services.avTransport.serviceType,
+      action: 'GetPositionInfo',
+      params: {
+        InstanceID: '0',
+      },
+    });
+  } catch (err) {
+    console.warn(`[GetPositionInfo] Failed: ${err.message}`);
+    return null;
+  }
+}
+
+async function seek(renderer, target, unit = 'REL_TIME') {
+  return sendSoapAction({
+    controlUrl: renderer.services.avTransport.controlUrl,
+    serviceType: renderer.services.avTransport.serviceType,
+    action: 'Seek',
+    params: {
+      InstanceID: '0',
+      Unit: String(unit),
+      Target: String(target),
+    },
+  });
+}
+
 async function play(renderer, speed = '1') {
   try {
     console.log(`[SOAP_DEBUG] Sending Play action with Speed=${speed}`);
@@ -187,9 +216,9 @@ async function setVolume(renderer, desiredVolume) {
       DesiredVolume: String(desiredVolume),
     },
   });
-
 }
-module.exports = {
+
+export {
   setAvTransportUri,
   play,
   pause,
@@ -197,4 +226,6 @@ module.exports = {
   setVolume,
   getTransportInfo,
   getCurrentTransportActions,
+  getPositionInfo,
+  seek,
 };

@@ -1,6 +1,6 @@
-const fs = require('fs');
-const path = require('path');
-const { spawn } = require('child_process');
+import fs from 'fs';
+import path from 'path';
+import { spawn } from 'child_process';
 
 const DLNA_SAFE_CONTAINER = 'mp4';
 const DLNA_SAFE_VIDEO_CODEC = 'h264';
@@ -136,7 +136,7 @@ async function shouldTranscode(filePath, options = {}) {
   }
 }
 
-module.exports = {
+export {
   probeFile,
   needsTranscoding,
   shouldTranscode,
@@ -144,3 +144,4 @@ module.exports = {
   DLNA_SAFE_VIDEO_CODEC,
   DLNA_SAFE_AUDIO_CODEC,
 };
+

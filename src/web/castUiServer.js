@@ -1,15 +1,22 @@
-const http = require('http');
-const fs = require('fs');
-const path = require('path');
-const { buildDidlLite } = require('../dlna/metadata');
-const { setAvTransportUri, play, stop, getTransportInfo } = require('../upnp/soap');
-const { discoverRenderers } = require('../upnp/discovery');
-const {
+import http from 'http';
+import fs from 'fs';
+import path from 'path';
+import { buildDidlLite } from '../dlna/metadata.js';
+import {
+  setAvTransportUri,
+  play,
+  stop,
+  seek,
+  getTransportInfo,
+  getPositionInfo,
+} from '../upnp/soap.js';
+import { discoverRenderers } from '../upnp/discovery.js';
+import {
   fetchMovieMetadata,
   fetchSeriesMetadata,
   fetchEpisodeMetadata,
   extractMovieTitle,
-} = require('./metadataFetcher');
+} from './metadataFetcher.js';
 
 function sendJson(res, statusCode, payload) {
   res.statusCode = statusCode;
@@ -26,6 +33,8 @@ function isLikelyMovie(media) {
     return false;
   }
 
+  console.log(`[Categorization] Checking if media is a movie: ${media.filePath}`);
+
   if (/\.d\.ts$/i.test(media.filePath)) {
     return false;
   }
@@ -39,6 +48,8 @@ const CATEGORY_MOVIES = 'movies';
 const CATEGORY_TV_SHOWS = 'tv-shows';
 const CATEGORY_ANIME_MOVIES = 'anime-movies';
 const CATEGORY_ANIME_SHOWS = 'anime-shows';
+const AUTO_NEXT_CREDITS_PROGRESS = 0.92;
+const AUTO_NEXT_CREDITS_REMAINING_SEC = 90;
 
 function splitPathParts(filePath) {
   return path.resolve(filePath).split(/[\\/]+/).filter(Boolean);
@@ -298,7 +309,8 @@ function buildPageHtml(rendererName) {
       display: inline-block;
     }
 
-    .renderer-dropdown-btn {
+    .renderer-dropdown-btn,
+    .sort-select {
       min-height: 46px;
       min-width: 280px;
       background: rgba(255, 255, 255, 0.03);
@@ -318,7 +330,31 @@ function buildPageHtml(rendererName) {
       transition: border-color 0.18s, box-shadow 0.18s;
     }
 
+    .sort-select {
+      width: auto;
+      display: inline-flex;
+      align-items: center;
+      justify-content: space-between;
+      appearance: none;
+      -webkit-appearance: none;
+      -moz-appearance: none;
+      background-image:
+        linear-gradient(45deg, transparent 50%, var(--text) 50%),
+        linear-gradient(135deg, var(--text) 50%, transparent 50%);
+      background-position:
+        calc(100% - 20px) calc(50% - 2px),
+        calc(100% - 14px) calc(50% - 2px);
+      background-size: 6px 6px, 6px 6px;
+      background-repeat: no-repeat;
+      padding-right: 36px;
+    }
+
     .renderer-dropdown-btn[aria-expanded="true"] {
+      border-color: rgba(96, 165, 250, 0.85);
+      box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.22);
+    }
+
+    .sort-select:focus {
       border-color: rgba(96, 165, 250, 0.85);
       box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.22);
     }
@@ -485,6 +521,19 @@ function buildPageHtml(rendererName) {
       color: #93c5fd;
     }
 
+    .neu-btn.resume {
+      color: #fef08a;
+      border-color: rgba(250, 204, 21, 0.55);
+      background: rgba(250, 204, 21, 0.12);
+      box-shadow: 0 0 0 1px rgba(250, 204, 21, 0.24), 6px 6px 12px rgba(0, 0, 0, 0.35);
+    }
+
+    .neu-btn.resume:hover {
+      color: #fef9c3;
+      background: rgba(250, 204, 21, 0.2);
+      border-color: rgba(250, 204, 21, 0.82);
+    }
+
     .status {
       background: var(--surface);
       border: 1px solid var(--stroke);
@@ -592,6 +641,34 @@ function buildPageHtml(rendererName) {
       border: 2px solid #ffffff;
       box-shadow: 0 6px 14px rgba(0, 0, 0, 0.42);
       pointer-events: none;
+    }
+
+    .resume-tag {
+      position: absolute;
+      top: 14px;
+      left: 14px;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      z-index: 9;
+      pointer-events: none;
+    }
+
+    .resume-tag .dot {
+      width: 14px;
+      height: 14px;
+      border-radius: 999px;
+      background: #facc15;
+      box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.45), 0 0 14px rgba(250, 204, 21, 0.55);
+    }
+
+    .resume-tag .label {
+      color: #fef08a;
+      font-size: 0.82rem;
+      font-weight: 800;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+      text-shadow: 0 2px 6px rgba(0, 0, 0, 0.6);
     }
 
     .movie-title {
@@ -726,6 +803,10 @@ function buildPageHtml(rendererName) {
         </div>
         <button class="neu-btn secondary" id="refreshRenderersBtn">Refresh Renderers</button>
         <button class="neu-btn" id="refreshBtn">Rescan Library</button>
+        <select id="sortSelect" class="sort-select" aria-label="Sort media">
+          <option value="alpha" selected>Sort: Alphabetical</option>
+          <option value="recent">Sort: Recently Added</option>
+        </select>
         <button class="neu-btn" id="addFolderBtn">Add Media Folder</button>
         <button class="neu-btn secondary" id="backBtn" style="display:none">Back</button>
         <button class="neu-btn danger" id="stopBtn">Stop Cast</button>
@@ -752,13 +833,28 @@ function buildPageHtml(rendererName) {
     };
 
     let currentCategory = 'movies';
+    let currentSort = 'alpha';
     let currentGroupedData = [];
     let selectedShowName = null;
     let expandedSeasonName = null;
     let currentRendererName = '${rendererName}';
+    let lastSeenAutoAdvanceAt = '';
+    let activeSessions = [];
     const watchedItemIds = new Set();
+    const resumeByKey = new Map();
     const statusBox = document.getElementById('statusBox');
     const grid = document.getElementById('grid');
+    // Track active playback state in frontend
+    let activePlayback = {
+      mediaId: null,
+      resumeKey: null,
+      rendererName: null,
+      positionSec: 0,
+      durationSec: null,
+      timerInterval: null,
+      playButtonRef: null,
+      lastUpdate: 0,
+    };
     const categoryTabs = document.getElementById('categoryTabs');
     const targetRendererName = document.getElementById('targetRendererName');
     const rendererDropdownBtn = document.getElementById('rendererDropdownBtn');
@@ -766,9 +862,12 @@ function buildPageHtml(rendererName) {
     const rendererDropdownLabel = document.getElementById('rendererDropdownLabel');
     const refreshRenderersBtn = document.getElementById('refreshRenderersBtn');
     const refreshBtn = document.getElementById('refreshBtn');
+    const sortSelect = document.getElementById('sortSelect');
     const addFolderBtn = document.getElementById('addFolderBtn');
     const backBtn = document.getElementById('backBtn');
     const stopBtn = document.getElementById('stopBtn');
+    let isLibraryLoading = false;
+    let lastMetadataVersion = 0;
 
     function isShowCategory(category) {
       return category === 'tv-shows' || category === 'anime-shows';
@@ -922,6 +1021,102 @@ function buildPageHtml(rendererName) {
       return value.toFixed(value >= 10 || unit === 0 ? 0 : 1) + ' ' + units[unit];
     }
 
+    function formatResumeClock(totalSeconds) {
+      const seconds = Math.max(0, Math.floor(Number(totalSeconds) || 0));
+      const hours = Math.floor(seconds / 3600);
+      const minutes = Math.floor((seconds % 3600) / 60);
+      const secs = seconds % 60;
+      if (hours > 0) {
+        return String(hours).padStart(2, '0') + ':' + String(minutes).padStart(2, '0') + ':' + String(secs).padStart(2, '0');
+      }
+      return String(minutes).padStart(2, '0') + ':' + String(secs).padStart(2, '0');
+    }
+
+    function findActiveSessionByMediaId(mediaId) {
+      const id = String(mediaId || '').trim();
+      if (!id) {
+        return null;
+      }
+
+      return activeSessions.find((session) => String(session && session.mediaId || '') === id) || null;
+    }
+
+    function normalizeClientResumeKey(value) {
+      return String(value || '').trim().replace(/\\\\/g, '/').toLowerCase();
+    }
+
+    function getResumeInfo(item) {
+      const watchedKey = item.watchedKey || item.filePath || item.id;
+      const resume = resumeByKey.get(watchedKey);
+      if (!resume || watchedItemIds.has(watchedKey)) {
+        return null;
+      }
+
+      const positionSec = Math.max(0, Math.floor(Number(resume.positionSec) || 0));
+      const durationSec = Math.floor(Number(resume.durationSec) || 0);
+      const explicitProgress = Number(resume.progress);
+      const progress = Number.isFinite(explicitProgress)
+        ? explicitProgress
+        : (durationSec > 0 ? (positionSec / durationSec) : null);
+
+      if (!positionSec || (Number.isFinite(progress) && progress >= 0.95)) {
+        return null;
+      }
+
+      return {
+        key: watchedKey,
+        positionSec,
+        durationSec: durationSec > 0 ? durationSec : null,
+        progress: Number.isFinite(progress) ? progress : null,
+      };
+    }
+
+    function setResumeCardState(card, isResumable) {
+      const existingTag = card.querySelector('.resume-tag');
+      // Find the item id for this card
+      const cardId = card && card.__mediaId;
+      const activeSession = findActiveSessionByMediaId(cardId);
+      const isCasting = Boolean(activeSession && activeSession.rendererName);
+      const isStoppedResume = activePlayback && activePlayback.lastStoppedSec && !isCasting && activePlayback.playButtonRef && activePlayback.playButtonRef.closest('.movie-card') === card;
+      if (isResumable && !existingTag) {
+        const tag = document.createElement('div');
+        tag.className = 'resume-tag';
+
+        const dot = document.createElement('span');
+        dot.className = 'dot';
+
+        const label = document.createElement('span');
+        label.className = 'label';
+        if (isCasting) {
+          label.textContent = 'Playback on ' + activeSession.rendererName;
+        } else if (isStoppedResume) {
+          label.textContent = 'Resume';
+        } else {
+          label.textContent = 'Resume';
+        }
+
+        tag.appendChild(dot);
+        tag.appendChild(label);
+        card.appendChild(tag);
+      } else if (isResumable && existingTag) {
+        // Update label if needed
+        const label = existingTag.querySelector('.label');
+        if (label) {
+          if (isCasting) {
+            label.textContent = 'Playback on ' + activeSession.rendererName;
+          } else if (isStoppedResume) {
+            label.textContent = 'Resume';
+          } else {
+            label.textContent = 'Resume';
+          }
+        }
+      }
+
+      if (!isResumable && existingTag) {
+        existingTag.remove();
+      }
+    }
+
     function createEmptyState(noFolders, category) {
       const empty = document.createElement('div');
       empty.className = 'empty';
@@ -949,13 +1144,19 @@ function buildPageHtml(rendererName) {
     }
 
     async function castItem(item, button) {
+      const resumeInfo = getResumeInfo(item);
+      let resumeSeconds = resumeInfo ? resumeInfo.positionSec : 0;
+      // If lastStoppedSec is set for this item, use it minus 5 seconds (min 0)
+      if (activePlayback && activePlayback.lastStoppedSec && activePlayback.playButtonRef === button) {
+        resumeSeconds = Math.max(0, activePlayback.lastStoppedSec - 5);
+      }
       button.disabled = true;
-      setStatus('Casting ' + (item.movieTitle || item.name) + '...');
+      setStatus((resumeSeconds > 0 ? 'Resuming ' : 'Casting ') + (item.movieTitle || item.name) + '...');
       try {
         const response = await fetch('/api/cast', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id: item.id }),
+          body: JSON.stringify({ id: item.id, resume: resumeSeconds > 0 }),
         });
         const result = await response.json();
         if (!response.ok || !result.ok) {
@@ -964,7 +1165,35 @@ function buildPageHtml(rendererName) {
         if (result.rendererName) {
           setCurrentRendererName(result.rendererName);
         }
-        setStatus('Now playing on ' + currentRendererName + ': ' + (item.movieTitle || item.name));
+        const resumedFromSec = Math.max(0, Math.floor(Number(result.resumedFromSec) || 0));
+        // Set active playback state
+        activePlayback.mediaId = item.id;
+        activePlayback.resumeKey = item.watchedKey || item.filePath || item.id;
+        activePlayback.rendererName = result.rendererName || currentRendererName;
+        activePlayback.positionSec = resumedFromSec;
+        activePlayback.durationSec = resumeInfo && resumeInfo.durationSec ? resumeInfo.durationSec : null;
+        activePlayback.lastUpdate = Date.now();
+        activePlayback.playButtonRef = button;
+        if (activePlayback.timerInterval) clearInterval(activePlayback.timerInterval);
+        activePlayback.timerInterval = setInterval(() => {
+          activePlayback.positionSec++;
+          // Update play button text in real time if still casting
+          if (activePlayback.playButtonRef && activePlayback.mediaId === item.id) {
+            activePlayback.playButtonRef.textContent = 'Playback ' + formatResumeClock(activePlayback.positionSec);
+          }
+        }, 1000);
+        if (resumedFromSec > 0) {
+          setStatus('Resumed on ' + currentRendererName + ': ' + (item.movieTitle || item.name) + ' at ' + formatResumeClock(resumedFromSec) + '.');
+        } else {
+          setStatus('Now playing on ' + currentRendererName + ': ' + (item.movieTitle || item.name));
+        }
+        // Instead of re-rendering the grid, update the badge and play button in place
+        // Update resume badge
+        const card = button.closest('.movie-card');
+        if (card) {
+          setResumeCardState(card, true);
+        }
+        // Play button text is already updated by timer
       } catch (error) {
         setStatus('Cast failed: ' + error.message, true);
       } finally {
@@ -993,6 +1222,7 @@ function buildPageHtml(rendererName) {
     function createMovieCard(item) {
         const card = document.createElement('article');
         card.className = 'movie-card';
+        card.__mediaId = item.id;
 
         if (item.posterUrl) {
           const img = document.createElement('img');
@@ -1034,7 +1264,33 @@ function buildPageHtml(rendererName) {
 
         const playButton = document.createElement('button');
         playButton.className = 'neu-btn';
-        playButton.textContent = 'Play';
+        const initialResumeInfo = getResumeInfo(item);
+        function updatePlayButtonText() {
+            const activeSession = findActiveSessionByMediaId(item.id);
+            const isCasting = Boolean(activeSession && activeSession.rendererName);
+          if (isCasting) {
+              if (activePlayback && activePlayback.mediaId === item.id) {
+                playButton.textContent = 'Playback ' + formatResumeClock(activePlayback.positionSec);
+              } else {
+                playButton.textContent = 'Playback';
+              }
+            playButton.classList.add('resume');
+            // Track the play button for timer updates
+              if (activePlayback && activePlayback.mediaId === item.id) {
+                activePlayback.playButtonRef = playButton;
+              }
+          } else if (activePlayback && activePlayback.lastStoppedSec && activePlayback.playButtonRef === playButton) {
+            playButton.textContent = 'Resume ' + formatResumeClock(activePlayback.lastStoppedSec);
+            playButton.classList.add('resume');
+          } else if (initialResumeInfo) {
+            playButton.textContent = 'Resume ' + formatResumeClock(initialResumeInfo.positionSec);
+            playButton.classList.add('resume');
+          } else {
+            playButton.textContent = 'Play';
+            playButton.classList.remove('resume');
+          }
+        }
+        updatePlayButtonText();
         playButton.addEventListener('click', (event) => {
           event.stopPropagation();
           castItem(item, playButton);
@@ -1047,6 +1303,7 @@ function buildPageHtml(rendererName) {
         watchedButton.addEventListener('click', async (event) => {
           event.stopPropagation();
           const watchedKey = item.watchedKey || item.filePath || item.id;
+          const watchedMediaId = String(item.id || '').trim();
           if (!watchedKey) {
             return;
           }
@@ -1057,7 +1314,11 @@ function buildPageHtml(rendererName) {
             const response = await fetch('/api/watched', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ key: watchedKey, watched: !isCurrentlyWatched }),
+              body: JSON.stringify({
+                key: watchedKey,
+                id: watchedMediaId,
+                watched: !isCurrentlyWatched,
+              }),
             });
             const result = await response.json();
             if (!response.ok || !result.ok) {
@@ -1071,6 +1332,48 @@ function buildPageHtml(rendererName) {
               watchedItemIds.delete(watchedKey);
               setWatchedCardState(card, watchedButton, false);
             }
+
+            // Clear any global last-stopped state to prevent unintended resume.
+            activePlayback.lastStoppedSec = 0;
+
+            // Reset local playback memory for this item so next play starts at 00:00.
+            if (activePlayback) {
+              const isSameItem = activePlayback.resumeKey === watchedKey
+                || activePlayback.mediaId === item.id
+                || activePlayback.playButtonRef === playButton;
+
+              if (isSameItem) {
+                if (activePlayback.timerInterval) {
+                  clearInterval(activePlayback.timerInterval);
+                }
+                activePlayback.mediaId = null;
+                activePlayback.resumeKey = null;
+                activePlayback.rendererName = null;
+                activePlayback.positionSec = 0;
+                activePlayback.durationSec = null;
+                activePlayback.lastUpdate = 0;
+                activePlayback.playButtonRef = null;
+                activePlayback.lastStoppedSec = 0;
+              }
+            }
+
+            const clearKeys = [
+              watchedKey,
+              watchedMediaId,
+              item.filePath,
+            ];
+            const normalizedClearKeys = new Set(
+              clearKeys.map((key) => normalizeClientResumeKey(key)).filter((key) => key.length > 0),
+            );
+            for (const existingKey of Array.from(resumeByKey.keys())) {
+              const normalizedExisting = normalizeClientResumeKey(existingKey);
+              if (normalizedClearKeys.has(normalizedExisting)) {
+                resumeByKey.delete(existingKey);
+              }
+            }
+            setResumeCardState(card, false);
+            playButton.textContent = 'Play';
+            playButton.classList.remove('resume');
           } catch (error) {
             setStatus('Watched update failed: ' + error.message, true);
           } finally {
@@ -1090,6 +1393,18 @@ function buildPageHtml(rendererName) {
 
         const watchedKey = item.watchedKey || item.filePath || item.id;
         setWatchedCardState(card, watchedButton, watchedItemIds.has(watchedKey));
+        // Update resume badge to match play button state
+        setResumeCardState(card, Boolean(initialResumeInfo) || Boolean(findActiveSessionByMediaId(item.id)));
+    // Listen for stop cast to clear active playback
+    stopBtn.addEventListener('click', () => {
+      if (activePlayback.timerInterval) clearInterval(activePlayback.timerInterval);
+      activePlayback.mediaId = null;
+      activePlayback.resumeKey = null;
+      activePlayback.rendererName = null;
+      activePlayback.positionSec = 0;
+      activePlayback.durationSec = null;
+      activePlayback.lastUpdate = 0;
+    });
 
         card.addEventListener('click', () => castItem(item, playButton));
         card.appendChild(overlay);
@@ -1363,10 +1678,15 @@ function buildPageHtml(rendererName) {
       });
     }
 
-    async function loadLibrary(forceRefresh = false) {
-      setStatus(forceRefresh ? 'Refreshing media library...' : 'Loading media library...');
+    async function loadLibrary(forceRefresh = false, options = {}) {
+      const silent = Boolean(options && options.silent);
+      if (!silent) {
+        setStatus(forceRefresh ? 'Refreshing media library...' : 'Loading media library...');
+      }
+      isLibraryLoading = true;
       try {
         const params = new URLSearchParams({ category: currentCategory });
+        params.set('sort', currentSort);
         if (forceRefresh) {
           params.set('refresh', '1');
         }
@@ -1376,6 +1696,9 @@ function buildPageHtml(rendererName) {
         if (!response.ok || !result.ok) {
           throw new Error(result.error || ('HTTP ' + response.status));
         }
+        if (Number.isFinite(Number(result.metadataVersion))) {
+          lastMetadataVersion = Number(result.metadataVersion);
+        }
 
         watchedItemIds.clear();
         const watchedKeys = Array.isArray(result.watchedKeys) ? result.watchedKeys : [];
@@ -1383,6 +1706,27 @@ function buildPageHtml(rendererName) {
           if (typeof watchedKey === 'string' && watchedKey.length > 0) {
             watchedItemIds.add(watchedKey);
           }
+        }
+
+        resumeByKey.clear();
+        const resumePositions = result.resumePositions && typeof result.resumePositions === 'object'
+          ? result.resumePositions
+          : {};
+        for (const [resumeKey, entry] of Object.entries(resumePositions)) {
+          const key = String(resumeKey || '').trim();
+          const positionSec = Number(entry && entry.positionSec);
+          if (!key || !Number.isFinite(positionSec) || positionSec <= 0) {
+            continue;
+          }
+
+          const durationSec = Number(entry && entry.durationSec);
+          const progress = Number(entry && entry.progress);
+          resumeByKey.set(key, {
+            positionSec,
+            durationSec: Number.isFinite(durationSec) && durationSec > 0 ? durationSec : null,
+            progress: Number.isFinite(progress) ? progress : null,
+            updatedAt: entry && entry.updatedAt ? entry.updatedAt : null,
+          });
         }
 
         const hasGroups = Array.isArray(result.groups) && result.groups.length > 0;
@@ -1403,17 +1747,20 @@ function buildPageHtml(rendererName) {
           renderItems(result.items || [], result.noFolders, currentCategory);
         }
 
-        if (result.noFolders) {
-          setStatus('No media folder selected. Click "Add Media Folder" to choose your default folder.');
-        } else {
-          const total = hasGroups
-            ? countGroupedItems(result.groups)
-            : (result.items || []).length;
-          const categoryName = CATEGORY_LABELS[currentCategory] || 'Titles';
-          if (isShowCategory(currentCategory)) {
-            setStatus('Showing ' + (result.groups || []).length + ' show(s) in ' + categoryName + '.');
+        if (!silent) {
+          if (result.noFolders) {
+            setStatus('No media folder selected. Click "Add Media Folder" to choose your default folder.');
           } else {
-            setStatus('Showing ' + total + ' item(s) in ' + categoryName + '.');
+            const total = hasGroups
+              ? countGroupedItems(result.groups)
+              : (result.items || []).length;
+            const categoryName = CATEGORY_LABELS[currentCategory] || 'Titles';
+            const sortLabel = currentSort === 'recent' ? 'Recently Added' : 'Alphabetical';
+            if (isShowCategory(currentCategory)) {
+              setStatus('Showing ' + (result.groups || []).length + ' show(s) in ' + categoryName + ' (' + sortLabel + ').');
+            } else {
+              setStatus('Showing ' + total + ' item(s) in ' + categoryName + ' (' + sortLabel + ').');
+            }
           }
         }
       } catch (error) {
@@ -1423,10 +1770,74 @@ function buildPageHtml(rendererName) {
         setBackButton(false);
         renderItems([], false, currentCategory);
         setStatus('Library load failed: ' + error.message, true);
+      } finally {
+        isLibraryLoading = false;
+      }
+    }
+
+    async function pollMetadataUpdates() {
+      if (isLibraryLoading) {
+        return;
+      }
+
+      try {
+        const response = await fetch('/api/library/status');
+        const result = await response.json();
+        if (!response.ok || !result.ok) {
+          return;
+        }
+
+        const nextVersion = Number(result.metadataVersion) || 0;
+        if (nextVersion > lastMetadataVersion) {
+          lastMetadataVersion = nextVersion;
+          await loadLibrary(false, { silent: true });
+        }
+      } catch {
+        // Ignore transient polling errors.
+      }
+    }
+
+    async function pollPlaybackState() {
+      try {
+        const response = await fetch('/api/playback-state');
+        const result = await response.json();
+        if (!response.ok || !result.ok) {
+          return;
+        }
+
+        activeSessions = Array.isArray(result.sessions) ? result.sessions : [];
+        const cards = document.querySelectorAll('.movie-card');
+        cards.forEach((card) => {
+          const cardId = card && card.__mediaId;
+          const hasResumeTag = Boolean(card.querySelector('.resume-tag'));
+          const resumeInfo = cardId
+            ? resumeByKey.get(cardId)
+            : null;
+          setResumeCardState(card, hasResumeTag || Boolean(resumeInfo) || Boolean(findActiveSessionByMediaId(cardId)));
+        });
+
+        const event = result.autoAdvance;
+        if (event && event.at && event.at !== lastSeenAutoAdvanceAt) {
+          lastSeenAutoAdvanceAt = event.at;
+          const fromTitle = event.fromTitle || 'current episode';
+          const toTitle = event.toTitle || 'next episode';
+          const rendererName = event.rendererName || result.rendererName || currentRendererName;
+          setStatus('Auto-playing next episode on ' + rendererName + ': ' + fromTitle + ' -> ' + toTitle + '.');
+        }
+      } catch (error) {
+        // Ignore transient polling failures to avoid noisy UI.
       }
     }
 
     refreshBtn.addEventListener('click', () => loadLibrary(true));
+
+    sortSelect.addEventListener('change', () => {
+      currentSort = sortSelect.value === 'recent' ? 'recent' : 'alpha';
+      selectedShowName = null;
+      expandedSeasonName = null;
+      setBackButton(false);
+      loadLibrary(false);
+    });
 
     refreshRenderersBtn.addEventListener('click', async () => {
       refreshRenderersBtn.disabled = true;
@@ -1543,6 +1954,31 @@ function buildPageHtml(rendererName) {
           setCurrentRendererName(result.rendererName);
         }
         setStatus('Playback stopped on ' + currentRendererName + '.');
+        // Save last stopped time for resume
+        if (activePlayback && activePlayback.mediaId && activePlayback.positionSec) {
+          activePlayback.lastStoppedSec = activePlayback.positionSec;
+        }
+        // Update badge and play button to show resume + last stopped time
+        if (activePlayback && activePlayback.playButtonRef) {
+          const card = activePlayback.playButtonRef.closest('.movie-card');
+          if (card) {
+            setResumeCardState(card, true);
+          }
+          if (typeof activePlayback.lastStoppedSec === 'number') {
+            activePlayback.playButtonRef.textContent = 'Resume ' + formatResumeClock(activePlayback.lastStoppedSec);
+            activePlayback.playButtonRef.classList.add('resume');
+          }
+        }
+        // Clear active playback state except lastStoppedSec
+        if (activePlayback.timerInterval) clearInterval(activePlayback.timerInterval);
+        activePlayback.mediaId = null;
+        activePlayback.resumeKey = null;
+        activePlayback.rendererName = null;
+        activePlayback.positionSec = 0;
+        activePlayback.durationSec = null;
+        activePlayback.lastUpdate = 0;
+        activePlayback.playButtonRef = null;
+        // Do not clear lastStoppedSec so resume can use it
       } catch (error) {
         setStatus('Stop failed: ' + error.message, true);
       } finally {
@@ -1554,6 +1990,9 @@ function buildPageHtml(rendererName) {
     syncActiveCategoryButton();
     loadRenderers(true);
     loadLibrary(false);
+    pollPlaybackState();
+    setInterval(pollPlaybackState, 4000);
+    setInterval(pollMetadataUpdates, 3000);
   </script>
 </body>
 </html>`;
@@ -1573,15 +2012,58 @@ function readRequestBody(req) {
   });
 }
 
-async function castMediaItem(renderer, mediaServer, media) {
+function parseDlnaClockToSeconds(value) {
+  const raw = String(value || '').trim();
+  if (!raw || raw === 'NOT_IMPLEMENTED') {
+    return null;
+  }
+
+  const match = raw.match(/^(\d{1,2}):(\d{2}):(\d{2})$/);
+  if (!match) {
+    return null;
+  }
+
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  const seconds = Number(match[3]);
+  if (!Number.isFinite(hours) || !Number.isFinite(minutes) || !Number.isFinite(seconds)) {
+    return null;
+  }
+
+  return (hours * 3600) + (minutes * 60) + seconds;
+}
+
+function formatSecondsAsDlnaClock(value) {
+  const total = Math.max(0, Math.floor(Number(value) || 0));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+}
+
+async function castMediaItem(renderer, mediaServer, media, options = {}) {
+  const startSeconds = Math.max(0, Math.floor(Number(options.startSeconds) || 0));
   const mediaUrl = mediaServer.getMediaUrl(media.id);
+  const subtitleUrl = await mediaServer.getSubtitleUrl(media.id, { allowDownload: true });
+  console.log(`[CastUI] Subtitle for ${media.name}: ${subtitleUrl || 'none'}`);
   const metadata = buildDidlLite({
     title: media.name,
     filePath: media.filePath,
     mediaUrl,
+    subtitleUrl,
   });
 
   try {
+    // Some renderers keep internal resume/bookmark state per prior item.
+    // Reset transport when starting fresh playback.
+    if (startSeconds <= 0) {
+      try {
+        await stop(renderer);
+      } catch {
+        // Ignore if renderer is already stopped.
+      }
+    }
+
     await setAvTransportUri(renderer, mediaUrl, metadata);
   } catch (err) {
     const message = String(err && err.message ? err.message : '');
@@ -1592,7 +2074,26 @@ async function castMediaItem(renderer, mediaServer, media) {
     }
   }
 
-  await play(renderer);
+  if (startSeconds > 0) {
+    await play(renderer);
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    try {
+      await seek(renderer, formatSecondsAsDlnaClock(startSeconds));
+    } catch (err) {
+      console.warn(`[CastUI] Resume seek failed: ${err.message}`);
+    }
+    await play(renderer);
+  } else {
+    // Force start-at-beginning for non-resume playback.
+    await play(renderer);
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    try {
+      await seek(renderer, '00:00:00');
+    } catch (err) {
+      console.warn(`[CastUI] Start-from-beginning seek failed: ${err.message}`);
+    }
+    await play(renderer);
+  }
 
   // Renderer state can lag behind Play by ~1s.
   await new Promise((resolve) => setTimeout(resolve, 1000));
@@ -1606,6 +2107,7 @@ async function castMediaItem(renderer, mediaServer, media) {
   return {
     mediaUrl,
     transportState: state || 'unknown',
+    resumedFromSec: startSeconds > 0 ? startSeconds : 0,
   };
 }
 
@@ -1618,15 +2120,332 @@ function createCastUiServer({
   onMediaFoldersChanged,
   initialWatchedKeys = [],
   onWatchedKeysChanged,
+  initialResumePositions = {},
+  onResumePositionsChanged,
 }) {
   let server = null;
   let selectedRenderer = renderer || null;
   let availableRenderers = selectedRenderer ? [selectedRenderer] : [];
+  let progressPollTimer = null;
+  const activePlaybacks = new Map();
+  let lastAutoAdvanceEvent = null;
   const watchedMediaKeys = new Set(
     (Array.isArray(initialWatchedKeys) ? initialWatchedKeys : [])
       .map((item) => String(item || '').trim())
       .filter((item) => item.length > 0),
   );
+  const resumePositions = new Map();
+
+  const trackingKeyFromMedia = (media) => String((media && (media.filePath || media.id)) || '').trim();
+  const normalizeResumeKey = (value) => {
+    const raw = String(value || '').trim();
+    if (!raw) {
+      return '';
+    }
+
+    const normalized = raw.replace(/\\/g, '/');
+    return process.platform === 'win32'
+      ? normalized.toLowerCase()
+      : normalized;
+  };
+
+  const clearResumePositionForIdentifiers = (identifiers) => {
+    const needles = new Set(
+      (Array.isArray(identifiers) ? identifiers : [])
+        .map((item) => normalizeResumeKey(item))
+        .filter((item) => item.length > 0),
+    );
+
+    if (needles.size === 0) {
+      return false;
+    }
+
+    let changed = false;
+    for (const resumeKey of Array.from(resumePositions.keys())) {
+      if (needles.has(normalizeResumeKey(resumeKey))) {
+        resumePositions.delete(resumeKey);
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      persistResumePositions();
+    }
+
+    return changed;
+  };
+
+  for (const [key, value] of Object.entries(initialResumePositions && typeof initialResumePositions === 'object'
+    ? initialResumePositions
+    : {})) {
+    const resumeKey = String(key || '').trim();
+    const positionSec = Number(value && value.positionSec);
+    const durationSec = Number(value && value.durationSec);
+    const progress = Number(value && value.progress);
+    if (!resumeKey || !Number.isFinite(positionSec) || positionSec <= 0) {
+      continue;
+    }
+    resumePositions.set(resumeKey, {
+      positionSec,
+      durationSec: Number.isFinite(durationSec) && durationSec > 0 ? durationSec : null,
+      progress: Number.isFinite(progress) ? progress : null,
+      updatedAt: (value && value.updatedAt) || new Date().toISOString(),
+    });
+  }
+
+  const persistResumePositions = () => {
+    if (typeof onResumePositionsChanged !== 'function') {
+      return;
+    }
+
+    const payload = {};
+    for (const [key, value] of resumePositions.entries()) {
+      payload[key] = {
+        positionSec: value.positionSec,
+        durationSec: value.durationSec,
+        progress: value.progress,
+        updatedAt: value.updatedAt,
+      };
+    }
+    onResumePositionsChanged(payload);
+  };
+
+  const setResumePosition = (key, positionSec, durationSec) => {
+    const resumeKey = String(key || '').trim();
+    if (!resumeKey) {
+      return;
+    }
+
+    const safePosition = Math.max(0, Math.floor(Number(positionSec) || 0));
+    const safeDuration = Number.isFinite(Number(durationSec)) && Number(durationSec) > 0
+      ? Math.floor(Number(durationSec))
+      : null;
+    const progress = safeDuration ? (safePosition / safeDuration) : null;
+
+    if (!safePosition || (Number.isFinite(progress) && progress >= 0.95)) {
+      if (resumePositions.delete(resumeKey)) {
+        persistResumePositions();
+      }
+      return;
+    }
+
+    resumePositions.set(resumeKey, {
+      positionSec: safePosition,
+      durationSec: safeDuration,
+      progress: Number.isFinite(progress) ? progress : null,
+      updatedAt: new Date().toISOString(),
+    });
+    persistResumePositions();
+  };
+
+  const clearResumePosition = (key) => {
+    const resumeKey = String(key || '').trim();
+    if (!resumeKey) {
+      return;
+    }
+    if (resumePositions.delete(resumeKey)) {
+      persistResumePositions();
+    }
+  };
+
+  const isShowCategoryFromMedia = (media) => {
+    if (!media || !media.filePath) {
+      return false;
+    }
+    const category = categoryFromPath(media.filePath);
+    return category === CATEGORY_TV_SHOWS || category === CATEGORY_ANIME_SHOWS;
+  };
+
+  const mediaEpisodeIndexInfo = (media) => {
+    if (!media || !media.filePath) {
+      return null;
+    }
+
+    const category = categoryFromPath(media.filePath);
+    if (category !== CATEGORY_TV_SHOWS && category !== CATEGORY_ANIME_SHOWS) {
+      return null;
+    }
+
+    const showName = extractSeriesName(media.filePath, category);
+    const episodeInfo = extractSeasonEpisodeInfo(media.filePath);
+    if (!Number.isFinite(episodeInfo.seasonNumber) || !Number.isFinite(episodeInfo.episodeNumber)) {
+      return null;
+    }
+
+    return {
+      category,
+      showName,
+      seasonNumber: episodeInfo.seasonNumber,
+      episodeNumber: episodeInfo.episodeNumber,
+    };
+  };
+
+  const findNextEpisode = (currentMedia) => {
+    const currentInfo = mediaEpisodeIndexInfo(currentMedia);
+    if (!currentInfo) {
+      return null;
+    }
+
+    const episodeCandidates = mediaServer.library
+      .filter((item) => isLikelyMovie(item))
+      .map((item) => {
+        const info = mediaEpisodeIndexInfo(item);
+        if (!info) {
+          return null;
+        }
+        if (info.category !== currentInfo.category || info.showName !== currentInfo.showName) {
+          return null;
+        }
+        return {
+          media: item,
+          seasonNumber: info.seasonNumber,
+          episodeNumber: info.episodeNumber,
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => {
+        if (a.seasonNumber !== b.seasonNumber) {
+          return a.seasonNumber - b.seasonNumber;
+        }
+        if (a.episodeNumber !== b.episodeNumber) {
+          return a.episodeNumber - b.episodeNumber;
+        }
+        return String(a.media.filePath || '').localeCompare(String(b.media.filePath || ''));
+      });
+
+    const currentIndex = episodeCandidates.findIndex((entry) => entry.media.id === currentMedia.id);
+    if (currentIndex < 0) {
+      return null;
+    }
+
+    const nextEntry = episodeCandidates[currentIndex + 1] || null;
+    return nextEntry ? nextEntry.media : null;
+  };
+
+  const shouldAutoAdvanceToNextEpisode = (media, relTimeSec, durationSec) => {
+    if (!isShowCategoryFromMedia(media)) {
+      return false;
+    }
+    if (!Number.isFinite(relTimeSec) || relTimeSec <= 0) {
+      return false;
+    }
+    if (!Number.isFinite(durationSec) || durationSec <= 0) {
+      return false;
+    }
+
+    const progress = relTimeSec / durationSec;
+    const remaining = durationSec - relTimeSec;
+    return progress >= AUTO_NEXT_CREDITS_PROGRESS || remaining <= AUTO_NEXT_CREDITS_REMAINING_SEC;
+  };
+
+  const autoAdvanceToNextEpisode = async (sessionKey, session) => {
+    if (!session || session.autoAdvanceInProgress || !session.mediaId || !session.renderer) {
+      return;
+    }
+
+    const currentMedia = mediaServer.getMediaById(session.mediaId);
+    if (!currentMedia) {
+      return;
+    }
+
+    const nextEpisode = findNextEpisode(currentMedia);
+    if (!nextEpisode) {
+      return;
+    }
+
+    session.autoAdvanceInProgress = true;
+    activePlaybacks.set(sessionKey, session);
+    try {
+      console.log(`[CastUI] Auto-advancing to next episode: ${nextEpisode.name}`);
+      const fromTitle = safeBasename(path.basename(currentMedia.name, path.extname(currentMedia.name)).replace(/[._]+/g, ' ').trim());
+      const toTitle = safeBasename(path.basename(nextEpisode.name, path.extname(nextEpisode.name)).replace(/[._]+/g, ' ').trim());
+      await castMediaItem(session.renderer, mediaServer, nextEpisode, { startSeconds: 0 });
+
+      const nextResumeKey = trackingKeyFromMedia(nextEpisode);
+      const rendererName = session.renderer && session.renderer.friendlyName
+        ? session.renderer.friendlyName
+        : 'Unknown Renderer';
+      lastAutoAdvanceEvent = {
+        at: new Date().toISOString(),
+        fromTitle,
+        toTitle,
+        rendererName,
+        mediaId: nextEpisode.id,
+      };
+      const updatedSession = {
+        mediaId: nextEpisode.id,
+        resumeKey: nextResumeKey,
+        renderer: session.renderer,
+        durationSec: null,
+        autoAdvanceInProgress: false,
+      };
+      activePlaybacks.set(sessionKey, updatedSession);
+
+      // Capture initial position for the new episode quickly.
+      await pollActivePlaybackPosition(sessionKey, updatedSession).catch(() => {});
+    } catch (error) {
+      session.autoAdvanceInProgress = false;
+      activePlaybacks.set(sessionKey, session);
+      console.warn(`[CastUI] Auto-next-episode failed: ${error.message}`);
+    }
+  };
+
+  const stopPlaybackProgressPolling = () => {
+    if (progressPollTimer) {
+      clearInterval(progressPollTimer);
+      progressPollTimer = null;
+    }
+  };
+
+  const pollActivePlaybackPosition = async (sessionKey, session) => {
+    if (!session || !session.renderer || !session.resumeKey) {
+      return;
+    }
+
+    const positionInfo = await getPositionInfo(session.renderer);
+    const response = positionInfo
+      && positionInfo['s:Envelope']
+      && positionInfo['s:Envelope']['s:Body']
+      && positionInfo['s:Envelope']['s:Body']['u:GetPositionInfoResponse'];
+
+    if (!response) {
+      return;
+    }
+
+    const relTimeSec = parseDlnaClockToSeconds(response.RelTime);
+    const durationSec = parseDlnaClockToSeconds(response.TrackDuration) || session.durationSec || null;
+    if (!Number.isFinite(relTimeSec) || relTimeSec <= 0) {
+      return;
+    }
+
+    setResumePosition(session.resumeKey, relTimeSec, durationSec);
+    session.durationSec = durationSec;
+    activePlaybacks.set(sessionKey, session);
+
+    const currentMedia = mediaServer.getMediaById(session.mediaId);
+    if (currentMedia && shouldAutoAdvanceToNextEpisode(currentMedia, relTimeSec, durationSec)) {
+      await autoAdvanceToNextEpisode(sessionKey, session);
+    }
+  };
+
+  const pollAllActivePlaybackPositions = async () => {
+    if (activePlaybacks.size === 0) {
+      return;
+    }
+
+    const tasks = [];
+    for (const [sessionKey, session] of activePlaybacks.entries()) {
+      tasks.push(pollActivePlaybackPosition(sessionKey, session).catch(() => {}));
+    }
+    await Promise.all(tasks);
+  };
+
+  const startPlaybackProgressPolling = () => {
+    stopPlaybackProgressPolling();
+    progressPollTimer = setInterval(() => {
+      pollAllActivePlaybackPositions().catch(() => {});
+    }, 15000);
+  };
 
   const rendererKey = (item) => String((item && (item.udn || item.location)) || '').trim();
 
@@ -1695,10 +2514,14 @@ function createCastUiServer({
     .filter(isLikelyMovie)
     .map((item) => {
       let size = null;
+      let addedAtMs = null;
       try {
-        size = fs.statSync(item.filePath).size;
+        const stat = fs.statSync(item.filePath);
+        size = stat.size;
+        addedAtMs = Number.isFinite(stat.mtimeMs) ? stat.mtimeMs : null;
       } catch (err) {
         size = null;
+        addedAtMs = null;
       }
 
       return {
@@ -1708,10 +2531,155 @@ function createCastUiServer({
         watchedKey: item.filePath,
         mimeType: item.mimeType,
         size,
+        addedAtMs,
       };
     });
 
   const metadataMap = new Map();
+  const metadataPending = new Map();
+  let metadataVersion = 0;
+  const MAX_METADATA_CONCURRENCY = 4;
+  const metadataQueue = [];
+  let metadataInFlight = 0;
+
+  const pumpMetadataQueue = () => {
+    while (metadataInFlight < MAX_METADATA_CONCURRENCY && metadataQueue.length > 0) {
+      const runTask = metadataQueue.shift();
+      metadataInFlight += 1;
+      Promise.resolve()
+        .then(() => runTask())
+        .catch(() => {})
+        .finally(() => {
+          metadataInFlight -= 1;
+          pumpMetadataQueue();
+        });
+    }
+  };
+
+  const buildLocalMetadata = (item) => {
+    const category = categoryFromPath(item.filePath);
+    const showName = category === CATEGORY_TV_SHOWS || category === CATEGORY_ANIME_SHOWS
+      ? extractSeriesName(item.filePath, category)
+      : null;
+    const seasonInfo = (category === CATEGORY_TV_SHOWS || category === CATEGORY_ANIME_SHOWS)
+      ? extractSeasonEpisodeInfo(item.filePath)
+      : null;
+    const fallbackSeriesTitle = extractSeriesTitleFromEpisodeName(item.name);
+    const searchTitle = showName || fallbackSeriesTitle || extractMovieTitle(item.name);
+    const isShowCategory = category === CATEGORY_TV_SHOWS || category === CATEGORY_ANIME_SHOWS;
+    const displayTitle = showName
+      ? safeBasename(path.basename(item.name, path.extname(item.name)).replace(/[._]+/g, ' ').trim())
+      : searchTitle;
+
+    return {
+      category,
+      showName,
+      seasonInfo,
+      fallbackSeriesTitle,
+      searchTitle,
+      isShowCategory,
+      displayTitle,
+      enriched: {
+        movieTitle: displayTitle,
+        showName,
+        showDisplayTitle: isShowCategory ? (showName || displayTitle) : null,
+        showPosterUrl: null,
+        showPlot: null,
+        showImdbRating: null,
+        showYear: null,
+        seasonLabel: seasonInfo ? seasonInfo.seasonLabel : null,
+        seasonNumber: seasonInfo ? seasonInfo.seasonNumber : null,
+        episodeNumber: seasonInfo ? seasonInfo.episodeNumber : null,
+        seasonSort: seasonInfo ? seasonInfo.seasonSort : null,
+        episodeSort: seasonInfo ? seasonInfo.episodeSort : null,
+        posterUrl: null,
+        year: null,
+        plot: null,
+        imdbRating: null,
+      },
+    };
+  };
+
+  const queueMetadataFetch = (item, local) => {
+    if (metadataMap.has(item.id) || metadataPending.has(item.id)) {
+      return;
+    }
+
+    let resolvePending = null;
+    const pendingPromise = new Promise((resolve) => {
+      resolvePending = resolve;
+    });
+    metadataPending.set(item.id, pendingPromise);
+
+    metadataQueue.push(async () => {
+      try {
+        const seriesResult = local.isShowCategory
+          ? await fetchSeriesMetadataWithFallback([
+            local.searchTitle,
+            local.fallbackSeriesTitle,
+            extractMovieTitle(item.name),
+          ])
+          : null;
+
+        const metadata = local.isShowCategory
+          ? seriesResult.metadata
+          : await fetchMovieMetadata(local.searchTitle);
+
+        const seriesLookupTitle = local.isShowCategory
+          ? (seriesResult.matchedTitle || local.searchTitle)
+          : local.searchTitle;
+
+        const episodeMetadata = (
+          local.isShowCategory
+          && local.seasonInfo
+          && Number.isFinite(local.seasonInfo.seasonNumber)
+          && Number.isFinite(local.seasonInfo.episodeNumber)
+        )
+          ? await fetchEpisodeMetadata(
+            seriesLookupTitle,
+            local.seasonInfo.seasonNumber,
+            local.seasonInfo.episodeNumber,
+            local.displayTitle,
+          )
+          : null;
+
+        const episodeTitle = (episodeMetadata && episodeMetadata.title) || local.displayTitle;
+        const episodePoster = (episodeMetadata && episodeMetadata.posterUrl) || (metadata && metadata.posterUrl) || null;
+        const episodePlot = (episodeMetadata && episodeMetadata.plot) || (metadata && metadata.plot) || null;
+        const episodeRating = (episodeMetadata && episodeMetadata.imdbRating) || (metadata && metadata.imdbRating) || null;
+        const episodeYear = (episodeMetadata && episodeMetadata.year) || (metadata && metadata.year) || null;
+
+        metadataMap.set(item.id, {
+          movieTitle: episodeTitle,
+          showName: local.showName,
+          showDisplayTitle: local.isShowCategory ? ((metadata && metadata.title) || local.showName) : null,
+          showPosterUrl: local.isShowCategory ? ((metadata && metadata.posterUrl) || null) : null,
+          showPlot: local.isShowCategory ? ((metadata && metadata.plot) || null) : null,
+          showImdbRating: local.isShowCategory ? ((metadata && metadata.imdbRating) || null) : null,
+          showYear: local.isShowCategory ? ((metadata && metadata.year) || null) : null,
+          seasonLabel: local.seasonInfo ? local.seasonInfo.seasonLabel : null,
+          seasonNumber: local.seasonInfo ? local.seasonInfo.seasonNumber : null,
+          episodeNumber: local.seasonInfo ? local.seasonInfo.episodeNumber : null,
+          seasonSort: local.seasonInfo ? local.seasonInfo.seasonSort : null,
+          episodeSort: local.seasonInfo ? local.seasonInfo.episodeSort : null,
+          posterUrl: episodePoster,
+          year: episodeYear,
+          plot: episodePlot,
+          imdbRating: episodeRating,
+        });
+        metadataVersion += 1;
+      } catch {
+        // Ignore metadata fetch failures.
+      } finally {
+        metadataPending.delete(item.id);
+        if (resolvePending) {
+          resolvePending();
+        }
+      }
+    });
+
+    pumpMetadataQueue();
+  };
 
   const enrichItemsWithMetadata = async (items) => {
     const result = [];
@@ -1723,86 +2691,37 @@ function createCastUiServer({
           ...metadataMap.get(item.id),
         });
       } else {
-        const category = categoryFromPath(item.filePath);
-        const showName = category === CATEGORY_TV_SHOWS || category === CATEGORY_ANIME_SHOWS
-          ? extractSeriesName(item.filePath, category)
-          : null;
-        const seasonInfo = (category === CATEGORY_TV_SHOWS || category === CATEGORY_ANIME_SHOWS)
-          ? extractSeasonEpisodeInfo(item.filePath)
-          : null;
-        const isShowCategory = category === CATEGORY_TV_SHOWS || category === CATEGORY_ANIME_SHOWS;
-        const fallbackSeriesTitle = extractSeriesTitleFromEpisodeName(item.name);
-        const searchTitle = showName || fallbackSeriesTitle || extractMovieTitle(item.name);
-        const displayTitle = showName
-          ? safeBasename(path.basename(item.name, path.extname(item.name)).replace(/[._]+/g, ' ').trim())
-          : searchTitle;
-
-        const seriesResult = isShowCategory
-          ? await fetchSeriesMetadataWithFallback([searchTitle, fallbackSeriesTitle, extractMovieTitle(item.name)])
-          : null;
-        const metadata = isShowCategory
-          ? seriesResult.metadata
-          : await fetchMovieMetadata(searchTitle);
-        const seriesLookupTitle = isShowCategory ? (seriesResult.matchedTitle || searchTitle) : searchTitle;
-        const episodeMetadata = (isShowCategory
-          && seasonInfo
-          && Number.isFinite(seasonInfo.seasonNumber)
-          && Number.isFinite(seasonInfo.episodeNumber))
-          ? await fetchEpisodeMetadata(seriesLookupTitle, seasonInfo.seasonNumber, seasonInfo.episodeNumber, displayTitle)
-          : null;
-
-        const episodeTitle = (episodeMetadata && episodeMetadata.title) || displayTitle;
-        const episodePoster = (episodeMetadata && episodeMetadata.posterUrl) || metadata.posterUrl;
-        const episodePlot = (episodeMetadata && episodeMetadata.plot) || metadata.plot;
-        const episodeRating = (episodeMetadata && episodeMetadata.imdbRating) || metadata.imdbRating;
-        const episodeYear = (episodeMetadata && episodeMetadata.year) || metadata.year;
-        const enriched = {
+        const local = buildLocalMetadata(item);
+        queueMetadataFetch(item, local);
+        result.push({
           ...item,
-          movieTitle: episodeTitle,
-          showName,
-          showDisplayTitle: isShowCategory ? (metadata.title || showName) : null,
-          showPosterUrl: isShowCategory ? metadata.posterUrl : null,
-          showPlot: isShowCategory ? metadata.plot : null,
-          showImdbRating: isShowCategory ? metadata.imdbRating : null,
-          showYear: isShowCategory ? metadata.year : null,
-          seasonLabel: seasonInfo ? seasonInfo.seasonLabel : null,
-          seasonNumber: seasonInfo ? seasonInfo.seasonNumber : null,
-          episodeNumber: seasonInfo ? seasonInfo.episodeNumber : null,
-          seasonSort: seasonInfo ? seasonInfo.seasonSort : null,
-          episodeSort: seasonInfo ? seasonInfo.episodeSort : null,
-          posterUrl: episodePoster,
-          year: episodeYear,
-          plot: episodePlot,
-          imdbRating: episodeRating,
-        };
-        metadataMap.set(item.id, {
-          movieTitle: episodeTitle,
-          showName,
-          showDisplayTitle: isShowCategory ? (metadata.title || showName) : null,
-          showPosterUrl: isShowCategory ? metadata.posterUrl : null,
-          showPlot: isShowCategory ? metadata.plot : null,
-          showImdbRating: isShowCategory ? metadata.imdbRating : null,
-          showYear: isShowCategory ? metadata.year : null,
-          seasonLabel: seasonInfo ? seasonInfo.seasonLabel : null,
-          seasonNumber: seasonInfo ? seasonInfo.seasonNumber : null,
-          episodeNumber: seasonInfo ? seasonInfo.episodeNumber : null,
-          seasonSort: seasonInfo ? seasonInfo.seasonSort : null,
-          episodeSort: seasonInfo ? seasonInfo.episodeSort : null,
-          posterUrl: episodePoster,
-          year: episodeYear,
-          plot: episodePlot,
-          imdbRating: episodeRating,
+          ...local.enriched,
         });
-        result.push(enriched);
       }
     }
 
     return result;
   };
 
-  const getCategoryPayload = async (category) => {
+  const getCategoryPayload = async (category, sortMode = 'alpha') => {
+    const normalizedSort = sortMode === 'recent' ? 'recent' : 'alpha';
     const items = getMovieItems().filter((item) => categoryFromPath(item.filePath) === category);
     const enrichedItems = await enrichItemsWithMetadata(items);
+
+    const sortByTitle = (a, b) => {
+      const titleA = String(a.movieTitle || a.name || '').toLowerCase();
+      const titleB = String(b.movieTitle || b.name || '').toLowerCase();
+      return titleA.localeCompare(titleB);
+    };
+
+    const sortByRecent = (a, b) => {
+      const aTs = Number.isFinite(Number(a.addedAtMs)) ? Number(a.addedAtMs) : 0;
+      const bTs = Number.isFinite(Number(b.addedAtMs)) ? Number(b.addedAtMs) : 0;
+      if (bTs !== aTs) {
+        return bTs - aTs;
+      }
+      return sortByTitle(a, b);
+    };
 
     if (category === CATEGORY_TV_SHOWS || category === CATEGORY_ANIME_SHOWS) {
       const groupsMap = new Map();
@@ -1822,7 +2741,6 @@ function createCastUiServer({
       }
 
       const groups = Array.from(groupsMap.entries())
-        .sort((a, b) => a[0].localeCompare(b[0]))
         .map(([name, seasonsMap]) => {
           const seasons = Array.from(seasonsMap.entries())
             .map(([seasonName, itemsInSeason]) => {
@@ -1854,6 +2772,14 @@ function createCastUiServer({
           const firstWithPoster = enrichedItems.find((item) => (item.showName || 'Unknown Show') === name)
             || {};
 
+          const latestAddedAtMs = seasons.reduce((latest, season) => {
+            const seasonLatest = (season.items || []).reduce((seasonMax, episode) => {
+              const ts = Number.isFinite(Number(episode.addedAtMs)) ? Number(episode.addedAtMs) : 0;
+              return Math.max(seasonMax, ts);
+            }, 0);
+            return Math.max(latest, seasonLatest);
+          }, 0);
+
           return {
             name,
             displayTitle: (firstWithPoster.showDisplayTitle || firstWithPoster.showName || name),
@@ -1861,15 +2787,27 @@ function createCastUiServer({
             year: firstWithPoster.showYear || firstWithPoster.year || null,
             plot: firstWithPoster.showPlot || firstWithPoster.plot || null,
             imdbRating: firstWithPoster.showImdbRating || firstWithPoster.imdbRating || null,
+            latestAddedAtMs,
             seasons,
             items: [],
           };
+        })
+        .sort((a, b) => {
+          if (normalizedSort === 'recent') {
+            const aTs = Number.isFinite(Number(a.latestAddedAtMs)) ? Number(a.latestAddedAtMs) : 0;
+            const bTs = Number.isFinite(Number(b.latestAddedAtMs)) ? Number(b.latestAddedAtMs) : 0;
+            if (bTs !== aTs) {
+              return bTs - aTs;
+            }
+          }
+          return String(a.displayTitle || a.name || '').localeCompare(String(b.displayTitle || b.name || ''));
         });
 
       return { items: [], groups };
     }
 
-    return { items: enrichedItems, groups: [] };
+    const sortedItems = [...enrichedItems].sort(normalizedSort === 'recent' ? sortByRecent : sortByTitle);
+    return { items: sortedItems, groups: [] };
   };
 
   async function handleRequest(req, res) {
@@ -1944,19 +2882,23 @@ function createCastUiServer({
         if (parsed.searchParams.get('refresh') === '1') {
           await mediaServer.buildLibrary();
           metadataMap.clear();
+          metadataVersion += 1;
         }
         const category = String(parsed.searchParams.get('category') || CATEGORY_MOVIES);
+        const sort = String(parsed.searchParams.get('sort') || 'alpha');
         const noFolders = mediaServer.getRootDirs().length === 0;
         const payload = noFolders
           ? { items: [], groups: [] }
-          : await getCategoryPayload(category);
+          : await getCategoryPayload(category, sort);
         sendJson(res, 200, {
           ok: true,
           noFolders,
           category,
           items: payload.items,
           groups: payload.groups,
+          metadataVersion,
           watchedKeys: Array.from(watchedMediaKeys),
+          resumePositions: Object.fromEntries(resumePositions.entries()),
         });
       } catch (error) {
         sendJson(res, 500, {
@@ -1966,6 +2908,49 @@ function createCastUiServer({
       }
       return;
     }
+
+    if (req.method === 'GET' && parsed.pathname === '/api/library/status') {
+      sendJson(res, 200, {
+        ok: true,
+        metadataVersion,
+        pendingCount: metadataPending.size,
+        cachedCount: metadataMap.size,
+      });
+      return;
+    }
+
+    if (req.method === 'GET' && parsed.pathname === '/api/playback-state') {
+      const selectedRendererSession = selectedRenderer
+        ? activePlaybacks.get(rendererKey(selectedRenderer))
+        : null;
+      const rendererName = selectedRendererSession && selectedRendererSession.renderer && selectedRendererSession.renderer.friendlyName
+        ? selectedRendererSession.renderer.friendlyName
+        : (selectedRenderer && selectedRenderer.friendlyName ? selectedRenderer.friendlyName : 'Unknown Renderer');
+      const sessions = Array.from(activePlaybacks.values()).map((session) => {
+        const media = mediaServer.getMediaById(session.mediaId);
+        return {
+          mediaId: session.mediaId || null,
+          mediaName: media ? media.name : null,
+          rendererKey: rendererKey(session.renderer),
+          rendererName: session.renderer && session.renderer.friendlyName
+            ? session.renderer.friendlyName
+            : 'Unknown Renderer',
+          resumeKey: session.resumeKey || null,
+        };
+      });
+      sendJson(res, 200, {
+        ok: true,
+        active: Boolean(selectedRendererSession && selectedRendererSession.mediaId),
+        mediaId: selectedRendererSession && selectedRendererSession.mediaId
+          ? selectedRendererSession.mediaId
+          : null,
+        rendererName,
+        sessions,
+        autoAdvance: lastAutoAdvanceEvent,
+      });
+      return;
+    }
+
 
     if (req.method === 'POST' && parsed.pathname === '/api/cast') {
       try {
@@ -1984,7 +2969,29 @@ function createCastUiServer({
           return;
         }
 
-        const result = await castMediaItem(selectedRenderer, mediaServer, media);
+        const resumeKey = trackingKeyFromMedia(media);
+        const savedResume = resumePositions.get(resumeKey);
+        const requestedResume = payload.resume !== false;
+        const startSeconds = requestedResume && savedResume
+          ? Math.max(0, Math.floor(Number(savedResume.positionSec) || 0))
+          : 0;
+
+        const result = await castMediaItem(selectedRenderer, mediaServer, media, {
+          startSeconds,
+        });
+        const selectedKey = rendererKey(selectedRenderer);
+        activePlaybacks.set(selectedKey, {
+          mediaId: media.id,
+          resumeKey,
+          renderer: selectedRenderer,
+          durationSec: savedResume && Number.isFinite(savedResume.durationSec)
+            ? Math.floor(Number(savedResume.durationSec))
+            : null,
+          autoAdvanceInProgress: false,
+        });
+        startPlaybackProgressPolling();
+        pollAllActivePlaybackPositions().catch(() => {});
+
         sendJson(res, 200, {
           ok: true,
           media: {
@@ -1994,6 +3001,7 @@ function createCastUiServer({
           rendererName: selectedRenderer.friendlyName || 'Unknown Renderer',
           transportState: result.transportState,
           mediaUrl: result.mediaUrl,
+          resumedFromSec: result.resumedFromSec || 0,
         });
       } catch (error) {
         sendJson(res, 500, {
@@ -2014,7 +3022,16 @@ function createCastUiServer({
           return;
         }
 
+        const selectedKey = rendererKey(selectedRenderer);
+        const selectedSession = activePlaybacks.get(selectedKey);
+        if (selectedSession) {
+          await pollActivePlaybackPosition(selectedKey, selectedSession).catch(() => {});
+        }
         await stop(selectedRenderer);
+        activePlaybacks.delete(selectedKey);
+        if (activePlaybacks.size === 0) {
+          stopPlaybackProgressPolling();
+        }
         sendJson(res, 200, {
           ok: true,
           rendererName: selectedRenderer.friendlyName || 'Unknown Renderer',
@@ -2033,6 +3050,7 @@ function createCastUiServer({
         const body = await readRequestBody(req);
         const payload = JSON.parse(body || '{}');
         const key = String(payload.key || '').trim();
+        const mediaId = String(payload.id || '').trim();
         const watched = Boolean(payload.watched);
 
         if (!key) {
@@ -2049,6 +3067,29 @@ function createCastUiServer({
           watchedMediaKeys.delete(key);
         }
 
+        // Clicking Watched or Unmark clears any partial resume progress.
+        const mediaById = mediaId ? mediaServer.getMediaById(mediaId) : null;
+        const mediaPath = mediaById && mediaById.filePath ? String(mediaById.filePath).trim() : '';
+        const mediaTrackingKey = mediaById ? trackingKeyFromMedia(mediaById) : '';
+        const clearKeys = [key, mediaId, mediaPath, mediaTrackingKey];
+
+        clearResumePositionForIdentifiers(clearKeys);
+
+        const normalizedClearKeys = new Set(
+          clearKeys.map((item) => normalizeResumeKey(item)).filter((item) => item.length > 0),
+        );
+        for (const [sessionKey, session] of activePlaybacks.entries()) {
+          const sessionResumeKey = session && session.resumeKey
+            ? normalizeResumeKey(session.resumeKey)
+            : '';
+          if (session && normalizedClearKeys.has(sessionResumeKey)) {
+            activePlaybacks.delete(sessionKey);
+          }
+        }
+        if (activePlaybacks.size === 0) {
+          stopPlaybackProgressPolling();
+        }
+
         if (typeof onWatchedKeysChanged === 'function') {
           onWatchedKeysChanged(Array.from(watchedMediaKeys));
         }
@@ -2058,6 +3099,7 @@ function createCastUiServer({
           key,
           watched: watchedMediaKeys.has(key),
           watchedKeys: Array.from(watchedMediaKeys),
+          resumeCleared: true,
         });
       } catch (error) {
         sendJson(res, 500, {
@@ -2116,19 +3158,42 @@ function createCastUiServer({
 
   return {
     start: async () => {
-      server = http.createServer((req, res) => {
-        handleRequest(req, res).catch((error) => {
-          sendJson(res, 500, {
-            ok: false,
-            error: error.message,
+      const basePort = Number(uiPort);
+      const maxAttempts = 10;
+
+      for (let offset = 0; offset < maxAttempts; offset += 1) {
+        const attemptPort = basePort + offset;
+        server = http.createServer((req, res) => {
+          handleRequest(req, res).catch((error) => {
+            sendJson(res, 500, {
+              ok: false,
+              error: error.message,
+            });
           });
         });
-      });
 
-      await new Promise((resolve, reject) => {
-        server.once('error', reject);
-        server.listen(Number(uiPort), uiHost, () => resolve());
-      });
+        try {
+          await new Promise((resolve, reject) => {
+            server.once('error', reject);
+            server.listen(attemptPort, uiHost, () => resolve());
+          });
+          break;
+        } catch (error) {
+          if (error && error.code === 'EADDRINUSE' && offset < maxAttempts - 1) {
+            await new Promise((resolve) => {
+              server.close(() => resolve());
+            }).catch(() => {});
+            server = null;
+            continue;
+          }
+
+          throw error;
+        }
+      }
+
+      if (!server || !server.listening) {
+        throw new Error(`Unable to bind the web app to ${uiHost}:${basePort} or the next ${maxAttempts - 1} port(s).`);
+      }
 
       const address = server.address();
       return {
@@ -2137,6 +3202,8 @@ function createCastUiServer({
       };
     },
     stop: () => {
+      stopPlaybackProgressPolling();
+      activePlayback = null;
       if (!server) {
         return Promise.resolve();
       }
@@ -2151,6 +3218,4 @@ function createCastUiServer({
   };
 }
 
-module.exports = {
-  createCastUiServer,
-};
+export { createCastUiServer };

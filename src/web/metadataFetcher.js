@@ -1,10 +1,10 @@
-const https = require('https');
-const path = require('path');
+import https from 'https';
+import path from 'path';
 
 // In-memory cache for metadata lookups to avoid repeated API calls
 const metadataCache = new Map();
 
-function extractMovieTitle(filename) {
+export function extractMovieTitle(filename) {
   const baseName = path.basename(filename, path.extname(filename));
   // Remove common patterns like year (2020), quality (1080p, BluRay, etc.)
   const cleaned = baseName
@@ -265,15 +265,15 @@ async function fetchTitleMetadata(title, isSeries = false) {
   return metadata;
 }
 
-async function fetchMovieMetadata(movieTitle) {
+export async function fetchMovieMetadata(movieTitle) {
   return fetchTitleMetadata(movieTitle, false);
 }
 
-async function fetchSeriesMetadata(seriesTitle) {
+export async function fetchSeriesMetadata(seriesTitle) {
   return fetchTitleMetadata(seriesTitle, true);
 }
 
-async function fetchEpisodeMetadata(seriesTitle, seasonNumber, episodeNumber, fallbackTitle = null) {
+export async function fetchEpisodeMetadata(seriesTitle, seasonNumber, episodeNumber, fallbackTitle = null) {
   const cacheKey = `episode:${seriesTitle.toLowerCase()}:s${seasonNumber}:e${episodeNumber}`;
   if (metadataCache.has(cacheKey)) {
     return metadataCache.get(cacheKey);
@@ -294,7 +294,7 @@ async function fetchEpisodeMetadata(seriesTitle, seasonNumber, episodeNumber, fa
   return metadata;
 }
 
-async function fetchMetadataForLibrary(mediaItems) {
+export async function fetchMetadataForLibrary(mediaItems) {
   const results = [];
 
   for (const item of mediaItems) {
@@ -309,11 +309,3 @@ async function fetchMetadataForLibrary(mediaItems) {
 
   return results;
 }
-
-module.exports = {
-  fetchMovieMetadata,
-  fetchSeriesMetadata,
-  fetchEpisodeMetadata,
-  fetchMetadataForLibrary,
-  extractMovieTitle,
-};
