@@ -86,6 +86,39 @@ class MediaServer {
       delayMs: Number.isFinite(Number(subtitles.delayMs)) ? Number(subtitles.delayMs) : 0,
     };
     this.playlists = new Map();
+    // Per-item playback choices made in the web UI, consumed on the next request.
+    this.subtitleOverrides = new Map();
+    this.playbackOptions = new Map();
+  }
+
+  setSubtitleOverride(id, subtitlePath) {
+    const key = String(id || '').trim();
+    if (!key) {
+      return;
+    }
+    if (!subtitlePath) {
+      this.subtitleOverrides.delete(key);
+      return;
+    }
+    this.subtitleOverrides.set(key, path.resolve(subtitlePath));
+  }
+
+  setPlaybackOptions(id, options) {
+    const key = String(id || '').trim();
+    if (!key) {
+      return;
+    }
+    if (!options || typeof options !== 'object') {
+      this.playbackOptions.delete(key);
+      return;
+    }
+
+    const audioStreamIndex = Number(options.audioStreamIndex);
+    this.playbackOptions.set(key, {
+      audioStreamIndex: Number.isInteger(audioStreamIndex) && audioStreamIndex >= 0
+        ? audioStreamIndex
+        : null,
+    });
   }
 
 
@@ -268,6 +301,12 @@ class MediaServer {
   }
 
   _subtitlePathForMedia(media) {
+    // A track chosen in the UI wins over the sidecar sitting next to the file.
+    const override = this.subtitleOverrides.get(String(media.id));
+    if (override && fs.existsSync(override)) {
+      return override;
+    }
+
     const dir = path.dirname(media.filePath);
     const base = path.basename(media.filePath, path.extname(media.filePath));
     return path.join(dir, `${base}.srt`);
@@ -391,18 +430,30 @@ class MediaServer {
   async _handleMediaRequest(req, res, media) {
     console.log(`[HTTP] Request for media: ${media.name}`);
 
+    const playbackOptions = this.playbackOptions.get(String(media.id)) || {};
+    const audioStreamIndex = Number.isInteger(playbackOptions.audioStreamIndex)
+      ? playbackOptions.audioStreamIndex
+      : null;
+    // A renderer always plays the file's default audio track, so honouring a
+    // different choice means remuxing it ourselves.
+    const needsAudioSelection = audioStreamIndex !== null && audioStreamIndex > 0;
+
     let willTranscode = false;
 
     if (this.transcoding.enabled) {
       try {
-        willTranscode = await shouldTranscode(media.filePath, {
+        willTranscode = needsAudioSelection || await shouldTranscode(media.filePath, {
           forceTranscode: this.transcoding.forceTranscode,
           skipTranscode: this.transcoding.skipTranscode,
         });
       } catch (err) {
         console.warn(`[PROBE] Failed to detect transcode: ${err.message}`);
-        willTranscode = false;
+        willTranscode = needsAudioSelection;
       }
+    }
+
+    if (needsAudioSelection && !this.transcoding.enabled) {
+      console.warn('[AUDIO] Track selection needs transcoding, which is disabled; using the default track.');
     }
 
     try {
@@ -426,6 +477,7 @@ class MediaServer {
           videoBufsize: this.transcoding.videoBufsize,
           videoGop: this.transcoding.videoGop,
           subtitlesPath,
+          audioStreamIndex,
         });
 
         const cacheKey = `${media.id}:${Date.now()}`;

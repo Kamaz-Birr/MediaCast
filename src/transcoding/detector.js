@@ -6,18 +6,26 @@ const DLNA_SAFE_CONTAINER = 'mp4';
 const DLNA_SAFE_VIDEO_CODEC = 'h264';
 const DLNA_SAFE_AUDIO_CODEC = 'aac';
 
-function parseFFprobeLine(text) {
-  const result = {};
-  const lines = text.split('\n');
+function describeStream(stream, typeOrdinal) {
+  const tags = stream && stream.tags ? stream.tags : {};
+  const disposition = stream && stream.disposition ? stream.disposition : {};
 
-  for (const line of lines) {
-    const match = line.match(/^(\w+)=(.*)$/);
-    if (match) {
-      result[match[1]] = match[2];
-    }
-  }
-
-  return result;
+  return {
+    index: Number(stream.index),
+    // Position among streams of the same type, which is what -map 0:a:N wants.
+    typeIndex: typeOrdinal,
+    codec_type: stream.codec_type || '',
+    codec_name: stream.codec_name || '',
+    profile: stream.profile || '',
+    language: String(tags.language || tags.LANGUAGE || '').trim(),
+    title: String(tags.title || tags.TITLE || '').trim(),
+    channels: Number.isFinite(Number(stream.channels)) ? Number(stream.channels) : null,
+    channelLayout: stream.channel_layout || '',
+    width: Number.isFinite(Number(stream.width)) ? Number(stream.width) : null,
+    height: Number.isFinite(Number(stream.height)) ? Number(stream.height) : null,
+    isDefault: disposition.default === 1,
+    isForced: disposition.forced === 1,
+  };
 }
 
 async function probeFile(filePath) {
@@ -26,7 +34,7 @@ async function probeFile(filePath) {
       '-v',
       'quiet',
       '-print_format',
-      'flat',
+      'json',
       '-show_format',
       '-show_streams',
       filePath,
@@ -57,35 +65,29 @@ async function probeFile(filePath) {
         return reject(new Error(`ffprobe failed: ${stderr}`));
       }
 
-      const info = parseFFprobeLine(stdout);
-      const streams = [];
-
-      let streamIndex = 0;
-      while (true) {
-        const prefix = `streams_${streamIndex}`;
-        if (!Object.keys(info).some((k) => k.startsWith(prefix))) {
-          break;
-        }
-
-        const stream = {};
-        for (const [key, value] of Object.entries(info)) {
-          if (key.startsWith(prefix)) {
-            const streamKey = key.substring(prefix.length + 1);
-            stream[streamKey] = value;
-          }
-        }
-
-        if (stream.codec_type) {
-          streams.push(stream);
-        }
-        streamIndex++;
+      let parsed;
+      try {
+        parsed = JSON.parse(stdout || '{}');
+      } catch (err) {
+        return reject(new Error(`ffprobe returned unreadable output: ${err.message}`));
       }
+
+      const format = parsed.format || {};
+      const typeCounters = {};
+      const streams = (Array.isArray(parsed.streams) ? parsed.streams : [])
+        .filter((stream) => stream && stream.codec_type)
+        .map((stream) => {
+          const type = stream.codec_type;
+          const ordinal = typeCounters[type] === undefined ? 0 : typeCounters[type];
+          typeCounters[type] = ordinal + 1;
+          return describeStream(stream, ordinal);
+        });
 
       resolve({
         container: path.extname(filePath).toLowerCase().replace('.', ''),
-        format: info['format_name'] || '',
-        duration: parseInt(info['format_duration']) || 0,
-        bitrate: parseInt(info['format_bit_rate']) || 0,
+        format: format.format_name || '',
+        duration: Math.round(Number(format.duration) || 0),
+        bitrate: parseInt(format.bit_rate, 10) || 0,
         streams,
       });
     });

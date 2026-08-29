@@ -1,6 +1,8 @@
 import http from 'http';
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
+import { spawn } from 'child_process';
 import { buildDidlLite } from '../dlna/metadata.js';
 import {
   setAvTransportUri,
@@ -61,6 +63,16 @@ const BUILT_IN_CATEGORIES = [
   { id: CATEGORY_ANIME_MOVIES, label: 'Anime Movies', kind: CATEGORY_KIND_MOVIES, builtIn: true },
   { id: CATEGORY_ANIME_SHOWS, label: 'Anime Shows', kind: CATEGORY_KIND_SHOWS, builtIn: true },
 ];
+
+const COVER_MIME_EXTENSIONS = {
+  'image/jpeg': 'jpg',
+  'image/jpg': 'jpg',
+  'image/png': 'png',
+  'image/webp': 'webp',
+  'image/gif': 'gif',
+};
+
+const MAX_COVER_BYTES = 8 * 1024 * 1024;
 
 function slugifyCategoryLabel(label) {
   return String(label || '')
@@ -902,6 +914,199 @@ function buildPageHtml(rendererName) {
       flex-wrap: wrap;
     }
 
+    /* ---------- Detail dialog ---------- */
+
+    .detail-modal { width: min(880px, 100%); padding: 0; overflow: hidden; }
+
+    .modal-close {
+      position: absolute;
+      top: 14px;
+      right: 14px;
+      z-index: 3;
+      width: 34px;
+      height: 34px;
+      border-radius: 999px;
+      border: 1px solid var(--stroke);
+      background: rgba(6, 11, 22, 0.75);
+      color: var(--text);
+      font-size: 19px;
+      line-height: 1;
+      cursor: pointer;
+      backdrop-filter: blur(8px);
+      transition: background 200ms var(--ease-soft), transform 200ms var(--ease);
+    }
+
+    .modal-close:hover { background: rgba(248, 113, 113, 0.28); transform: rotate(90deg); }
+
+    .detail-body {
+      display: grid;
+      grid-template-columns: 260px 1fr;
+      gap: 0;
+    }
+
+    .detail-poster {
+      position: relative;
+      background: linear-gradient(150deg, #17203a, #0d1526);
+      min-height: 340px;
+    }
+
+    .detail-poster img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+
+    .detail-poster .placeholder { font-size: 60px; }
+
+    .detail-info { padding: 26px 26px 22px; min-width: 0; }
+
+    .detail-info .modal-title { font-size: 1.55rem; margin-bottom: 8px; }
+
+    .detail-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+
+    .detail-meta span {
+      padding: 5px 11px;
+      border-radius: 999px;
+      background: var(--glass);
+      border: 1px solid var(--stroke);
+      color: #9dc4fb;
+      font-size: 0.72rem;
+      font-weight: 800;
+      letter-spacing: 0.03em;
+    }
+
+    .detail-meta span.edited { color: #fde68a; border-color: rgba(250, 204, 21, 0.45); }
+
+    .detail-plot {
+      margin: 0 0 16px;
+      color: #c9d6ea;
+      font-size: 0.92rem;
+      line-height: 1.65;
+      max-height: 190px;
+      overflow-y: auto;
+    }
+
+    .detail-file {
+      color: var(--faint);
+      font-size: 0.72rem;
+      font-weight: 600;
+      word-break: break-all;
+      margin-bottom: 18px;
+    }
+
+    .detail-actions { justify-content: flex-start; }
+
+    .track-section {
+      border-top: 1px solid var(--stroke);
+      padding-top: 14px;
+      margin-bottom: 16px;
+      display: grid;
+      gap: 12px;
+    }
+
+    .track-section[hidden] { display: none; }
+
+    .track-row[hidden] { display: none; }
+
+    .track-select {
+      width: 100%;
+      min-width: 0;
+      margin-top: 2px;
+    }
+
+    .track-actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 9px;
+      flex-wrap: wrap;
+    }
+
+    .track-actions .neu-btn { padding: 8px 12px; min-height: 34px; font-size: 0.63rem; }
+
+    .track-note {
+      color: var(--faint);
+      font-size: 0.73rem;
+      font-weight: 600;
+      line-height: 1.5;
+    }
+
+    .track-note.warn { color: #fcd34d; }
+
+    .detail-edit {
+      border-top: 1px solid var(--stroke);
+      padding: 22px 26px 24px;
+      animation: section-in 300ms var(--ease);
+    }
+
+    .detail-edit[hidden] { display: none; }
+
+    .form-grid {
+      display: grid;
+      grid-template-columns: 1fr 140px;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+
+    .form-field { min-width: 0; }
+
+    textarea.text-input {
+      min-height: 108px;
+      resize: vertical;
+      line-height: 1.55;
+      font-weight: 500;
+    }
+
+    .cover-row {
+      display: flex;
+      gap: 12px;
+      align-items: flex-end;
+      margin-top: 12px;
+      flex-wrap: wrap;
+    }
+
+    .cover-preview {
+      width: 62px;
+      height: 93px;
+      border-radius: 8px;
+      border: 1px solid var(--stroke);
+      object-fit: cover;
+      background: #0d1526;
+      flex: none;
+    }
+
+    .cover-fields { flex: 1 1 240px; min-width: 0; }
+
+    .file-btn { position: relative; overflow: hidden; }
+    .file-btn input[type="file"] {
+      position: absolute;
+      inset: 0;
+      opacity: 0;
+      cursor: pointer;
+      font-size: 0;
+    }
+
+    .edit-actions {
+      display: flex;
+      gap: 9px;
+      justify-content: flex-end;
+      flex-wrap: wrap;
+      margin-top: 18px;
+    }
+
+    .edit-actions .spacer { flex: 1; }
+
+    @media (max-width: 720px) {
+      .detail-body { grid-template-columns: 1fr; }
+      .detail-poster { min-height: 220px; max-height: 300px; }
+      .form-grid { grid-template-columns: 1fr; }
+    }
+
     /* ---------- Status bar ---------- */
 
     .status {
@@ -1473,6 +1678,81 @@ function buildPageHtml(rendererName) {
     </div>
   </div>
 
+  <div class="modal-backdrop" id="detailModal" hidden>
+    <div class="modal detail-modal" role="dialog" aria-modal="true" aria-labelledby="detailTitle">
+      <button class="modal-close" id="detailClose" aria-label="Close">&times;</button>
+
+      <div class="detail-body">
+        <div class="detail-poster" id="detailPosterWrap"></div>
+        <div class="detail-info">
+          <h2 class="modal-title" id="detailTitle"></h2>
+          <div class="detail-meta" id="detailMeta"></div>
+          <p class="detail-plot" id="detailPlot"></p>
+          <div class="detail-file" id="detailFile"></div>
+          <div class="track-section" id="trackSection" hidden>
+            <div class="track-row" id="audioRow" hidden>
+              <label class="field-label" for="audioSelect">Audio track</label>
+              <select class="sort-select track-select" id="audioSelect"></select>
+            </div>
+            <div class="track-row" id="subtitleRow">
+              <label class="field-label" for="subtitleSelect">Subtitles</label>
+              <select class="sort-select track-select" id="subtitleSelect"></select>
+              <div class="track-actions">
+                <button type="button" class="neu-btn secondary file-btn" id="subtitleLoadBtn">
+                  Load Subtitle File
+                  <input type="file" id="subtitleFile" accept=".srt,.vtt,.ass,.ssa,text/plain" />
+                </button>
+                <button type="button" class="neu-btn secondary" id="subtitleFindBtn">Find Online</button>
+              </div>
+            </div>
+            <div class="track-note" id="trackNote"></div>
+          </div>
+
+          <div class="modal-actions detail-actions">
+            <button class="neu-btn" id="detailPlay">Play</button>
+            <button class="neu-btn secondary" id="detailWatched">Watched</button>
+            <button class="neu-btn secondary" id="detailEdit">Edit Info</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="detail-edit" id="detailEditForm" hidden>
+        <div class="form-grid">
+          <div class="form-field">
+            <label class="field-label" for="editTitle">Title</label>
+            <input class="text-input" id="editTitle" type="text" maxlength="300" autocomplete="off" />
+          </div>
+          <div class="form-field">
+            <label class="field-label" for="editYear">Year</label>
+            <input class="text-input" id="editYear" type="text" maxlength="12" autocomplete="off" />
+          </div>
+        </div>
+
+        <label class="field-label" for="editPlot">Synopsis</label>
+        <textarea class="text-input" id="editPlot" maxlength="4000"></textarea>
+
+        <div class="cover-row">
+          <img class="cover-preview" id="editCoverPreview" alt="" />
+          <div class="cover-fields">
+            <label class="field-label" for="editPoster">Cover image URL</label>
+            <input class="text-input" id="editPoster" type="text" maxlength="2000" placeholder="https://... or choose a file" autocomplete="off" />
+          </div>
+          <button type="button" class="neu-btn secondary file-btn" id="editCoverBtn">
+            Choose Image
+            <input type="file" id="editCoverFile" accept="image/png,image/jpeg,image/webp,image/gif" />
+          </button>
+        </div>
+
+        <div class="edit-actions">
+          <button type="button" class="neu-btn danger" id="editReset">Reset To Original</button>
+          <span class="spacer"></span>
+          <button type="button" class="neu-btn secondary" id="editCancel">Cancel</button>
+          <button type="button" class="neu-btn" id="editSave">Save Changes</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <script>
     const CATEGORY_LABELS = {
       'movies': 'Movies',
@@ -1536,6 +1816,37 @@ function buildPageHtml(rendererName) {
     const newCategoryName = document.getElementById('newCategoryName');
     const folderModalCancel = document.getElementById('folderModalCancel');
     const folderModalConfirm = document.getElementById('folderModalConfirm');
+    const detailModal = document.getElementById('detailModal');
+    const detailClose = document.getElementById('detailClose');
+    const detailPosterWrap = document.getElementById('detailPosterWrap');
+    const detailTitle = document.getElementById('detailTitle');
+    const detailMeta = document.getElementById('detailMeta');
+    const detailPlot = document.getElementById('detailPlot');
+    const detailFile = document.getElementById('detailFile');
+    const detailPlay = document.getElementById('detailPlay');
+    const detailWatched = document.getElementById('detailWatched');
+    const detailEdit = document.getElementById('detailEdit');
+    const detailEditForm = document.getElementById('detailEditForm');
+    const editTitle = document.getElementById('editTitle');
+    const editYear = document.getElementById('editYear');
+    const editPlot = document.getElementById('editPlot');
+    const editPoster = document.getElementById('editPoster');
+    const editCoverPreview = document.getElementById('editCoverPreview');
+    const editCoverFile = document.getElementById('editCoverFile');
+    const editReset = document.getElementById('editReset');
+    const editCancel = document.getElementById('editCancel');
+    const editSave = document.getElementById('editSave');
+    const trackSection = document.getElementById('trackSection');
+    const audioRow = document.getElementById('audioRow');
+    const audioSelect = document.getElementById('audioSelect');
+    const subtitleSelect = document.getElementById('subtitleSelect');
+    const subtitleFile = document.getElementById('subtitleFile');
+    const subtitleFindBtn = document.getElementById('subtitleFindBtn');
+    const trackNote = document.getElementById('trackNote');
+    let detailItem = null;
+    let detailCard = null;
+    let detailTracks = null;
+    let pendingCoverDataUrl = '';
     let isLibraryLoading = false;
     let lastMetadataVersion = 0;
 
@@ -1983,7 +2294,8 @@ function buildPageHtml(rendererName) {
       return empty;
     }
 
-    async function castItem(item, button) {
+    async function castItem(item, button, options) {
+      const choices = options && typeof options === 'object' ? options : {};
       const resumeInfo = getResumeInfo(item);
       let resumeSeconds = resumeInfo ? resumeInfo.positionSec : 0;
       // If lastStoppedSec is set for this item, use it minus 5 seconds (min 0)
@@ -1996,7 +2308,12 @@ function buildPageHtml(rendererName) {
         const response = await fetch('/api/cast', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id: item.id, resume: resumeSeconds > 0 }),
+          body: JSON.stringify({
+          id: item.id,
+          resume: resumeSeconds > 0,
+          audioStreamIndex: Number.isFinite(choices.audioStreamIndex) ? choices.audioStreamIndex : null,
+          subtitleMode: choices.subtitleMode || '',
+        }),
         });
         const result = await response.json();
         if (!response.ok || !result.ok) {
@@ -2226,7 +2543,18 @@ function buildPageHtml(rendererName) {
         setWatchedCardState(card, watchedButton, watchedItemIds.has(watchedKey));
         // Update resume badge to match play button state
         setResumeCardState(card, Boolean(initialResumeInfo) || Boolean(findActiveSessionByMediaId(item.id)));
-        card.addEventListener('click', () => castItem(item, playButton));
+
+        // The tile opens details; casting is reserved for the Play button so a
+        // stray click on artwork never starts playback.
+        card.tabIndex = 0;
+        card.setAttribute('role', 'button');
+        card.addEventListener('click', () => openDetailModal(item, card));
+        card.addEventListener('keydown', (event) => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            openDetailModal(item, card);
+          }
+        });
         card.appendChild(overlay);
         return card;
     }
@@ -2849,6 +3177,455 @@ function buildPageHtml(rendererName) {
       openFolderModal();
     });
 
+    function openDetailModal(item, card) {
+      detailItem = item;
+      detailCard = card || null;
+      pendingCoverDataUrl = '';
+      detailEditForm.hidden = true;
+      detailEdit.textContent = 'Edit Info';
+
+      detailTitle.textContent = item.movieTitle || item.name;
+
+      detailPosterWrap.innerHTML = '';
+      if (item.posterUrl) {
+        const img = document.createElement('img');
+        img.src = item.posterUrl;
+        img.alt = item.movieTitle || item.name;
+        img.onerror = () => {
+          detailPosterWrap.innerHTML = '';
+          const fallback = document.createElement('div');
+          fallback.className = 'placeholder';
+          fallback.textContent = '\u25B6';
+          detailPosterWrap.appendChild(fallback);
+        };
+        detailPosterWrap.appendChild(img);
+      } else {
+        const fallback = document.createElement('div');
+        fallback.className = 'placeholder';
+        fallback.textContent = '\u25B6';
+        detailPosterWrap.appendChild(fallback);
+      }
+
+      detailMeta.innerHTML = '';
+      const chips = [];
+      if (item.year) chips.push(String(item.year));
+      if (item.imdbRating) chips.push((item.ratingSource || 'IMDb') + ' ' + item.imdbRating + '/10');
+      if (item.showName) chips.push(item.showName);
+      if (item.seasonLabel) chips.push(item.seasonLabel);
+      if (Number.isFinite(item.size)) chips.push(formatSize(item.size));
+      for (const text of chips) {
+        const chip = document.createElement('span');
+        chip.textContent = text;
+        detailMeta.appendChild(chip);
+      }
+      if (item.userEdited) {
+        const chip = document.createElement('span');
+        chip.className = 'edited';
+        chip.textContent = 'Edited by you';
+        detailMeta.appendChild(chip);
+      }
+
+      detailPlot.textContent = item.plot || 'No synopsis available for this title.';
+      detailFile.textContent = item.filePath || item.name;
+
+      const resumeInfo = getResumeInfo(item);
+      detailPlay.textContent = resumeInfo
+        ? 'Resume ' + formatResumeClock(resumeInfo.positionSec)
+        : 'Play';
+      detailPlay.classList.toggle('resume', Boolean(resumeInfo));
+
+      const watchedKey = item.watchedKey || item.filePath || item.id;
+      const isWatched = watchedItemIds.has(watchedKey);
+      detailWatched.textContent = isWatched ? 'Unmark' : 'Watched';
+      detailWatched.classList.toggle('watched', isWatched);
+
+      trackSection.hidden = true;
+      trackNote.textContent = '';
+      detailModal.hidden = false;
+      loadDetailTracks(item);
+    }
+
+    function addOption(select, value, label) {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = label;
+      select.appendChild(option);
+      return option;
+    }
+
+    function renderTrackOptions(tracks) {
+      detailTracks = tracks;
+      audioSelect.innerHTML = '';
+      subtitleSelect.innerHTML = '';
+      trackNote.textContent = '';
+      trackNote.classList.remove('warn');
+
+      const audio = Array.isArray(tracks.audio) ? tracks.audio : [];
+      const subtitles = Array.isArray(tracks.subtitles) ? tracks.subtitles : [];
+
+      audio.forEach((track, index) => {
+        addOption(audioSelect, String(track.streamIndex),
+          track.label + (track.isDefault ? ' - default' : ''));
+        if (track.isDefault || index === 0) {
+          audioSelect.value = String(track.streamIndex);
+        }
+      });
+      audioRow.hidden = audio.length < 2;
+
+      addOption(subtitleSelect, 'off', 'Off');
+      for (const track of subtitles) {
+        if (track.extractable) {
+          addOption(subtitleSelect, 'embedded:' + track.streamIndex, 'Embedded - ' + track.label);
+        } else {
+          const option = addOption(subtitleSelect, 'embedded:' + track.streamIndex,
+            'Embedded - ' + track.label + ' (image based)');
+          option.disabled = true;
+        }
+      }
+      if (tracks.hasSidecar) {
+        addOption(subtitleSelect, 'sidecar', 'Subtitle file next to the video');
+      }
+      if (tracks.hasUserSubtitle) {
+        addOption(subtitleSelect, 'user', 'Subtitle file you loaded');
+      }
+      addOption(subtitleSelect, 'download', 'Download automatically');
+
+      // Prefer something that already exists over an extraction step.
+      const firstEmbedded = subtitles.find((track) => track.extractable);
+      if (tracks.hasUserSubtitle) {
+        subtitleSelect.value = 'user';
+      } else if (tracks.hasSidecar) {
+        subtitleSelect.value = 'sidecar';
+      } else if (firstEmbedded) {
+        subtitleSelect.value = 'embedded:' + firstEmbedded.streamIndex;
+      } else {
+        subtitleSelect.value = 'off';
+      }
+
+      const notes = [];
+      if (tracks.probeError) {
+        notes.push('Could not read tracks from this file: ' + tracks.probeError);
+      } else {
+        if (subtitles.length === 0) {
+          notes.push('No embedded subtitles found - load a file or download one.');
+        }
+        if (audio.length > 1 && !tracks.canSelectAudio) {
+          notes.push('Audio track switching needs transcoding, which is currently disabled.');
+        }
+      }
+
+      trackNote.textContent = notes.join(' ');
+      trackNote.classList.toggle('warn', Boolean(tracks.probeError));
+      trackSection.hidden = false;
+    }
+
+    async function loadDetailTracks(item) {
+      detailTracks = null;
+      trackSection.hidden = true;
+      try {
+        const response = await fetch('/api/media/tracks?id=' + encodeURIComponent(item.id));
+        const result = await response.json();
+        if (!response.ok || !result.ok) {
+          throw new Error(result.error || ('HTTP ' + response.status));
+        }
+        if (detailItem && detailItem.id === item.id) {
+          renderTrackOptions(result);
+        }
+      } catch (error) {
+        if (detailItem && detailItem.id === item.id) {
+          trackNote.textContent = 'Could not read tracks: ' + error.message;
+          trackNote.classList.add('warn');
+          trackSection.hidden = false;
+        }
+      }
+    }
+
+    // Make the chosen subtitle available to the renderer before playback starts.
+    async function prepareSubtitleSelection() {
+      const value = String(subtitleSelect.value || 'off');
+
+      if (value === 'off') {
+        await fetch('/api/media/subtitle', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: detailItem.id, mode: 'off' }),
+        });
+        return 'off';
+      }
+
+      let body = { id: detailItem.id, mode: value };
+      if (value.indexOf('embedded:') === 0) {
+        body = {
+          id: detailItem.id,
+          mode: 'embedded',
+          streamIndex: Number(value.split(':')[1]),
+        };
+      }
+
+      const response = await fetch('/api/media/subtitle', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.ok) {
+        throw new Error(result.error || ('HTTP ' + response.status));
+      }
+
+      return value === 'download' ? 'download' : 'sidecar';
+    }
+
+    async function playFromDetail() {
+      if (!detailItem) {
+        return;
+      }
+
+      detailPlay.disabled = true;
+      try {
+        const subtitleMode = detailTracks ? await prepareSubtitleSelection() : '';
+        const audioStreamIndex = (detailTracks && !audioRow.hidden)
+          ? Number(audioSelect.value)
+          : null;
+
+        const item = detailItem;
+        const button = detailPlay;
+        closeDetailModal();
+        await castItem(item, button, {
+          subtitleMode,
+          audioStreamIndex: Number.isFinite(audioStreamIndex) ? audioStreamIndex : null,
+        });
+      } catch (error) {
+        setStatus('Playback setup failed: ' + error.message, true);
+      } finally {
+        detailPlay.disabled = false;
+      }
+    }
+
+    function closeDetailModal() {
+      detailModal.hidden = true;
+      detailItem = null;
+      detailCard = null;
+      pendingCoverDataUrl = '';
+      detailEditForm.hidden = true;
+    }
+
+    // Reuse the card's own buttons so playback and watched logic stay in one place.
+    function clickCardButton(role) {
+      if (!detailCard) {
+        return null;
+      }
+      const button = detailCard.querySelector('[data-role="' + role + '"]');
+      if (button) {
+        button.click();
+      }
+      return button;
+    }
+
+    function toggleEditForm() {
+      if (!detailItem) {
+        return;
+      }
+
+      const opening = detailEditForm.hidden;
+      detailEditForm.hidden = !opening;
+      detailEdit.textContent = opening ? 'Close Editor' : 'Edit Info';
+
+      if (!opening) {
+        return;
+      }
+
+      pendingCoverDataUrl = '';
+      editTitle.value = detailItem.movieTitle || detailItem.name || '';
+      editYear.value = detailItem.year ? String(detailItem.year) : '';
+      editPlot.value = detailItem.plot || '';
+      editPoster.value = detailItem.posterUrl || '';
+      editCoverPreview.src = detailItem.posterUrl || '';
+      editTitle.focus();
+    }
+
+    async function saveDetailEdits() {
+      if (!detailItem) {
+        return;
+      }
+
+      editSave.disabled = true;
+      try {
+        const body = {
+          id: detailItem.id,
+          title: editTitle.value,
+          year: editYear.value,
+          plot: editPlot.value,
+          posterUrl: editPoster.value,
+        };
+        if (pendingCoverDataUrl) {
+          body.coverDataUrl = pendingCoverDataUrl;
+        }
+
+        const response = await fetch('/api/media/override', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const result = await response.json();
+        if (!response.ok || !result.ok) {
+          throw new Error(result.error || ('HTTP ' + response.status));
+        }
+
+        const title = (result.override && result.override.title) || detailItem.name;
+        closeDetailModal();
+        await loadLibrary(false, { silent: true });
+        setStatus(result.cleared
+          ? 'Restored original details for ' + title + '.'
+          : 'Saved details for ' + title + '.');
+      } catch (error) {
+        setStatus('Save failed: ' + error.message, true);
+      } finally {
+        editSave.disabled = false;
+      }
+    }
+
+    async function resetDetailEdits() {
+      if (!detailItem) {
+        return;
+      }
+
+      editReset.disabled = true;
+      try {
+        const response = await fetch('/api/media/override', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: detailItem.id, clear: true }),
+        });
+        const result = await response.json();
+        if (!response.ok || !result.ok) {
+          throw new Error(result.error || ('HTTP ' + response.status));
+        }
+
+        const name = detailItem.name;
+        closeDetailModal();
+        await loadLibrary(false, { silent: true });
+        setStatus('Restored original details for ' + name + '.');
+      } catch (error) {
+        setStatus('Reset failed: ' + error.message, true);
+      } finally {
+        editReset.disabled = false;
+      }
+    }
+
+    detailClose.addEventListener('click', closeDetailModal);
+    detailEdit.addEventListener('click', toggleEditForm);
+    editCancel.addEventListener('click', toggleEditForm);
+    editSave.addEventListener('click', saveDetailEdits);
+    editReset.addEventListener('click', resetDetailEdits);
+
+    detailPlay.addEventListener('click', playFromDetail);
+
+    subtitleFindBtn.addEventListener('click', async () => {
+      if (!detailItem) {
+        return;
+      }
+      subtitleFindBtn.disabled = true;
+      trackNote.classList.remove('warn');
+      trackNote.textContent = 'Searching for subtitles...';
+      try {
+        const response = await fetch('/api/media/subtitle', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: detailItem.id, mode: 'download' }),
+        });
+        const result = await response.json();
+        if (!response.ok || !result.ok) {
+          throw new Error(result.error || 'No subtitles found.');
+        }
+        trackNote.textContent = 'Subtitles downloaded and selected.';
+        await loadDetailTracks(detailItem);
+        subtitleSelect.value = 'sidecar';
+      } catch (error) {
+        trackNote.textContent = error.message;
+        trackNote.classList.add('warn');
+      } finally {
+        subtitleFindBtn.disabled = false;
+      }
+    });
+
+    subtitleFile.addEventListener('change', () => {
+      const file = subtitleFile.files && subtitleFile.files[0];
+      if (!file || !detailItem) {
+        return;
+      }
+      if (file.size > 4 * 1024 * 1024) {
+        trackNote.textContent = 'Subtitle files must be 4MB or smaller.';
+        trackNote.classList.add('warn');
+        subtitleFile.value = '';
+        return;
+      }
+
+      const reader = new FileReader();
+      reader.onload = async () => {
+        try {
+          const response = await fetch('/api/media/subtitle', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              id: detailItem.id,
+              mode: 'upload',
+              content: String(reader.result || ''),
+            }),
+          });
+          const result = await response.json();
+          if (!response.ok || !result.ok) {
+            throw new Error(result.error || ('HTTP ' + response.status));
+          }
+          trackNote.classList.remove('warn');
+          trackNote.textContent = 'Loaded ' + file.name + '.';
+          await loadDetailTracks(detailItem);
+          subtitleSelect.value = 'user';
+        } catch (error) {
+          trackNote.textContent = 'Could not load that file: ' + error.message;
+          trackNote.classList.add('warn');
+        } finally {
+          subtitleFile.value = '';
+        }
+      };
+      reader.readAsText(file);
+    });
+
+    detailWatched.addEventListener('click', () => {
+      clickCardButton('watched');
+      closeDetailModal();
+    });
+
+    editPoster.addEventListener('input', () => {
+      pendingCoverDataUrl = '';
+      editCoverPreview.src = editPoster.value || '';
+    });
+
+    editCoverFile.addEventListener('change', () => {
+      const file = editCoverFile.files && editCoverFile.files[0];
+      if (!file) {
+        return;
+      }
+      if (file.size > 8 * 1024 * 1024) {
+        setStatus('Cover image must be 8MB or smaller.', true);
+        editCoverFile.value = '';
+        return;
+      }
+
+      const reader = new FileReader();
+      reader.onload = () => {
+        pendingCoverDataUrl = String(reader.result || '');
+        editCoverPreview.src = pendingCoverDataUrl;
+        editPoster.value = file.name;
+      };
+      reader.readAsDataURL(file);
+    });
+
+    detailModal.addEventListener('click', (event) => {
+      if (event.target === detailModal) {
+        closeDetailModal();
+      }
+    });
+
     function renderCategoryChoices() {
       categoryChoices.innerHTML = '';
 
@@ -3033,7 +3810,12 @@ function buildPageHtml(rendererName) {
     });
 
     document.addEventListener('keydown', (event) => {
-      if (event.key === 'Escape' && !folderModal.hidden) {
+      if (event.key !== 'Escape') {
+        return;
+      }
+      if (!detailModal.hidden) {
+        closeDetailModal();
+      } else if (!folderModal.hidden) {
         closeFolderModal();
       }
     });
@@ -3093,12 +3875,12 @@ function buildPageHtml(rendererName) {
 </html>`;
 }
 
-function readRequestBody(req) {
+function readRequestBody(req, maxBytes = 1024 * 1024) {
   return new Promise((resolve, reject) => {
     let body = '';
     req.on('data', (chunk) => {
       body += chunk;
-      if (body.length > 1024 * 1024) {
+      if (body.length > maxBytes) {
         reject(new Error('Payload too large'));
       }
     });
@@ -3182,7 +3964,9 @@ async function castMediaItem(renderer, mediaServer, media, options = {}) {
   let mediaUrl = effectivePlaylistContext && effectivePlaylistContext.playlistUrl
     ? String(effectivePlaylistContext.playlistUrl)
     : directMediaUrl;
-  const subtitleUrl = await mediaServer.getSubtitleUrl(media.id, { allowDownload: true });
+  const subtitleUrl = options.subtitleUrl !== undefined
+    ? options.subtitleUrl
+    : await mediaServer.getSubtitleUrl(media.id, { allowDownload: true });
   console.log(`[CastUI] Subtitle for ${media.name}: ${subtitleUrl || 'none'}`);
   let metadata = buildDidlLite({
     title: media.name,
@@ -3305,6 +4089,10 @@ function createCastUiServer({
   initialCustomCategories = [],
   initialFolderCategories = {},
   onCategoriesChanged,
+  initialMediaOverrides = {},
+  onMediaOverridesChanged,
+  coversDir,
+  subtitlesDir,
   allowLanAccess = false,
 }) {
   let server = null;
@@ -3316,6 +4104,255 @@ function createCastUiServer({
   // folder-name heuristics.
   const customCategories = [];
   const folderCategories = new Map();
+
+  // ---- User-supplied metadata -------------------------------------------
+  // Keyed by file path (not the index-based media id, which shifts whenever the
+  // library is rescanned) so edits stick across restarts.
+  const mediaOverrides = new Map();
+
+  const overrideKeyFor = (filePath) => normalizeFolderKey(filePath);
+
+  const overrideFor = (filePath) => mediaOverrides.get(overrideKeyFor(filePath)) || null;
+
+  const sanitizeOverride = (value) => {
+    const source = value && typeof value === 'object' ? value : {};
+    const text = (input, max) => {
+      const cleaned = String(input === null || input === undefined ? '' : input).trim();
+      return cleaned.length > max ? cleaned.slice(0, max) : cleaned;
+    };
+
+    const entry = {
+      title: text(source.title, 300),
+      year: text(source.year, 12),
+      plot: text(source.plot, 4000),
+      posterUrl: text(source.posterUrl, 2000),
+    };
+
+    // An entry with nothing in it is the same as having no override at all.
+    if (!entry.title && !entry.year && !entry.plot && !entry.posterUrl) {
+      return null;
+    }
+
+    entry.updatedAt = source.updatedAt || new Date().toISOString();
+    return entry;
+  };
+
+  const persistMediaOverrides = () => {
+    if (typeof onMediaOverridesChanged !== 'function') {
+      return;
+    }
+    onMediaOverridesChanged(Object.fromEntries(mediaOverrides.entries()));
+  };
+
+  const setMediaOverride = (filePath, value) => {
+    const key = overrideKeyFor(filePath);
+    if (!key) {
+      return null;
+    }
+
+    const entry = sanitizeOverride(value);
+    if (!entry) {
+      mediaOverrides.delete(key);
+      persistMediaOverrides();
+      return null;
+    }
+
+    mediaOverrides.set(key, entry);
+    persistMediaOverrides();
+    return entry;
+  };
+
+  for (const [key, value] of Object.entries(
+    initialMediaOverrides && typeof initialMediaOverrides === 'object' ? initialMediaOverrides : {},
+  )) {
+    const entry = sanitizeOverride(value);
+    const normalized = String(key || '').trim();
+    if (entry && normalized) {
+      mediaOverrides.set(normalized, entry);
+    }
+  }
+
+  const resolvedCoversDir = coversDir ? path.resolve(coversDir) : null;
+  const resolvedSubtitlesDir = subtitlesDir
+    ? path.resolve(subtitlesDir)
+    : (coversDir ? path.join(path.dirname(path.resolve(coversDir)), 'subtitles') : null);
+
+  // Text formats convert cleanly to SRT; bitmap ones would need OCR, so they are
+  // offered only as burn-in candidates rather than sidecar tracks.
+  const TEXT_SUBTITLE_CODECS = new Set(['subrip', 'srt', 'ass', 'ssa', 'mov_text', 'webvtt', 'text']);
+
+  const probeCache = new Map();
+
+  const probeMediaTracks = async (media) => {
+    const cacheKey = media.filePath;
+    if (probeCache.has(cacheKey)) {
+      return probeCache.get(cacheKey);
+    }
+
+    const { probeFile } = await import('../transcoding/detector.js');
+    const probe = await probeFile(media.filePath);
+    probeCache.set(cacheKey, probe);
+    return probe;
+  };
+
+  const describeAudioTrack = (stream) => {
+    const parts = [];
+    if (stream.language) {
+      parts.push(stream.language.toUpperCase());
+    }
+    if (stream.title) {
+      parts.push(stream.title);
+    }
+    if (!parts.length) {
+      parts.push('Track ' + (stream.typeIndex + 1));
+    }
+
+    const extras = [];
+    if (stream.codec_name) {
+      extras.push(stream.codec_name.toUpperCase());
+    }
+    if (stream.channels === 1) {
+      extras.push('Mono');
+    } else if (stream.channels === 2) {
+      extras.push('Stereo');
+    } else if (stream.channels > 2) {
+      extras.push(stream.channels + 'ch');
+    }
+
+    return parts.join(' - ') + (extras.length ? ' (' + extras.join(', ') + ')' : '');
+  };
+
+  const describeSubtitleTrack = (stream) => {
+    const parts = [];
+    if (stream.language) {
+      parts.push(stream.language.toUpperCase());
+    }
+    if (stream.title) {
+      parts.push(stream.title);
+    }
+    if (!parts.length) {
+      parts.push('Track ' + (stream.typeIndex + 1));
+    }
+    if (stream.isForced) {
+      parts.push('Forced');
+    }
+
+    return parts.join(' - ') + (stream.codec_name ? ' (' + stream.codec_name + ')' : '');
+  };
+
+  const subtitleCachePath = (media, streamIndex) => {
+    if (!resolvedSubtitlesDir) {
+      return null;
+    }
+    const stem = crypto.createHash('sha1').update(normalizeFolderKey(media.filePath)).digest('hex').slice(0, 16);
+    return path.join(resolvedSubtitlesDir, stem + '-s' + streamIndex + '.srt');
+  };
+
+  // Pull one embedded track out to SRT so the renderer can show it as a sidecar,
+  // which avoids re-encoding the video just to get subtitles on screen.
+  const extractEmbeddedSubtitle = (media, streamIndex) => new Promise((resolve, reject) => {
+    const outPath = subtitleCachePath(media, streamIndex);
+    if (!outPath) {
+      reject(new Error('Subtitle storage is not available.'));
+      return;
+    }
+
+    if (fs.existsSync(outPath) && fs.statSync(outPath).size > 0) {
+      resolve(outPath);
+      return;
+    }
+
+    fs.mkdirSync(path.dirname(outPath), { recursive: true });
+
+    const proc = spawn('ffmpeg', [
+      '-y', '-hide_banner', '-loglevel', 'error',
+      '-i', media.filePath,
+      '-map', '0:s:' + streamIndex,
+      '-c:s', 'srt',
+      outPath,
+    ], { windowsHide: true });
+
+    let stderr = '';
+    proc.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+    proc.on('error', (err) => {
+      reject(new Error(err.code === 'ENOENT'
+        ? 'ffmpeg not found. Install FFmpeg to use embedded subtitles.'
+        : err.message));
+    });
+    proc.on('close', (code) => {
+      if (code === 0 && fs.existsSync(outPath) && fs.statSync(outPath).size > 0) {
+        resolve(outPath);
+      } else {
+        reject(new Error('Could not extract that subtitle track. ' + stderr.slice(0, 200)));
+      }
+    });
+  });
+
+  const saveUploadedSubtitle = (media, content) => {
+    const outPath = subtitleCachePath(media, 'user');
+    if (!outPath) {
+      throw new Error('Subtitle storage is not available.');
+    }
+
+    const text = String(content || '');
+    if (!text.trim()) {
+      throw new Error('That subtitle file is empty.');
+    }
+
+    fs.mkdirSync(path.dirname(outPath), { recursive: true });
+    fs.writeFileSync(outPath, text, 'utf8');
+    return outPath;
+  };
+
+  const saveCoverImage = (filePath, dataUrl) => {
+    if (!resolvedCoversDir) {
+      throw new Error('Cover storage is not available.');
+    }
+
+    const match = String(dataUrl || '').match(/^data:([a-z/+.-]+);base64,(.+)$/i);
+    if (!match) {
+      throw new Error('Cover must be a base64 image.');
+    }
+
+    const extension = COVER_MIME_EXTENSIONS[match[1].toLowerCase()];
+    if (!extension) {
+      throw new Error('Unsupported image type: ' + match[1]);
+    }
+
+    const buffer = Buffer.from(match[2], 'base64');
+    if (buffer.length === 0) {
+      throw new Error('Cover image is empty.');
+    }
+    if (buffer.length > MAX_COVER_BYTES) {
+      throw new Error('Cover image is larger than 8MB.');
+    }
+
+    fs.mkdirSync(resolvedCoversDir, { recursive: true });
+
+    const stem = crypto.createHash('sha1').update(overrideKeyFor(filePath)).digest('hex').slice(0, 16);
+
+    // Drop any previous cover for this item so the folder does not accumulate.
+    for (const candidate of Object.values(COVER_MIME_EXTENSIONS)) {
+      const previous = path.join(resolvedCoversDir, stem + '.' + candidate);
+      if (previous !== path.join(resolvedCoversDir, stem + '.' + extension) && fs.existsSync(previous)) {
+        try {
+          fs.unlinkSync(previous);
+        } catch {
+          // A locked file is not worth failing the save over.
+        }
+      }
+    }
+
+    const fileName = stem + '.' + extension;
+    fs.writeFileSync(path.join(resolvedCoversDir, fileName), buffer);
+
+    // Cache-bust so the browser picks up a replaced cover immediately.
+    return '/covers/' + fileName + '?v=' + Date.now();
+  };
+
+  const transcodingEnabled = Boolean(
+    mediaServer && mediaServer.transcoding && mediaServer.transcoding.enabled !== false,
+  );
 
   const getAllCategories = () => BUILT_IN_CATEGORIES.concat(customCategories);
 
@@ -4265,22 +5302,44 @@ function createCastUiServer({
     pumpMetadataQueue();
   };
 
+  const withOverride = (item, enriched) => {
+    const override = overrideFor(item.filePath);
+    if (!override) {
+      return enriched;
+    }
+
+    return {
+      ...enriched,
+      movieTitle: override.title || enriched.movieTitle,
+      year: override.year || enriched.year,
+      plot: override.plot || enriched.plot,
+      posterUrl: override.posterUrl || enriched.posterUrl,
+      userEdited: true,
+      overrideFields: {
+        title: Boolean(override.title),
+        year: Boolean(override.year),
+        plot: Boolean(override.plot),
+        posterUrl: Boolean(override.posterUrl),
+      },
+    };
+  };
+
   const enrichItemsWithMetadata = async (items) => {
     const result = [];
 
     for (const item of items) {
       if (metadataMap.has(item.id)) {
-        result.push({
+        result.push(withOverride(item, {
           ...item,
           ...metadataMap.get(item.id),
-        });
+        }));
       } else {
         const local = buildLocalMetadata(item);
         queueMetadataFetch(item, local);
-        result.push({
+        result.push(withOverride(item, {
           ...item,
           ...local.enriched,
-        });
+        }));
       }
     }
 
@@ -4605,9 +5664,26 @@ function createCastUiServer({
           : 0;
         const playlistContext = null;
 
+        // Audio choice is applied when the stream is built for this item.
+        const audioStreamIndex = Number(payload.audioStreamIndex);
+        mediaServer.setPlaybackOptions(media.id, {
+          audioStreamIndex: Number.isInteger(audioStreamIndex) ? audioStreamIndex : null,
+        });
+
+        const subtitleMode = String(payload.subtitleMode || '').trim();
+        let subtitleUrl;
+        if (subtitleMode === 'off') {
+          subtitleUrl = null;
+        } else if (subtitleMode) {
+          subtitleUrl = await mediaServer.getSubtitleUrl(media.id, {
+            allowDownload: subtitleMode === 'download',
+          });
+        }
+
         const result = await castMediaItem(selectedRenderer, mediaServer, media, {
           startSeconds,
           playlistContext,
+          subtitleUrl,
         });
         const playlistModeUsed = Boolean(result && result.playlistModeUsed);
         const selectedKey = rendererKey(selectedRenderer);
@@ -4743,6 +5819,206 @@ function createCastUiServer({
           ok: false,
           error: error.message,
         });
+      }
+      return;
+    }
+
+    if (req.method === 'GET' && parsed.pathname.startsWith('/covers/')) {
+      try {
+        const fileName = decodeURIComponent(parsed.pathname.slice('/covers/'.length));
+        if (!resolvedCoversDir || !/^[a-f0-9]{16}\.(jpg|png|webp|gif)$/.test(fileName)) {
+          res.statusCode = 404;
+          res.end('Not found');
+          return;
+        }
+
+        const fullPath = path.join(resolvedCoversDir, fileName);
+        if (!fs.existsSync(fullPath)) {
+          res.statusCode = 404;
+          res.end('Not found');
+          return;
+        }
+
+        const extension = path.extname(fileName).slice(1).toLowerCase();
+        const mime = extension === 'png' ? 'image/png'
+          : extension === 'webp' ? 'image/webp'
+            : extension === 'gif' ? 'image/gif'
+              : 'image/jpeg';
+
+        res.statusCode = 200;
+        res.setHeader('Content-Type', mime);
+        res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+        fs.createReadStream(fullPath).pipe(res);
+      } catch (error) {
+        res.statusCode = 500;
+        res.end('Cover read failed');
+      }
+      return;
+    }
+
+    if (req.method === 'GET' && parsed.pathname === '/api/media/tracks') {
+      try {
+        const media = mediaServer.getMediaById(String(parsed.searchParams.get('id') || ''));
+        if (!media) {
+          sendJson(res, 404, { ok: false, error: 'Media item not found.' });
+          return;
+        }
+
+        const sidecarPath = path.join(
+          path.dirname(media.filePath),
+          path.basename(media.filePath, path.extname(media.filePath)) + '.srt',
+        );
+        const userPath = subtitleCachePath(media, 'user');
+
+        let audio = [];
+        let subtitles = [];
+        let probeError = null;
+
+        try {
+          const probe = await probeMediaTracks(media);
+          audio = probe.streams
+            .filter((stream) => stream.codec_type === 'audio')
+            .map((stream) => ({
+              streamIndex: stream.typeIndex,
+              label: describeAudioTrack(stream),
+              language: stream.language,
+              isDefault: stream.isDefault,
+            }));
+
+          subtitles = probe.streams
+            .filter((stream) => stream.codec_type === 'subtitle')
+            .map((stream) => ({
+              streamIndex: stream.typeIndex,
+              label: describeSubtitleTrack(stream),
+              language: stream.language,
+              isDefault: stream.isDefault,
+              // Bitmap subtitles cannot be turned into a text sidecar.
+              extractable: TEXT_SUBTITLE_CODECS.has(String(stream.codec_name || '').toLowerCase()),
+            }));
+        } catch (error) {
+          probeError = error.message;
+        }
+
+        sendJson(res, 200, {
+          ok: true,
+          id: media.id,
+          audio,
+          subtitles,
+          hasSidecar: fs.existsSync(sidecarPath),
+          hasUserSubtitle: Boolean(userPath && fs.existsSync(userPath)),
+          // Selecting a non-default audio track requires a remux on our side.
+          canSelectAudio: transcodingEnabled,
+          probeError,
+        });
+      } catch (error) {
+        sendJson(res, 500, { ok: false, error: error.message });
+      }
+      return;
+    }
+
+    if (req.method === 'POST' && parsed.pathname === '/api/media/subtitle') {
+      try {
+        const body = await readRequestBody(req, 4 * 1024 * 1024);
+        const payload = JSON.parse(body || '{}');
+        const media = mediaServer.getMediaById(String(payload.id || ''));
+
+        if (!media) {
+          sendJson(res, 404, { ok: false, error: 'Media item not found.' });
+          return;
+        }
+
+        const mode = String(payload.mode || '').trim();
+
+        if (mode === 'upload') {
+          const savedPath = saveUploadedSubtitle(media, payload.content);
+          mediaServer.setSubtitleOverride(media.id, savedPath);
+          sendJson(res, 200, { ok: true, mode, ready: true });
+          return;
+        }
+
+        if (mode === 'user') {
+          const userPath = subtitleCachePath(media, 'user');
+          if (!userPath || !fs.existsSync(userPath)) {
+            sendJson(res, 404, { ok: false, error: 'No subtitle file has been loaded for this item.' });
+            return;
+          }
+          mediaServer.setSubtitleOverride(media.id, userPath);
+          sendJson(res, 200, { ok: true, mode, ready: true });
+          return;
+        }
+
+        if (mode === 'download') {
+          mediaServer.setSubtitleOverride(media.id, null);
+          const url = await mediaServer.getSubtitleUrl(media.id, { allowDownload: true });
+          sendJson(res, 200, {
+            ok: Boolean(url),
+            mode,
+            ready: Boolean(url),
+            error: url ? undefined : 'No subtitles found online for this file.',
+          });
+          return;
+        }
+
+        if (mode === 'embedded') {
+          const streamIndex = Number(payload.streamIndex);
+          if (!Number.isInteger(streamIndex) || streamIndex < 0) {
+            sendJson(res, 400, { ok: false, error: 'Pick a subtitle track first.' });
+            return;
+          }
+
+          const savedPath = await extractEmbeddedSubtitle(media, streamIndex);
+          mediaServer.setSubtitleOverride(media.id, savedPath);
+          sendJson(res, 200, { ok: true, mode, ready: true });
+          return;
+        }
+
+        // "off" and "sidecar" only need the override cleared.
+        mediaServer.setSubtitleOverride(media.id, null);
+        sendJson(res, 200, { ok: true, mode: mode || 'sidecar', ready: true });
+      } catch (error) {
+        sendJson(res, 400, { ok: false, error: error.message });
+      }
+      return;
+    }
+
+    if (req.method === 'POST' && parsed.pathname === '/api/media/override') {
+      try {
+        const body = await readRequestBody(req, MAX_COVER_BYTES + 1024 * 64);
+        const payload = JSON.parse(body || '{}');
+        const media = mediaServer.getMediaById(String(payload.id || ''));
+
+        if (!media) {
+          sendJson(res, 404, { ok: false, error: 'Media item not found.' });
+          return;
+        }
+
+        if (payload.clear === true) {
+          setMediaOverride(media.filePath, null);
+          metadataVersion += 1;
+          sendJson(res, 200, { ok: true, cleared: true, override: null });
+          return;
+        }
+
+        let posterUrl = String(payload.posterUrl || '').trim();
+        if (typeof payload.coverDataUrl === 'string' && payload.coverDataUrl.length > 0) {
+          posterUrl = saveCoverImage(media.filePath, payload.coverDataUrl);
+        }
+
+        const saved = setMediaOverride(media.filePath, {
+          title: payload.title,
+          year: payload.year,
+          plot: payload.plot,
+          posterUrl,
+        });
+        metadataVersion += 1;
+
+        sendJson(res, 200, {
+          ok: true,
+          cleared: !saved,
+          override: saved,
+        });
+      } catch (error) {
+        sendJson(res, 400, { ok: false, error: error.message });
       }
       return;
     }

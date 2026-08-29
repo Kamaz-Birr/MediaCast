@@ -444,6 +444,50 @@ function saveCategoryConfig(payload) {
   updateCastUiConfig({ customCategories, folderCategories });
 }
 
+function getCoversDir() {
+  return path.join(path.dirname(getCastUiConfigPath()), 'covers');
+}
+
+function getSubtitlesDir() {
+  return path.join(path.dirname(getCastUiConfigPath()), 'subtitles');
+}
+
+function normalizeMediaOverrides(source) {
+  const input = source && typeof source === 'object' && !Array.isArray(source) ? source : {};
+  const normalized = {};
+
+  for (const [key, value] of Object.entries(input)) {
+    const itemKey = String(key || '').trim();
+    if (!itemKey || !value || typeof value !== 'object') {
+      continue;
+    }
+
+    const entry = {
+      title: String(value.title || '').trim(),
+      year: String(value.year || '').trim(),
+      plot: String(value.plot || '').trim(),
+      posterUrl: String(value.posterUrl || '').trim(),
+    };
+
+    if (!entry.title && !entry.year && !entry.plot && !entry.posterUrl) {
+      continue;
+    }
+
+    entry.updatedAt = value.updatedAt || new Date().toISOString();
+    normalized[itemKey] = entry;
+  }
+
+  return normalized;
+}
+
+function loadMediaOverrides() {
+  return normalizeMediaOverrides(readCastUiConfig().mediaOverrides);
+}
+
+function saveMediaOverrides(overrides) {
+  updateCastUiConfig({ mediaOverrides: normalizeMediaOverrides(overrides) });
+}
+
 function loadMediaLibraryCache() {
   const parsed = readCastUiConfig();
   const cache = parsed.mediaLibraryCache;
@@ -887,6 +931,10 @@ program
         initialCustomCategories: loadCustomCategories(),
         initialFolderCategories: loadFolderCategories(),
         onCategoriesChanged: (payload) => saveCategoryConfig(payload),
+        initialMediaOverrides: loadMediaOverrides(),
+        onMediaOverridesChanged: (overrides) => saveMediaOverrides(overrides),
+        coversDir: getCoversDir(),
+        subtitlesDir: getSubtitlesDir(),
       });
 
       const uiInfo = await uiServer.start();

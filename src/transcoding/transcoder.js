@@ -12,6 +12,9 @@ export class FFmpegTranscoder extends EventEmitter {
     this.isRunning = false;
     this.hasError = false;
     this.subtitlesPath = options.subtitlesPath || null;
+    this.audioStreamIndex = Number.isInteger(options.audioStreamIndex) && options.audioStreamIndex >= 0
+      ? options.audioStreamIndex
+      : null;
   }
 
   start() {
@@ -56,11 +59,12 @@ export class FFmpegTranscoder extends EventEmitter {
       this.options.audioBitrate || '128k',
     );
 
+    args.push('-map', '0:v:0');
+    args.push('-map', '0:a:' + (this.audioStreamIndex === null ? 0 : this.audioStreamIndex) + '?');
+
     args.push(
-      '-c:s',
-      'copy',
-      '-map',
-      '0',
+      '-sn',
+      '-dn',
       '-f',
       'mp4',
       '-movflags',
