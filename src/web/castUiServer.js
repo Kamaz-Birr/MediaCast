@@ -916,7 +916,15 @@ function buildPageHtml(rendererName) {
 
     /* ---------- Detail dialog ---------- */
 
-    .detail-modal { width: min(880px, 100%); padding: 0; overflow: hidden; }
+    /* overflow:hidden here would clip the dialog instead of scrolling it, which
+       hid the editor's Save row entirely on shorter screens. */
+    .detail-modal {
+      width: min(880px, 100%);
+      padding: 0;
+      overflow-y: auto;
+      overflow-x: hidden;
+      overscroll-behavior: contain;
+    }
 
     .modal-close {
       position: absolute;
@@ -946,8 +954,46 @@ function buildPageHtml(rendererName) {
 
     .detail-poster {
       position: relative;
+      align-self: start;
+      aspect-ratio: 2 / 3;
       background: linear-gradient(150deg, #17203a, #0d1526);
-      min-height: 340px;
+      cursor: pointer;
+      overflow: hidden;
+    }
+
+    /* Hover affordance telling the user the cover is editable. */
+    .poster-edit {
+      position: absolute;
+      inset: 0;
+      z-index: 2;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 16px;
+      border: 0;
+      background: rgba(4, 8, 16, 0.74);
+      backdrop-filter: blur(3px);
+      color: #fff;
+      font-family: inherit;
+      font-size: 0.72rem;
+      font-weight: 800;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      text-align: center;
+      line-height: 1.4;
+      cursor: pointer;
+      opacity: 0;
+      transition: opacity 260ms var(--ease-soft);
+    }
+
+    .detail-poster:hover .poster-edit,
+    .poster-edit:focus-visible { opacity: 1; }
+
+    .poster-edit .icon {
+      font-size: 26px;
+      line-height: 1;
     }
 
     .detail-poster img {
@@ -988,8 +1034,6 @@ function buildPageHtml(rendererName) {
       color: #c9d6ea;
       font-size: 0.92rem;
       line-height: 1.65;
-      max-height: 190px;
-      overflow-y: auto;
     }
 
     .detail-file {
@@ -1092,11 +1136,15 @@ function buildPageHtml(rendererName) {
     }
 
     .edit-actions {
+      position: sticky;
+      bottom: 0;
       display: flex;
       gap: 9px;
       justify-content: flex-end;
       flex-wrap: wrap;
       margin-top: 18px;
+      padding: 14px 0 2px;
+      background: linear-gradient(to top, rgba(14, 20, 34, 0.98) 55%, rgba(14, 20, 34, 0));
     }
 
     .edit-actions .spacer { flex: 1; }
@@ -1681,6 +1729,7 @@ function buildPageHtml(rendererName) {
   <div class="modal-backdrop" id="detailModal" hidden>
     <div class="modal detail-modal" role="dialog" aria-modal="true" aria-labelledby="detailTitle">
       <button class="modal-close" id="detailClose" aria-label="Close">&times;</button>
+      <input type="file" id="detailPosterFile" accept="image/png,image/jpeg,image/webp,image/gif" hidden />
 
       <div class="detail-body">
         <div class="detail-poster" id="detailPosterWrap"></div>
@@ -1819,6 +1868,7 @@ function buildPageHtml(rendererName) {
     const detailModal = document.getElementById('detailModal');
     const detailClose = document.getElementById('detailClose');
     const detailPosterWrap = document.getElementById('detailPosterWrap');
+    const detailPosterFile = document.getElementById('detailPosterFile');
     const detailTitle = document.getElementById('detailTitle');
     const detailMeta = document.getElementById('detailMeta');
     const detailPlot = document.getElementById('detailPlot');
@@ -1847,6 +1897,7 @@ function buildPageHtml(rendererName) {
     let detailCard = null;
     let detailTracks = null;
     let pendingCoverDataUrl = '';
+    let detailPosterFileHandler = null;
     let isLibraryLoading = false;
     let lastMetadataVersion = 0;
 
@@ -2376,6 +2427,7 @@ function buildPageHtml(rendererName) {
           card.classList.add('is-episode');
         }
         card.__mediaId = item.id;
+        card.__item = item;
         card.__watchedKey = item.watchedKey || item.filePath || item.id;
 
         if (item.posterUrl) {
@@ -3186,25 +3238,7 @@ function buildPageHtml(rendererName) {
 
       detailTitle.textContent = item.movieTitle || item.name;
 
-      detailPosterWrap.innerHTML = '';
-      if (item.posterUrl) {
-        const img = document.createElement('img');
-        img.src = item.posterUrl;
-        img.alt = item.movieTitle || item.name;
-        img.onerror = () => {
-          detailPosterWrap.innerHTML = '';
-          const fallback = document.createElement('div');
-          fallback.className = 'placeholder';
-          fallback.textContent = '\u25B6';
-          detailPosterWrap.appendChild(fallback);
-        };
-        detailPosterWrap.appendChild(img);
-      } else {
-        const fallback = document.createElement('div');
-        fallback.className = 'placeholder';
-        fallback.textContent = '\u25B6';
-        detailPosterWrap.appendChild(fallback);
-      }
+      renderDetailPoster(item.posterUrl, item.movieTitle || item.name);
 
       detailMeta.innerHTML = '';
       const chips = [];
@@ -3401,6 +3435,95 @@ function buildPageHtml(rendererName) {
       }
     }
 
+    function reopenDetailFor(mediaId) {
+      const card = [...document.querySelectorAll('.movie-card')]
+        .find((element) => element.__mediaId === mediaId);
+      if (card && card.__item) {
+        openDetailModal(card.__item, card);
+      }
+    }
+
+    function renderDetailPoster(posterUrl, altText) {
+      detailPosterWrap.innerHTML = '';
+
+      const showFallback = () => {
+        const fallback = document.createElement('div');
+        fallback.className = 'placeholder';
+        fallback.textContent = '\u25B6';
+        detailPosterWrap.insertBefore(fallback, detailPosterWrap.firstChild);
+      };
+
+      if (posterUrl) {
+        const img = document.createElement('img');
+        img.src = posterUrl;
+        img.alt = altText || '';
+        img.onerror = () => {
+          img.remove();
+          showFallback();
+        };
+        detailPosterWrap.appendChild(img);
+      } else {
+        showFallback();
+      }
+
+      // Overlay is rebuilt with the poster so it always sits on top.
+      const overlay = document.createElement('button');
+      overlay.type = 'button';
+      overlay.className = 'poster-edit';
+      overlay.title = 'Change cover image';
+
+      const icon = document.createElement('span');
+      icon.className = 'icon';
+      icon.textContent = '🖼';
+
+      const label = document.createElement('span');
+      label.textContent = 'Click to change cover';
+
+      overlay.appendChild(icon);
+      overlay.appendChild(label);
+      overlay.addEventListener('click', (event) => {
+        event.stopPropagation();
+        detailPosterFile.click();
+      });
+      detailPosterWrap.appendChild(overlay);
+    }
+
+    function populateEditFields() {
+      if (!detailItem) {
+        return;
+      }
+      editTitle.value = detailItem.movieTitle || detailItem.name || '';
+      editYear.value = detailItem.year ? String(detailItem.year) : '';
+      editPlot.value = detailItem.plot || '';
+      editPoster.value = detailItem.posterUrl || '';
+      editCoverPreview.src = detailItem.posterUrl || '';
+    }
+
+    function openEditForm(options) {
+      const keepCover = Boolean(options && options.keepPendingCover);
+      if (!keepCover) {
+        pendingCoverDataUrl = '';
+      }
+
+      const wasOpen = !detailEditForm.hidden;
+      detailEditForm.hidden = false;
+      detailEdit.textContent = 'Close Editor';
+
+      if (!wasOpen) {
+        populateEditFields();
+      }
+
+      if (keepCover && pendingCoverDataUrl) {
+        editCoverPreview.src = pendingCoverDataUrl;
+      }
+    }
+
+    function closeEditForm() {
+      detailEditForm.hidden = true;
+      detailEdit.textContent = 'Edit Info';
+      pendingCoverDataUrl = '';
+    }
+
     function closeDetailModal() {
       detailModal.hidden = true;
       detailItem = null;
@@ -3426,22 +3549,39 @@ function buildPageHtml(rendererName) {
         return;
       }
 
-      const opening = detailEditForm.hidden;
-      detailEditForm.hidden = !opening;
-      detailEdit.textContent = opening ? 'Close Editor' : 'Edit Info';
+      if (detailEditForm.hidden) {
+        openEditForm();
+        editTitle.focus();
+      } else {
+        closeEditForm();
+      }
+    }
 
-      if (!opening) {
+    // Picking a cover straight from the poster opens the editor with the image
+    // staged, so one Save writes the cover and the text fields together.
+    detailPosterFileHandler = () => {
+      const file = detailPosterFile.files && detailPosterFile.files[0];
+      if (!file || !detailItem) {
+        return;
+      }
+      if (file.size > 8 * 1024 * 1024) {
+        setStatus('Cover image must be 8MB or smaller.', true);
+        detailPosterFile.value = '';
         return;
       }
 
-      pendingCoverDataUrl = '';
-      editTitle.value = detailItem.movieTitle || detailItem.name || '';
-      editYear.value = detailItem.year ? String(detailItem.year) : '';
-      editPlot.value = detailItem.plot || '';
-      editPoster.value = detailItem.posterUrl || '';
-      editCoverPreview.src = detailItem.posterUrl || '';
-      editTitle.focus();
-    }
+      const reader = new FileReader();
+      reader.onload = () => {
+        pendingCoverDataUrl = String(reader.result || '');
+        openEditForm({ keepPendingCover: true });
+        editPoster.value = file.name;
+        editCoverPreview.src = pendingCoverDataUrl;
+        renderDetailPoster(pendingCoverDataUrl, detailItem.movieTitle || detailItem.name);
+        detailEditForm.scrollIntoView({ block: 'nearest' });
+        detailPosterFile.value = '';
+      };
+      reader.readAsDataURL(file);
+    };
 
     async function saveDetailEdits() {
       if (!detailItem) {
@@ -3472,11 +3612,13 @@ function buildPageHtml(rendererName) {
         }
 
         const title = (result.override && result.override.title) || detailItem.name;
+        const savedId = detailItem.id;
         closeDetailModal();
         await loadLibrary(false, { silent: true });
         setStatus(result.cleared
           ? 'Restored original details for ' + title + '.'
           : 'Saved details for ' + title + '.');
+        reopenDetailFor(savedId);
       } catch (error) {
         setStatus('Save failed: ' + error.message, true);
       } finally {
@@ -3502,9 +3644,11 @@ function buildPageHtml(rendererName) {
         }
 
         const name = detailItem.name;
+        const savedId = detailItem.id;
         closeDetailModal();
         await loadLibrary(false, { silent: true });
         setStatus('Restored original details for ' + name + '.');
+        reopenDetailFor(savedId);
       } catch (error) {
         setStatus('Reset failed: ' + error.message, true);
       } finally {
@@ -3514,7 +3658,18 @@ function buildPageHtml(rendererName) {
 
     detailClose.addEventListener('click', closeDetailModal);
     detailEdit.addEventListener('click', toggleEditForm);
-    editCancel.addEventListener('click', toggleEditForm);
+    editCancel.addEventListener('click', () => {
+      closeEditForm();
+      if (detailItem) {
+        renderDetailPoster(detailItem.posterUrl, detailItem.movieTitle || detailItem.name);
+      }
+    });
+
+    detailPosterFile.addEventListener('change', () => {
+      if (detailPosterFileHandler) {
+        detailPosterFileHandler();
+      }
+    });
     editSave.addEventListener('click', saveDetailEdits);
     editReset.addEventListener('click', resetDetailEdits);
 
