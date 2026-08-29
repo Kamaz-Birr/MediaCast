@@ -386,6 +386,64 @@ function saveResumePositions(resumePositions) {
   updateCastUiConfig({ resumePositions: normalized });
 }
 
+function loadCustomCategories() {
+  const parsed = readCastUiConfig();
+  const values = Array.isArray(parsed.customCategories) ? parsed.customCategories : [];
+
+  return values
+    .map((item) => ({
+      id: String(item && item.id ? item.id : '').trim(),
+      label: String(item && item.label ? item.label : '').trim(),
+      kind: item && item.kind === 'shows' ? 'shows' : 'movies',
+    }))
+    .filter((item) => item.id.length > 0 && item.label.length > 0);
+}
+
+function loadFolderCategories() {
+  const parsed = readCastUiConfig();
+  const source = parsed.folderCategories;
+  if (!source || typeof source !== 'object' || Array.isArray(source)) {
+    return {};
+  }
+
+  const normalized = {};
+  for (const [folderPath, categoryId] of Object.entries(source)) {
+    const key = String(folderPath || '').trim();
+    const value = String(categoryId || '').trim();
+    if (key && value) {
+      normalized[key] = value;
+    }
+  }
+
+  return normalized;
+}
+
+function saveCategoryConfig(payload) {
+  const source = payload && typeof payload === 'object' ? payload : {};
+
+  const customCategories = (Array.isArray(source.customCategories) ? source.customCategories : [])
+    .map((item) => ({
+      id: String(item && item.id ? item.id : '').trim(),
+      label: String(item && item.label ? item.label : '').trim(),
+      kind: item && item.kind === 'shows' ? 'shows' : 'movies',
+    }))
+    .filter((item) => item.id.length > 0 && item.label.length > 0);
+
+  const folderSource = source.folderCategories && typeof source.folderCategories === 'object'
+    ? source.folderCategories
+    : {};
+  const folderCategories = {};
+  for (const [folderPath, categoryId] of Object.entries(folderSource)) {
+    const key = String(folderPath || '').trim();
+    const value = String(categoryId || '').trim();
+    if (key && value) {
+      folderCategories[key] = value;
+    }
+  }
+
+  updateCastUiConfig({ customCategories, folderCategories });
+}
+
 function loadMediaLibraryCache() {
   const parsed = readCastUiConfig();
   const cache = parsed.mediaLibraryCache;
@@ -826,6 +884,9 @@ program
         onWatchedKeysChanged: (keys) => saveWatchedMediaKeys(keys),
         initialResumePositions: loadResumePositions(),
         onResumePositionsChanged: (positions) => saveResumePositions(positions),
+        initialCustomCategories: loadCustomCategories(),
+        initialFolderCategories: loadFolderCategories(),
+        onCategoriesChanged: (payload) => saveCategoryConfig(payload),
       });
 
       const uiInfo = await uiServer.start();

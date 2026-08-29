@@ -50,6 +50,32 @@ const CATEGORY_MOVIES = 'movies';
 const CATEGORY_TV_SHOWS = 'tv-shows';
 const CATEGORY_ANIME_MOVIES = 'anime-movies';
 const CATEGORY_ANIME_SHOWS = 'anime-shows';
+const CATEGORY_KIND_MOVIES = 'movies';
+const CATEGORY_KIND_SHOWS = 'shows';
+const CATEGORY_AUTO = 'auto';
+
+// Categories that ship with the app. Custom ones are appended at runtime.
+const BUILT_IN_CATEGORIES = [
+  { id: CATEGORY_MOVIES, label: 'Movies', kind: CATEGORY_KIND_MOVIES, builtIn: true },
+  { id: CATEGORY_TV_SHOWS, label: 'TV Shows', kind: CATEGORY_KIND_SHOWS, builtIn: true },
+  { id: CATEGORY_ANIME_MOVIES, label: 'Anime Movies', kind: CATEGORY_KIND_MOVIES, builtIn: true },
+  { id: CATEGORY_ANIME_SHOWS, label: 'Anime Shows', kind: CATEGORY_KIND_SHOWS, builtIn: true },
+];
+
+function slugifyCategoryLabel(label) {
+  return String(label || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 40);
+}
+
+function normalizeFolderKey(value) {
+  const resolved = path.resolve(String(value || ''));
+  const unified = resolved.split('\\').join('/');
+  return process.platform === 'win32' ? unified.toLowerCase() : unified;
+}
+
 const AUTO_NEXT_MIN_CREDITS_WATCH_SEC = 5;
 const WATCHED_COMPLETION_PROGRESS = 0.99;
 
@@ -224,18 +250,32 @@ function buildPageHtml(rendererName) {
   <link href="https://fonts.googleapis.com/css2?family=Raleway:wght@400;600;700;800;900&display=swap" rel="stylesheet" />
   <style>
     :root {
-      --bg: #0f172a;
-      --surface: rgba(30, 41, 59, 0.7);
-      --surface-2: #1e293b;
-      --text: #f8fafc;
-      --muted: #94a3b8;
+      --bg: #070b14;
+      --surface: rgba(18, 26, 44, 0.72);
+      --glass: rgba(255, 255, 255, 0.045);
+      --glass-hi: rgba(255, 255, 255, 0.085);
+      --text: #f4f7fc;
+      --muted: #8d9db8;
+      --faint: #5b6b85;
       --accent: #fb923c;
       --accent-strong: #f97316;
-      --danger: #ef4444;
-      --stroke: rgba(255, 255, 255, 0.1);
+      --brand-a: #60a5fa;
+      --brand-b: #a78bfa;
+      --success: #22c55e;
+      --warn: #facc15;
+      --danger: #f87171;
+      --stroke: rgba(255, 255, 255, 0.08);
+      --stroke-hi: rgba(255, 255, 255, 0.16);
+      --shadow-md: 0 12px 30px rgba(0, 0, 0, 0.42);
+      --shadow-lg: 0 26px 60px rgba(0, 0, 0, 0.55);
+      --ease: cubic-bezier(0.22, 1, 0.36, 1);
+      --ease-soft: cubic-bezier(0.4, 0, 0.2, 1);
+      --radius: 16px;
     }
 
     * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
 
     body {
       margin: 0;
@@ -243,107 +283,294 @@ function buildPageHtml(rendererName) {
       background-color: var(--bg);
       color: var(--text);
       font-family: 'Raleway', system-ui, -apple-system, Segoe UI, sans-serif;
-      background-image:
-        radial-gradient(circle at 14% 18%, rgba(59, 130, 246, 0.12) 0, transparent 38%),
-        radial-gradient(circle at 85% 82%, rgba(249, 115, 22, 0.1) 0, transparent 35%),
-        linear-gradient(160deg, #0b1222 0%, #0f172a 55%, #121f37 100%);
-      padding: 24px;
+      -webkit-font-smoothing: antialiased;
+      padding: 0 clamp(14px, 3vw, 34px) 60px;
+      position: relative;
+      overflow-x: hidden;
     }
 
-    .button-row {
-      display: flex;
-      gap: 10px;
-      margin-top: 12px;
+    /* Slow-drifting aurora field behind everything. */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: -25vmax;
+      z-index: -2;
+      background:
+        radial-gradient(38vmax 38vmax at 12% 14%, rgba(59, 130, 246, 0.16), transparent 62%),
+        radial-gradient(34vmax 34vmax at 88% 82%, rgba(249, 115, 22, 0.13), transparent 60%),
+        radial-gradient(30vmax 30vmax at 70% 10%, rgba(167, 139, 250, 0.11), transparent 62%);
+      animation: aurora-drift 34s var(--ease-soft) infinite alternate;
+      will-change: transform;
     }
 
-    .neu-btn.watched, .neu-btn.secondary.watched {
-      background: #22c55e;
-      color: #fff;
-      border-color: #22c55e;
-      font-weight: 700;
-      box-shadow: 0 2px 8px 0 rgba(34,197,94,0.12);
+    body::after {
+      content: '';
+      position: fixed;
+      inset: 0;
+      z-index: -3;
+      background: linear-gradient(165deg, #070b14 0%, #0c1322 52%, #0a1120 100%);
+    }
+
+    @keyframes aurora-drift {
+      from { transform: translate3d(-2%, -1%, 0) scale(1); }
+      to   { transform: translate3d(3%, 2%, 0) scale(1.08); }
     }
 
     .app {
-      max-width: 1600px;
+      max-width: 1680px;
       margin: 0 auto;
     }
 
+    /* ---------- Header ---------- */
+
     .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 60;
       display: flex;
-      gap: 16px;
+      gap: 18px;
       align-items: center;
       justify-content: space-between;
-      margin-bottom: 18px;
       flex-wrap: wrap;
+      margin: 0 calc(clamp(14px, 3vw, 34px) * -1) 20px;
+      padding: 20px clamp(14px, 3vw, 34px) 18px;
+      background: linear-gradient(180deg, rgba(7, 11, 20, 0.92), rgba(7, 11, 20, 0.66));
+      backdrop-filter: blur(18px) saturate(140%);
+      -webkit-backdrop-filter: blur(18px) saturate(140%);
+      border-bottom: 1px solid transparent;
+      transition: padding 320ms var(--ease), border-color 320ms var(--ease), box-shadow 320ms var(--ease);
+    }
+
+    body.scrolled .topbar {
+      padding-top: 11px;
+      padding-bottom: 11px;
+      border-bottom-color: var(--stroke);
+      box-shadow: 0 12px 34px rgba(0, 0, 0, 0.45);
     }
 
     .brand {
       display: flex;
       flex-direction: column;
-      gap: 6px;
+      gap: 4px;
+      min-width: 0;
     }
 
     .brand h1 {
       margin: 0;
-      font-size: clamp(2rem, 3vw, 2.8rem);
-      letter-spacing: 0.02em;
+      font-size: clamp(1.6rem, 2.4vw, 2.3rem);
+      letter-spacing: -0.02em;
       font-weight: 900;
-      background: linear-gradient(90deg, #60a5fa, #818cf8);
+      line-height: 1;
+      background: linear-gradient(100deg, var(--brand-a), var(--brand-b) 55%, var(--accent));
+      background-size: 220% 100%;
       -webkit-background-clip: text;
       background-clip: text;
       color: transparent;
+      animation: brand-sheen 9s var(--ease-soft) infinite alternate;
+      transition: font-size 320ms var(--ease);
+    }
+
+    body.scrolled .brand h1 { font-size: clamp(1.3rem, 1.8vw, 1.7rem); }
+
+    @keyframes brand-sheen {
+      from { background-position: 0% 50%; }
+      to   { background-position: 100% 50%; }
     }
 
     .subtitle {
       color: var(--muted);
-      font-size: 0.95rem;
+      font-size: 0.86rem;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .subtitle strong { color: #cfe0f8; font-weight: 800; }
+
+    /* Live dot next to the renderer name. */
+    .subtitle::before {
+      content: '';
+      width: 7px;
+      height: 7px;
+      border-radius: 999px;
+      background: var(--success);
+      box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.6);
+      animation: live-pulse 2.4s var(--ease-soft) infinite;
+      flex: none;
+    }
+
+    @keyframes live-pulse {
+      0%   { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.55); }
+      70%  { box-shadow: 0 0 0 8px rgba(34, 197, 94, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
     }
 
     .controls {
       display: flex;
-      gap: 10px;
+      gap: 9px;
       flex-wrap: wrap;
+      align-items: center;
     }
+
+    /* ---------- Buttons ---------- */
+
+    .neu-btn {
+      position: relative;
+      background: var(--glass);
+      border: 1px solid var(--stroke);
+      color: var(--accent);
+      border-radius: 12px;
+      font-family: inherit;
+      font-weight: 800;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      font-size: 0.7rem;
+      cursor: pointer;
+      padding: 11px 16px;
+      min-height: 42px;
+      backdrop-filter: blur(10px);
+      overflow: hidden;
+      transition:
+        transform 200ms var(--ease),
+        background 200ms var(--ease-soft),
+        border-color 200ms var(--ease-soft),
+        color 200ms var(--ease-soft),
+        box-shadow 200ms var(--ease);
+    }
+
+    /* Sheen that sweeps across on hover. */
+    .neu-btn::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(115deg, transparent 30%, rgba(255, 255, 255, 0.16) 50%, transparent 70%);
+      transform: translateX(-120%);
+      transition: transform 620ms var(--ease);
+      pointer-events: none;
+    }
+
+    .neu-btn:hover::after { transform: translateX(120%); }
+
+    .neu-btn:hover {
+      color: #ffd9b3;
+      background: var(--glass-hi);
+      border-color: rgba(251, 146, 60, 0.5);
+      transform: translateY(-2px);
+      box-shadow: 0 10px 24px rgba(249, 115, 22, 0.18);
+    }
+
+    .neu-btn:active { transform: translateY(0) scale(0.97); }
+
+    .neu-btn:focus-visible {
+      outline: none;
+      box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.45);
+    }
+
+    .neu-btn:disabled {
+      opacity: 0.55;
+      cursor: progress;
+      transform: none;
+    }
+
+    .neu-btn.secondary { color: #9dc4fb; }
+    .neu-btn.secondary:hover {
+      color: #d5e7ff;
+      border-color: rgba(96, 165, 250, 0.5);
+      box-shadow: 0 10px 24px rgba(59, 130, 246, 0.18);
+    }
+
+    .neu-btn.danger { color: #fca5a5; }
+    .neu-btn.danger:hover {
+      color: #fecaca;
+      border-color: rgba(248, 113, 113, 0.55);
+      box-shadow: 0 10px 24px rgba(239, 68, 68, 0.2);
+    }
+
+    .neu-btn.resume {
+      color: #fde68a;
+      border-color: rgba(250, 204, 21, 0.5);
+      background: rgba(250, 204, 21, 0.12);
+    }
+
+    .neu-btn.resume:hover {
+      color: #fef9c3;
+      background: rgba(250, 204, 21, 0.2);
+      border-color: rgba(250, 204, 21, 0.8);
+      box-shadow: 0 10px 24px rgba(250, 204, 21, 0.2);
+    }
+
+    .neu-btn.watched, .neu-btn.secondary.watched {
+      background: rgba(34, 197, 94, 0.18);
+      color: #bbf7d0;
+      border-color: rgba(34, 197, 94, 0.6);
+    }
+
+    .neu-btn.watched:hover {
+      background: rgba(34, 197, 94, 0.28);
+      color: #dcfce7;
+      box-shadow: 0 10px 24px rgba(34, 197, 94, 0.2);
+    }
+
+    .button-row {
+      display: flex;
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    /* ---------- Renderer dropdown + sort ---------- */
 
     .renderer-dropdown {
       position: relative;
-      min-width: 280px;
+      min-width: 230px;
       display: inline-block;
     }
 
     .renderer-dropdown-btn,
     .sort-select {
-      min-height: 46px;
-      min-width: 280px;
-      background: rgba(255, 255, 255, 0.03);
+      min-height: 42px;
+      width: 100%;
+      background: var(--glass);
       color: var(--text);
-      border-radius: 1rem;
-      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 12px;
+      border: 1px solid var(--stroke);
       padding: 10px 14px;
+      font-family: inherit;
       font-weight: 700;
+      font-size: 0.8rem;
       letter-spacing: 0.02em;
       backdrop-filter: blur(10px);
       outline: none;
       display: flex;
       align-items: center;
       justify-content: space-between;
-      width: 100%;
+      gap: 10px;
       cursor: pointer;
-      transition: border-color 0.18s, box-shadow 0.18s;
+      transition: border-color 200ms var(--ease-soft), box-shadow 200ms var(--ease-soft), background 200ms var(--ease-soft);
+    }
+
+    .renderer-dropdown-btn:hover,
+    .sort-select:hover { background: var(--glass-hi); border-color: var(--stroke-hi); }
+
+    .renderer-dropdown-btn span:first-child {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
 
     .sort-select {
       width: auto;
+      min-width: 190px;
       display: inline-flex;
-      align-items: center;
-      justify-content: space-between;
       appearance: none;
       -webkit-appearance: none;
       -moz-appearance: none;
       background-image:
-        linear-gradient(45deg, transparent 50%, var(--text) 50%),
-        linear-gradient(135deg, var(--text) 50%, transparent 50%);
+        linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+        linear-gradient(135deg, var(--muted) 50%, transparent 50%);
       background-position:
         calc(100% - 20px) calc(50% - 2px),
         calc(100% - 14px) calc(50% - 2px);
@@ -352,110 +579,88 @@ function buildPageHtml(rendererName) {
       padding-right: 36px;
     }
 
-    .renderer-dropdown-btn[aria-expanded="true"] {
-      border-color: rgba(96, 165, 250, 0.85);
-      box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.22);
-    }
+    .sort-select option { background: #131c2f; color: var(--text); }
 
-    .sort-select:focus {
-      border-color: rgba(96, 165, 250, 0.85);
-      box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.22);
+    .renderer-dropdown-btn[aria-expanded="true"],
+    .sort-select:focus-visible {
+      border-color: rgba(96, 165, 250, 0.8);
+      box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.22);
     }
 
     .dropdown-arrow {
-      margin-left: 10px;
-      font-size: 1.1em;
-      transition: transform 0.28s cubic-bezier(.4, 2, .6, 1);
+      font-size: 0.7em;
+      color: var(--muted);
+      transition: transform 320ms var(--ease);
+      flex: none;
     }
 
-    .renderer-dropdown-btn[aria-expanded="true"] .dropdown-arrow {
-      transform: rotate(-180deg);
-    }
+    .renderer-dropdown-btn[aria-expanded="true"] .dropdown-arrow { transform: rotate(-180deg); }
 
     .renderer-dropdown-menu {
       position: absolute;
       left: 0;
       right: 0;
-      top: 110%;
-      background: rgba(30, 41, 59, 0.98);
-      border-radius: 1rem;
-      border: 1px solid rgba(255, 255, 255, 0.08);
-      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.18);
+      top: calc(100% + 8px);
+      background: rgba(16, 23, 39, 0.97);
+      border-radius: 14px;
+      border: 1px solid var(--stroke-hi);
+      box-shadow: var(--shadow-lg);
+      backdrop-filter: blur(20px);
       margin: 0;
-      padding: 0.5em 0;
+      padding: 6px;
       list-style: none;
       z-index: 100;
       opacity: 0;
-      transform: translateY(-10px) scale(0.985);
+      transform: translateY(-8px) scale(0.98);
       transform-origin: top center;
       pointer-events: none;
-      transition: opacity 0.38s cubic-bezier(0.2, 0.9, 0.2, 1), transform 0.38s cubic-bezier(0.2, 0.9, 0.2, 1);
-      max-height: 320px;
+      transition: opacity 260ms var(--ease), transform 260ms var(--ease);
+      max-height: 340px;
       overflow-y: auto;
-      will-change: opacity, transform;
     }
 
     .renderer-dropdown-menu.open {
       opacity: 1;
-      transform: translateY(0) scaleY(1);
+      transform: translateY(0) scale(1);
       pointer-events: auto;
     }
 
     .renderer-dropdown-menu li {
-      padding: 12px 18px;
+      padding: 11px 14px;
+      border-radius: 9px;
       color: var(--text);
       font-weight: 600;
+      font-size: 0.86rem;
       cursor: pointer;
-      transition: background 0.18s;
-      border: none;
-      background: none;
-      outline: none;
-      font-size: 1rem;
+      transition: background 160ms var(--ease-soft), color 160ms var(--ease-soft), transform 160ms var(--ease);
       display: flex;
       align-items: center;
       opacity: 0;
-      transform: translateX(-10px);
+      transform: translateX(-8px);
     }
 
     .renderer-dropdown-menu.open li {
-      animation: renderer-dropdown-item-in 360ms cubic-bezier(0.16, 0.84, 0.34, 1) forwards;
-      animation-delay: calc(var(--item-index, 0) * 24ms);
+      animation: dropdown-item-in 340ms var(--ease) forwards;
+      animation-delay: calc(var(--item-index, 0) * 34ms);
     }
 
-    @keyframes renderer-dropdown-item-in {
-      from {
-        opacity: 0;
-        transform: translateX(-12px);
-      }
-      to {
-        opacity: 1;
-        transform: translateX(0);
-      }
-    }
-
-    @media (prefers-reduced-motion: reduce) {
-      .renderer-dropdown-menu,
-      .renderer-dropdown-menu li,
-      .dropdown-arrow {
-        transition: none;
-        animation: none;
-      }
-
-      .renderer-dropdown-menu li {
-        opacity: 1;
-        transform: none;
-      }
+    @keyframes dropdown-item-in {
+      from { opacity: 0; transform: translateX(-10px); }
+      to   { opacity: 1; transform: translateX(0); }
     }
 
     .renderer-dropdown-menu li.selected {
-      background: rgba(96, 165, 250, 0.13);
-      color: #bae6fd;
+      background: rgba(96, 165, 250, 0.16);
+      color: #cfe4ff;
     }
 
     .renderer-dropdown-menu li:hover {
-      background: rgba(251, 146, 60, 0.13);
-      color: #fed7aa;
+      background: rgba(251, 146, 60, 0.16);
+      color: #ffd9b3;
+      transform: translateX(2px);
     }
+
+    /* ---------- Category tabs ---------- */
 
     .categories {
       display: flex;
@@ -465,127 +670,332 @@ function buildPageHtml(rendererName) {
     }
 
     .category-btn {
+      position: relative;
+      isolation: isolate;
       border: 1px solid var(--stroke);
       border-radius: 999px;
-      background: rgba(15, 23, 42, 0.62);
-      color: var(--text);
-      padding: 10px 14px;
-      font-size: 0.82rem;
-      font-weight: 700;
-      letter-spacing: 0.04em;
+      background: var(--glass);
+      color: var(--muted);
+      padding: 9px 18px;
+      font-family: inherit;
+      font-size: 0.74rem;
+      font-weight: 800;
+      letter-spacing: 0.07em;
       text-transform: uppercase;
       cursor: pointer;
-      transition: all 160ms ease;
+      overflow: hidden;
+      transition: color 220ms var(--ease-soft), border-color 220ms var(--ease-soft), transform 220ms var(--ease);
     }
 
+    /* Gradient fill grows from the centre when the tab becomes active. */
+    .category-btn::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      border-radius: inherit;
+      background: linear-gradient(100deg, rgba(251, 146, 60, 0.26), rgba(167, 139, 250, 0.22));
+      transform: scaleX(0);
+      transform-origin: center;
+      transition: transform 360ms var(--ease);
+      z-index: -1;
+    }
+
+    .category-btn.active::before { transform: scaleX(1); }
+
     .category-btn.active {
-      background: rgba(251, 146, 60, 0.18);
-      border-color: rgba(251, 146, 60, 0.8);
-      color: #fed7aa;
+      color: #ffdcbc;
+      border-color: rgba(251, 146, 60, 0.7);
     }
 
     .category-btn:hover {
-      border-color: rgba(255, 255, 255, 0.45);
-      transform: translateY(-1px);
+      color: var(--text);
+      border-color: var(--stroke-hi);
+      transform: translateY(-2px);
     }
 
-    .neu-btn {
-      background: rgba(255, 255, 255, 0.03);
-      box-shadow: 6px 6px 12px rgba(0, 0, 0, 0.4), -6px -6px 12px rgba(255, 255, 255, 0.04);
-      backdrop-filter: blur(10px);
-      color: var(--accent);
-      border-radius: 1rem;
-      border: 1px solid rgba(255, 255, 255, 0.04);
-      font-weight: 700;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-      font-size: 0.76rem;
+    .category-btn:focus-visible {
+      outline: none;
+      box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.4);
+    }
+
+    /* ---------- Modal ---------- */
+
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      z-index: 200;
+      display: grid;
+      place-items: center;
+      padding: 20px;
+      background: rgba(3, 6, 12, 0.72);
+      backdrop-filter: blur(6px);
+      animation: fade-in 200ms var(--ease-soft);
+    }
+
+    .modal-backdrop[hidden] { display: none; }
+
+    @keyframes fade-in {
+      from { opacity: 0; }
+      to   { opacity: 1; }
+    }
+
+    .modal {
+      width: min(560px, 100%);
+      max-height: min(86vh, 760px);
+      overflow-y: auto;
+      background: linear-gradient(155deg, rgba(24, 33, 54, 0.98), rgba(14, 20, 34, 0.98));
+      border: 1px solid var(--stroke-hi);
+      border-radius: 20px;
+      box-shadow: var(--shadow-lg);
+      padding: 26px;
+      animation: modal-in 320ms var(--ease);
+    }
+
+    @keyframes modal-in {
+      from { opacity: 0; transform: translateY(18px) scale(0.97); }
+      to   { opacity: 1; transform: translateY(0) scale(1); }
+    }
+
+    .modal-title {
+      margin: 0 0 6px;
+      font-size: 1.35rem;
+      font-weight: 900;
+      letter-spacing: -0.02em;
+      color: var(--text);
+    }
+
+    .modal-sub {
+      margin: 0 0 20px;
+      color: var(--muted);
+      font-size: 0.88rem;
+      line-height: 1.55;
+    }
+
+    .category-choices {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+      gap: 9px;
+      margin-bottom: 16px;
+    }
+
+    .category-choice {
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      text-align: left;
+      padding: 13px 15px;
+      border-radius: 12px;
+      border: 1px solid var(--stroke);
+      background: var(--glass);
+      color: var(--text);
+      font-family: inherit;
       cursor: pointer;
-      transition: all 0.2s ease-in-out;
-      padding: 12px 18px;
-      min-height: 46px;
+      transition: border-color 200ms var(--ease-soft), background 200ms var(--ease-soft), transform 200ms var(--ease);
     }
 
-    .neu-btn:hover {
-      color: var(--accent-strong);
-      background: rgba(255, 255, 255, 0.06);
-      transform: translateY(-1px);
+    .category-choice:hover {
+      background: var(--glass-hi);
+      border-color: var(--stroke-hi);
+      transform: translateY(-2px);
     }
 
-    .neu-btn:active {
-      box-shadow: inset 4px 4px 10px rgba(0, 0, 0, 0.4), inset -4px -4px 10px rgba(255, 255, 255, 0.02);
+    .category-choice.selected {
+      border-color: rgba(251, 146, 60, 0.8);
+      background: rgba(251, 146, 60, 0.14);
+      box-shadow: 0 0 0 1px rgba(251, 146, 60, 0.3);
     }
 
-    .neu-btn.danger {
-      color: #fca5a5;
+    .category-choice:focus-visible {
+      outline: none;
+      box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.45);
     }
 
-    .neu-btn.secondary {
-      color: #93c5fd;
+    .category-choice .name {
+      font-weight: 800;
+      font-size: 0.92rem;
     }
 
-    .neu-btn.resume {
-      color: #fef08a;
-      border-color: rgba(250, 204, 21, 0.55);
-      background: rgba(250, 204, 21, 0.12);
-      box-shadow: 0 0 0 1px rgba(250, 204, 21, 0.24), 6px 6px 12px rgba(0, 0, 0, 0.35);
+    .category-choice .hint {
+      color: var(--muted);
+      font-size: 0.74rem;
+      font-weight: 600;
     }
 
-    .neu-btn.resume:hover {
-      color: #fef9c3;
-      background: rgba(250, 204, 21, 0.2);
-      border-color: rgba(250, 204, 21, 0.82);
+    .category-choice.is-new {
+      border-style: dashed;
+      color: #9dc4fb;
     }
+
+    .category-choice.is-new .name::before { content: '+ '; }
+
+    .new-category {
+      border-top: 1px solid var(--stroke);
+      padding-top: 16px;
+      margin-bottom: 18px;
+      animation: section-in 300ms var(--ease);
+    }
+
+    .new-category[hidden] { display: none; }
+
+    .field-label {
+      display: block;
+      margin-bottom: 7px;
+      font-size: 0.72rem;
+      font-weight: 800;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    .text-input {
+      width: 100%;
+      padding: 12px 14px;
+      border-radius: 11px;
+      border: 1px solid var(--stroke);
+      background: rgba(6, 11, 22, 0.6);
+      color: var(--text);
+      font-family: inherit;
+      font-size: 0.92rem;
+      font-weight: 600;
+      outline: none;
+      transition: border-color 200ms var(--ease-soft), box-shadow 200ms var(--ease-soft);
+    }
+
+    .text-input::placeholder { color: var(--faint); }
+
+    .text-input:focus {
+      border-color: rgba(96, 165, 250, 0.8);
+      box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.2);
+    }
+
+    .kind-row {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 9px;
+      margin-top: 12px;
+    }
+
+    .kind-option {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      padding: 12px 14px;
+      border-radius: 11px;
+      border: 1px solid var(--stroke);
+      background: var(--glass);
+      cursor: pointer;
+      transition: border-color 200ms var(--ease-soft), background 200ms var(--ease-soft);
+    }
+
+    .kind-option:hover { background: var(--glass-hi); }
+
+    .kind-option input { margin-top: 3px; accent-color: var(--accent); flex: none; }
+
+    .kind-option .name { display: block; font-weight: 800; font-size: 0.85rem; }
+    .kind-option .hint { display: block; color: var(--muted); font-size: 0.73rem; font-weight: 600; margin-top: 2px; }
+
+    .modal-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 9px;
+      flex-wrap: wrap;
+    }
+
+    /* ---------- Status bar ---------- */
 
     .status {
+      position: relative;
       background: var(--surface);
       border: 1px solid var(--stroke);
-      border-radius: 0.9rem;
-      padding: 14px 16px;
-      color: var(--text);
-      margin-bottom: 20px;
-      backdrop-filter: blur(10px);
-      min-height: 52px;
+      border-left: 3px solid var(--brand-a);
+      border-radius: 12px;
+      padding: 13px 16px;
+      color: #dbe6f6;
+      font-size: 0.9rem;
+      font-weight: 600;
+      margin-bottom: 22px;
+      backdrop-filter: blur(14px);
+      min-height: 50px;
       display: flex;
       align-items: center;
+      overflow: hidden;
+      transition: border-color 260ms var(--ease-soft), color 260ms var(--ease-soft), background 260ms var(--ease-soft);
     }
 
-    .grid {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 20px;
-      justify-content: flex-start;
+    .status.is-busy::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(100deg, transparent 20%, rgba(96, 165, 250, 0.14) 50%, transparent 80%);
+      transform: translateX(-100%);
+      animation: status-sweep 1.5s var(--ease-soft) infinite;
     }
+
+    @keyframes status-sweep {
+      to { transform: translateX(100%); }
+    }
+
+    .status.is-error {
+      border-left-color: var(--danger);
+      color: #fecaca;
+      background: rgba(69, 26, 26, 0.5);
+    }
+
+    .status.is-playing { border-left-color: var(--accent); color: #ffe2c7; }
+
+    /* ---------- Grid ---------- */
+
+    .grid, .group-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(196px, 1fr));
+      gap: clamp(14px, 1.6vw, 22px);
+      align-items: start;
+    }
+
+    .group-grid { width: 100%; }
+
+    /* ---------- Cards ---------- */
 
     .movie-card {
-      width: 500px;
-      height: 500px;
-      max-width: 100%;
-      background: #1e293b;
-      border-radius: 0;
       position: relative;
+      width: 100%;
+      aspect-ratio: 2 / 3;
+      background: linear-gradient(150deg, #17203a, #0d1526);
+      border: 1px solid var(--stroke);
+      border-radius: var(--radius);
       cursor: pointer;
       overflow: hidden;
-      border: 10px solid white;
-      transition: transform 0.28s ease, box-shadow 0.28s ease;
-      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.25);
-      flex-shrink: 0;
+      box-shadow: var(--shadow-md);
+      transform: translateZ(0);
+      transition:
+        transform 420ms var(--ease),
+        box-shadow 420ms var(--ease),
+        border-color 420ms var(--ease),
+        filter 420ms var(--ease-soft),
+        opacity 420ms var(--ease-soft);
+      animation: card-in 520ms var(--ease) backwards;
+      animation-delay: calc(var(--i, 0) * 42ms);
     }
 
-    .movie-card.watched-media {
-      filter: grayscale(0.95);
-      opacity: 0.78;
-      box-shadow: 0 12px 24px rgba(15, 23, 42, 0.6);
+    /* Episode stills are 16:9, so give those cards a matching frame. */
+    .movie-card.is-episode { aspect-ratio: 16 / 10; }
+
+    @keyframes card-in {
+      from { opacity: 0; transform: translateY(18px) scale(0.97); }
+      to   { opacity: 1; transform: translateY(0) scale(1); }
     }
 
     .movie-card:hover {
-      transform: scale(1.03);
-      box-shadow: 0 28px 56px rgba(30, 64, 175, 0.25);
+      transform: translateY(-8px);
+      border-color: rgba(251, 146, 60, 0.45);
+      box-shadow: var(--shadow-lg), 0 0 0 1px rgba(251, 146, 60, 0.18);
+      z-index: 5;
     }
 
-    .movie-card.watched-media:hover {
-      transform: scale(1.015);
-      box-shadow: 0 18px 30px rgba(15, 23, 42, 0.68);
+    .movie-card:focus-visible {
+      outline: none;
+      box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.55);
     }
 
     .movie-card img {
@@ -593,6 +1003,29 @@ function buildPageHtml(rendererName) {
       height: 100%;
       object-fit: cover;
       display: block;
+      transition: transform 700ms var(--ease), opacity 460ms var(--ease-soft);
+    }
+
+    .movie-card:hover img { transform: scale(1.07); }
+
+    /* Poster fades in once loaded; a shimmer holds the space until then. */
+    .movie-card.img-pending img { opacity: 0; }
+
+    .movie-card.img-pending::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      z-index: 1;
+      background:
+        linear-gradient(100deg, transparent 20%, rgba(255, 255, 255, 0.07) 45%, transparent 70%),
+        linear-gradient(150deg, #17203a, #0d1526);
+      background-size: 220% 100%, 100% 100%;
+      animation: shimmer 1.5s var(--ease-soft) infinite;
+    }
+
+    @keyframes shimmer {
+      from { background-position: 120% 0, 0 0; }
+      to   { background-position: -120% 0, 0 0; }
     }
 
     .placeholder {
@@ -600,192 +1033,375 @@ function buildPageHtml(rendererName) {
       inset: 0;
       display: grid;
       place-items: center;
-      color: #64748b;
-      background: linear-gradient(145deg, #1e293b, #0f172a);
-      font-size: 72px;
-      font-weight: 800;
+      color: #3c4a63;
+      background: linear-gradient(150deg, #17203a, #0d1526);
+      font-size: 54px;
     }
 
+    /* Overlay: title always readable, details reveal on hover. */
     .movie-overlay {
       position: absolute;
       inset: 0;
-      z-index: 5;
-      opacity: 0;
-      transition: opacity 0.28s ease;
+      z-index: 6;
       display: flex;
       flex-direction: column;
-      justify-content: center;
-      align-items: center;
-      text-align: center;
-      gap: 16px;
-      padding: 28px;
-      background: rgba(0, 0, 0, 0.8);
-      backdrop-filter: blur(4px);
+      justify-content: flex-end;
+      gap: 6px;
+      padding: 16px 15px 15px;
+      text-align: left;
+      background: linear-gradient(
+        to top,
+        rgba(4, 8, 16, 0.96) 0%,
+        rgba(4, 8, 16, 0.82) 26%,
+        rgba(4, 8, 16, 0.25) 55%,
+        transparent 78%
+      );
+      transition: background 420ms var(--ease-soft);
     }
 
     .movie-card:hover .movie-overlay {
-      opacity: 1;
-    }
-
-    .watched-check {
-      position: absolute;
-      top: 12px;
-      left: 12px;
-      width: 34px;
-      height: 34px;
-      border-radius: 999px;
-      background: #16a34a;
-      color: #ffffff;
-      display: grid;
-      place-items: center;
-      font-size: 20px;
-      font-weight: 900;
-      z-index: 9;
-      border: 2px solid #ffffff;
-      box-shadow: 0 6px 14px rgba(0, 0, 0, 0.42);
-      pointer-events: none;
-    }
-
-    .resume-tag {
-      position: absolute;
-      top: 14px;
-      left: 14px;
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      z-index: 9;
-      pointer-events: none;
-    }
-
-    .resume-tag .dot {
-      width: 14px;
-      height: 14px;
-      border-radius: 999px;
-      background: #facc15;
-      box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.45), 0 0 14px rgba(250, 204, 21, 0.55);
-    }
-
-    .resume-tag .label {
-      color: #fef08a;
-      font-size: 0.82rem;
-      font-weight: 800;
-      letter-spacing: 0.03em;
-      text-transform: uppercase;
-      text-shadow: 0 2px 6px rgba(0, 0, 0, 0.6);
+      background: linear-gradient(
+        to top,
+        rgba(4, 8, 16, 0.97) 0%,
+        rgba(4, 8, 16, 0.93) 42%,
+        rgba(5, 10, 20, 0.72) 72%,
+        rgba(5, 10, 20, 0.38) 100%
+      );
     }
 
     .movie-title {
       margin: 0;
       color: #fff;
-      font-size: clamp(1.3rem, 2.2vw, 2rem);
+      font-size: 0.98rem;
       font-weight: 800;
-      line-height: 1.2;
-      text-shadow: 0 6px 18px rgba(0, 0, 0, 0.55);
-      word-break: break-word;
-    }
-
-    .movie-meta {
-      color: #93c5fd;
-      font-size: 0.9rem;
-      font-weight: 700;
-      letter-spacing: 0.02em;
-    }
-
-    .movie-plot {
-      margin: 0;
-      color: #e2e8f0;
-      font-size: 1rem;
-      line-height: 1.5;
+      line-height: 1.25;
+      letter-spacing: -0.01em;
+      text-shadow: 0 2px 12px rgba(0, 0, 0, 0.7);
       display: -webkit-box;
-      -webkit-line-clamp: 5;
+      -webkit-line-clamp: 2;
       -webkit-box-orient: vertical;
       overflow: hidden;
     }
 
-    .empty {
-      width: 100%;
-      margin-top: 110px;
-      text-align: center;
-      color: #64748b;
-      display: flex;
-      flex-direction: column;
+    .movie-meta {
+      color: #9dc4fb;
+      font-size: 0.73rem;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      text-shadow: 0 2px 8px rgba(0, 0, 0, 0.6);
+    }
+
+    /* Plot + buttons stay collapsed until hover. */
+    .movie-plot, .movie-overlay .button-row, .movie-overlay > .neu-btn {
+      opacity: 0;
+      transform: translateY(10px);
+      max-height: 0;
+      overflow: hidden;
+      margin-top: 0;
+      transition:
+        opacity 320ms var(--ease-soft),
+        transform 380ms var(--ease),
+        max-height 420ms var(--ease),
+        margin-top 420ms var(--ease);
+    }
+
+    .movie-plot {
+      color: #c9d6ea;
+      font-size: 0.78rem;
+      line-height: 1.5;
+      display: -webkit-box;
+      -webkit-line-clamp: 4;
+      -webkit-box-orient: vertical;
+      margin: 0;
+    }
+
+    .movie-card:hover .movie-plot {
+      opacity: 1;
+      transform: translateY(0);
+      max-height: 6.4em;
+      margin-top: 4px;
+      transition-delay: 60ms;
+    }
+
+    .movie-card:hover .movie-overlay .button-row,
+    .movie-card:hover .movie-overlay > .neu-btn {
+      opacity: 1;
+      transform: translateY(0);
+      max-height: 60px;
+      margin-top: 10px;
+      transition-delay: 110ms;
+    }
+
+    .movie-overlay .neu-btn {
+      flex: 1 1 0;
+      min-width: 0;
+      padding: 9px 8px;
+      min-height: 36px;
+      font-size: 0.65rem;
+      letter-spacing: 0.03em;
+      line-height: 1.2;
+      overflow: hidden;
+    }
+
+    /* ---------- Card badges ---------- */
+
+    .movie-card.watched-media { filter: grayscale(0.9); opacity: 0.72; }
+    .movie-card.watched-media:hover { filter: grayscale(0.25); opacity: 1; }
+
+    .watched-check {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      width: 28px;
+      height: 28px;
+      border-radius: 999px;
+      background: var(--success);
+      color: #04140a;
+      display: grid;
+      place-items: center;
+      font-size: 15px;
+      font-weight: 900;
+      z-index: 9;
+      border: 2px solid rgba(255, 255, 255, 0.85);
+      box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5);
+      pointer-events: none;
+      animation: badge-pop 420ms var(--ease) backwards;
+    }
+
+    @keyframes badge-pop {
+      from { opacity: 0; transform: scale(0.4) rotate(-25deg); }
+      to   { opacity: 1; transform: scale(1) rotate(0); }
+    }
+
+    .resume-tag {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      display: inline-flex;
       align-items: center;
-      gap: 10px;
+      gap: 7px;
+      z-index: 9;
+      padding: 5px 10px 5px 7px;
+      border-radius: 999px;
+      background: rgba(6, 11, 22, 0.82);
+      border: 1px solid rgba(250, 204, 21, 0.45);
+      backdrop-filter: blur(8px);
+      pointer-events: none;
+      max-width: calc(100% - 20px);
+      animation: badge-pop 420ms var(--ease) backwards;
     }
 
-    .empty .icon {
-      font-size: 54px;
-      opacity: 0.5;
+    .resume-tag .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: var(--warn);
+      box-shadow: 0 0 10px rgba(250, 204, 21, 0.8);
+      flex: none;
     }
 
-    .empty .main {
-      font-size: 2rem;
+    .resume-tag .label {
+      color: #fde68a;
+      font-size: 0.66rem;
       font-weight: 800;
-      color: #94a3b8;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
 
-    .empty .sub {
-      font-size: 1.05rem;
-      color: #64748b;
+    /* Currently casting: accent ring + pulsing dot. */
+    .movie-card.now-playing {
+      border-color: rgba(251, 146, 60, 0.75);
+      box-shadow: var(--shadow-md), 0 0 0 2px rgba(251, 146, 60, 0.35);
     }
+
+    .movie-card.now-playing .resume-tag {
+      border-color: rgba(251, 146, 60, 0.6);
+    }
+
+    .movie-card.now-playing .resume-tag .dot {
+      background: var(--accent);
+      box-shadow: 0 0 10px rgba(251, 146, 60, 0.9);
+      animation: eq-pulse 1.1s var(--ease-soft) infinite;
+    }
+
+    .movie-card.now-playing .resume-tag .label { color: #ffd9b3; }
+
+    @keyframes eq-pulse {
+      0%, 100% { transform: scale(1); opacity: 1; }
+      50%      { transform: scale(1.45); opacity: 0.65; }
+    }
+
+    /* Watch-progress rail along the bottom edge. */
+    .progress-rail {
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      height: 4px;
+      background: rgba(0, 0, 0, 0.55);
+      z-index: 8;
+      pointer-events: none;
+    }
+
+    .progress-rail .progress-fill {
+      display: block;
+      height: 100%;
+      width: 0;
+      background: linear-gradient(90deg, var(--warn), var(--accent));
+      box-shadow: 0 0 12px rgba(250, 204, 21, 0.6);
+      transition: width 620ms var(--ease);
+    }
+
+    .movie-card.now-playing .progress-rail .progress-fill {
+      background: linear-gradient(90deg, var(--accent), #fdba74);
+    }
+
+    /* ---------- Sections ---------- */
 
     .group-section {
       width: 100%;
-      margin-bottom: 34px;
+      grid-column: 1 / -1;
+      margin-bottom: 30px;
+      animation: section-in 480ms var(--ease) backwards;
     }
 
     .group-title {
-      margin: 0 0 14px;
-      color: #cbd5e1;
-      font-size: 1.3rem;
-      font-weight: 800;
-      letter-spacing: 0.01em;
+      margin: 0 0 16px;
+      color: var(--text);
+      font-size: clamp(1.3rem, 2vw, 1.75rem);
+      font-weight: 900;
+      letter-spacing: -0.02em;
+      display: flex;
+      align-items: center;
+      gap: 12px;
     }
 
-    .group-grid {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 20px;
+    .group-title::after {
+      content: '';
+      flex: 1;
+      height: 1px;
+      background: linear-gradient(90deg, var(--stroke-hi), transparent);
     }
 
     .episodes-block {
       width: 100%;
-      margin-top: 20px;
-      padding-top: 16px;
-      border-top: 1px solid rgba(148, 163, 184, 0.25);
+      margin-top: 26px;
+      padding-top: 22px;
+      border-top: 1px solid var(--stroke);
+      animation: section-in 480ms var(--ease) backwards;
     }
 
-    .episodes-title {
-      margin: 0 0 12px;
+    @keyframes section-in {
+      from { opacity: 0; transform: translateY(14px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    .episodes-title, .season-title {
+      margin: 0 0 14px;
       color: #cbd5e1;
-      font-size: 1.05rem;
-      font-weight: 700;
-      letter-spacing: 0.01em;
-    }
-
-    .season-section {
-      margin: 0 0 26px;
-    }
-
-    .season-title {
-      margin: 0 0 12px;
-      color: #93c5fd;
       font-size: 1rem;
-      font-weight: 700;
+      font-weight: 800;
       letter-spacing: 0.02em;
-      text-transform: uppercase;
     }
+
+    .season-title { color: #9dc4fb; text-transform: uppercase; font-size: 0.88rem; }
+
+    .season-section { margin: 0 0 24px; }
+
+    /* ---------- Empty state ---------- */
+
+    .empty {
+      grid-column: 1 / -1;
+      margin: 90px auto;
+      max-width: 520px;
+      text-align: center;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+      animation: section-in 520ms var(--ease) backwards;
+    }
+
+    .empty .icon {
+      width: 78px;
+      height: 78px;
+      display: grid;
+      place-items: center;
+      border-radius: 999px;
+      background: var(--glass);
+      border: 1px solid var(--stroke);
+      font-size: 30px;
+      font-weight: 900;
+      color: var(--faint);
+      animation: float-soft 4.5s var(--ease-soft) infinite alternate;
+    }
+
+    @keyframes float-soft {
+      from { transform: translateY(-5px); }
+      to   { transform: translateY(5px); }
+    }
+
+    .empty .main { font-size: 1.5rem; font-weight: 800; color: #b6c4da; }
+    .empty .sub { font-size: 0.92rem; color: var(--faint); line-height: 1.6; }
+
+    /* ---------- Scrollbar ---------- */
+
+    ::-webkit-scrollbar { width: 11px; height: 11px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb {
+      background: rgba(255, 255, 255, 0.12);
+      border-radius: 999px;
+      border: 3px solid transparent;
+      background-clip: content-box;
+    }
+    ::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.22); background-clip: content-box; }
+
+    /* ---------- Responsive ---------- */
 
     @media (max-width: 920px) {
-      body { padding: 14px; }
-      .topbar { align-items: flex-start; }
+      .topbar { align-items: flex-start; gap: 12px; }
       .controls { width: 100%; }
-      .neu-btn { flex: 1 1 180px; }
-      .grid { justify-content: center; }
-      .movie-card {
-        width: min(92vw, 500px);
-        height: min(92vw, 500px);
+      .renderer-dropdown { min-width: 100%; }
+      .sort-select { flex: 1 1 160px; min-width: 0; }
+      .neu-btn { flex: 1 1 140px; }
+      .grid, .group-grid { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); }
+      .movie-title { font-size: 0.86rem; }
+      .movie-plot { display: none; }
+      .movie-overlay { padding: 12px 11px 11px; }
+      .movie-overlay .button-row { gap: 6px; }
+      .movie-overlay .neu-btn {
+        font-size: 0.56rem;
+        padding: 8px 4px;
+        letter-spacing: 0.01em;
       }
+    }
+
+    /* Touch devices have no hover, so keep the actions visible. */
+    @media (hover: none) {
+      .movie-overlay .button-row, .movie-overlay > .neu-btn {
+        opacity: 1;
+        transform: none;
+        max-height: 60px;
+        margin-top: 8px;
+      }
+    }
+
+    /* ---------- Reduced motion ---------- */
+
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      *, *::before, *::after {
+        animation-duration: 0.001ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.001ms !important;
+      }
+      .movie-card, .movie-card:hover { transform: none; }
+      .movie-card:hover img { transform: none; }
+      .renderer-dropdown-menu li { opacity: 1; transform: none; }
+      .movie-card.img-pending img { opacity: 1; }
     }
   </style>
 </head>
@@ -816,15 +1432,45 @@ function buildPageHtml(rendererName) {
       </div>
     </header>
 
-    <div class="categories" id="categoryTabs">
-      <button class="category-btn active" data-category="movies">Movies</button>
-      <button class="category-btn" data-category="tv-shows">TV Shows</button>
-      <button class="category-btn" data-category="anime-movies">Anime Movies</button>
-      <button class="category-btn" data-category="anime-shows">Anime Shows</button>
-    </div>
+    <div class="categories" id="categoryTabs"></div>
 
     <div class="status" id="statusBox">Loading media library...</div>
     <section id="grid" class="grid"></section>
+  </div>
+
+  <div class="modal-backdrop" id="folderModal" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="folderModalTitle">
+      <h2 class="modal-title" id="folderModalTitle">Add media folder</h2>
+      <p class="modal-sub">Pick the category this folder belongs to. Everything inside it will be filed there.</p>
+
+      <div class="category-choices" id="categoryChoices"></div>
+
+      <div class="new-category" id="newCategoryForm" hidden>
+        <label class="field-label" for="newCategoryName">Category name</label>
+        <input class="text-input" id="newCategoryName" type="text" maxlength="60" placeholder="Documentaries, Concerts, Kids..." autocomplete="off" />
+        <div class="kind-row">
+          <label class="kind-option">
+            <input type="radio" name="newCategoryKind" value="movies" checked />
+            <span>
+              <span class="name">Flat list</span>
+              <span class="hint">One card per file, like Movies</span>
+            </span>
+          </label>
+          <label class="kind-option">
+            <input type="radio" name="newCategoryKind" value="shows" />
+            <span>
+              <span class="name">Grouped by show</span>
+              <span class="hint">Series, seasons and episodes</span>
+            </span>
+          </label>
+        </div>
+      </div>
+
+      <div class="modal-actions">
+        <button class="neu-btn secondary" id="folderModalCancel">Cancel</button>
+        <button class="neu-btn" id="folderModalConfirm">Choose Folder</button>
+      </div>
+    </div>
   </div>
 
   <script>
@@ -834,6 +1480,19 @@ function buildPageHtml(rendererName) {
       'anime-movies': 'Anime Movies',
       'anime-shows': 'Anime Shows',
     };
+    const CATEGORY_KINDS = {
+      'movies': 'movies',
+      'tv-shows': 'shows',
+      'anime-movies': 'movies',
+      'anime-shows': 'shows',
+    };
+    let availableCategories = [
+      { id: 'movies', label: 'Movies', kind: 'movies', builtIn: true },
+      { id: 'tv-shows', label: 'TV Shows', kind: 'shows', builtIn: true },
+      { id: 'anime-movies', label: 'Anime Movies', kind: 'movies', builtIn: true },
+      { id: 'anime-shows', label: 'Anime Shows', kind: 'shows', builtIn: true },
+    ];
+    let pendingFolderCategory = 'auto';
     const WATCHED_PROGRESS_THRESHOLD = ${WATCHED_COMPLETION_PROGRESS};
 
     let currentCategory = 'movies';
@@ -871,18 +1530,107 @@ function buildPageHtml(rendererName) {
     const addFolderBtn = document.getElementById('addFolderBtn');
     const backBtn = document.getElementById('backBtn');
     const stopBtn = document.getElementById('stopBtn');
+    const folderModal = document.getElementById('folderModal');
+    const categoryChoices = document.getElementById('categoryChoices');
+    const newCategoryForm = document.getElementById('newCategoryForm');
+    const newCategoryName = document.getElementById('newCategoryName');
+    const folderModalCancel = document.getElementById('folderModalCancel');
+    const folderModalConfirm = document.getElementById('folderModalConfirm');
     let isLibraryLoading = false;
     let lastMetadataVersion = 0;
 
+    // Give each card an index so CSS can stagger its entrance animation.
+    function applyStagger(root) {
+      if (!root) {
+        return;
+      }
+      const cards = root.querySelectorAll('.movie-card');
+      for (let index = 0; index < cards.length; index += 1) {
+        cards[index].style.setProperty('--i', String(Math.min(index, 22)));
+      }
+    }
+
+    // Poster swaps in only once it has loaded, so the shimmer covers the gap.
+    function attachPosterLoader(card, img) {
+      card.classList.add('img-pending');
+      const reveal = () => card.classList.remove('img-pending');
+      img.addEventListener('load', reveal);
+      if (img.complete && img.naturalWidth > 0) {
+        reveal();
+      }
+    }
+
     function isShowCategory(category) {
+      const kind = CATEGORY_KINDS[category];
+      if (kind) {
+        return kind === 'shows';
+      }
       return category === 'tv-shows' || category === 'anime-shows';
     }
 
+    // The category list is owned by the server; the tabs mirror whatever it sends.
+    function applyCategories(list) {
+      if (!Array.isArray(list) || list.length === 0) {
+        return;
+      }
+
+      availableCategories = list;
+      for (const key of Object.keys(CATEGORY_LABELS)) {
+        delete CATEGORY_LABELS[key];
+      }
+      for (const key of Object.keys(CATEGORY_KINDS)) {
+        delete CATEGORY_KINDS[key];
+      }
+      for (const item of list) {
+        CATEGORY_LABELS[item.id] = item.label;
+        CATEGORY_KINDS[item.id] = item.kind;
+      }
+
+      if (!CATEGORY_LABELS[currentCategory]) {
+        currentCategory = list[0].id;
+      }
+
+      renderCategoryTabs();
+    }
+
+    function renderCategoryTabs() {
+      categoryTabs.innerHTML = '';
+      for (const item of availableCategories) {
+        const button = document.createElement('button');
+        button.className = 'category-btn' + (item.id === currentCategory ? ' active' : '');
+        button.dataset.category = item.id;
+        button.textContent = item.label;
+        if (Number.isFinite(Number(item.itemCount))) {
+          button.title = item.label + ' - ' + item.itemCount + ' item(s)';
+        }
+        categoryTabs.appendChild(button);
+      }
+    }
+
+    function setStatusState(state) {
+      statusBox.classList.toggle('is-busy', state === 'busy');
+      statusBox.classList.toggle('is-error', state === 'error');
+      statusBox.classList.toggle('is-playing', state === 'playing');
+    }
+
     function setStatus(message, isError) {
-      statusBox.textContent = message;
-      statusBox.style.borderColor = isError ? 'rgba(239, 68, 68, 0.7)' : 'rgba(255, 255, 255, 0.1)';
-      statusBox.style.color = isError ? '#fecaca' : '#f8fafc';
-      statusBox.style.background = isError ? 'rgba(127, 29, 29, 0.45)' : 'rgba(30, 41, 59, 0.7)';
+      const text = String(message || '');
+      statusBox.textContent = text;
+
+      // Trailing ellipsis means work in flight, which drives the sweep animation.
+      const isBusy = !isError && text.slice(-3) === '...';
+      const isPlaying = !isError
+        && (text.indexOf('Now playing') === 0 || text.indexOf('Resumed on') === 0);
+
+      if (isError) {
+        setStatusState('error');
+      } else if (isBusy) {
+        setStatusState('busy');
+      } else if (isPlaying) {
+        setStatusState('playing');
+      } else {
+        setStatusState('idle');
+      }
     }
 
     function setCurrentRendererName(name) {
@@ -1161,6 +1909,52 @@ function buildPageHtml(rendererName) {
       if (!showResumeTag && existingTag) {
         existingTag.remove();
       }
+
+      card.classList.toggle('now-playing', isCasting);
+      updateProgressRail(card, isCasting);
+    }
+
+    // Thin bar along the card's bottom edge showing how far through it is.
+    function updateProgressRail(card, isCasting) {
+      const watchedKey = card && card.__watchedKey;
+      const resume = watchedKey ? resumeByKey.get(watchedKey) : null;
+      const isWatched = watchedKey ? watchedItemIds.has(watchedKey) : false;
+
+      let ratio = 0;
+      if (!isWatched && resume) {
+        const explicit = Number(resume.progress);
+        const position = Number(resume.positionSec);
+        const duration = Number(resume.durationSec);
+        if (Number.isFinite(explicit) && explicit > 0) {
+          ratio = explicit;
+        } else if (Number.isFinite(position) && Number.isFinite(duration) && duration > 0) {
+          ratio = position / duration;
+        }
+      }
+
+      const percent = Math.max(0, Math.min(100, Math.round(ratio * 100)));
+      let rail = card.querySelector('.progress-rail');
+
+      if (percent <= 0 && !isCasting) {
+        if (rail) {
+          rail.remove();
+        }
+        return;
+      }
+
+      if (!rail) {
+        rail = document.createElement('div');
+        rail.className = 'progress-rail';
+        const fill = document.createElement('span');
+        fill.className = 'progress-fill';
+        rail.appendChild(fill);
+        card.appendChild(rail);
+      }
+
+      const fill = rail.querySelector('.progress-fill');
+      if (fill) {
+        fill.style.width = percent + '%';
+      }
     }
 
     function createEmptyState(noFolders, category) {
@@ -1261,13 +2055,18 @@ function buildPageHtml(rendererName) {
     function createMovieCard(item) {
         const card = document.createElement('article');
         card.className = 'movie-card';
+        if (item.seasonNumber !== null && item.seasonNumber !== undefined) {
+          card.classList.add('is-episode');
+        }
         card.__mediaId = item.id;
         card.__watchedKey = item.watchedKey || item.filePath || item.id;
 
         if (item.posterUrl) {
           const img = document.createElement('img');
+          img.loading = 'lazy';
           img.src = item.posterUrl;
           img.alt = item.movieTitle || item.name;
+          attachPosterLoader(card, img);
           img.onerror = () => {
             img.remove();
             const fallback = document.createElement('div');
@@ -1295,7 +2094,7 @@ function buildPageHtml(rendererName) {
         const parts = [];
         if (item.year) parts.push(item.year);
         if (item.imdbRating) parts.push((item.ratingSource || 'IMDb') + ' ' + item.imdbRating + '/10');
-        parts.push(formatSize(item.size));
+        if (Number.isFinite(item.size)) parts.push(formatSize(item.size));
         meta.textContent = parts.join(' • ');
 
         const plot = document.createElement('p');
@@ -1469,8 +2268,10 @@ function buildPageHtml(rendererName) {
       const posterUrl = group.posterUrl || (representative && representative.posterUrl);
       if (posterUrl) {
         const img = document.createElement('img');
+        img.loading = 'lazy';
         img.src = posterUrl;
         img.alt = group.displayTitle || group.name;
+        attachPosterLoader(card, img);
         img.onerror = () => {
           img.remove();
           const fallback = document.createElement('div');
@@ -1541,8 +2342,10 @@ function buildPageHtml(rendererName) {
 
       if (representative && representative.posterUrl) {
         const img = document.createElement('img');
+        img.loading = 'lazy';
         img.src = representative.posterUrl;
         img.alt = season.name;
+        attachPosterLoader(card, img);
         img.onerror = () => {
           img.remove();
           const fallback = document.createElement('div');
@@ -1609,6 +2412,8 @@ function buildPageHtml(rendererName) {
       for (const item of items) {
         target.appendChild(createMovieCard(item));
       }
+
+      applyStagger(target);
     }
 
     function renderGroupedItems(groups, noFolders, category) {
@@ -1622,6 +2427,8 @@ function buildPageHtml(rendererName) {
       for (const group of groups) {
         grid.appendChild(createShowCard(group));
       }
+
+      applyStagger(grid);
     }
 
     function renderSelectedShowPage() {
@@ -1681,6 +2488,7 @@ function buildPageHtml(rendererName) {
       }
 
       grid.appendChild(section);
+      applyStagger(section);
       const seasonCount = seasons.length;
       const episodeCount = getGroupEpisodeCount(selected);
       setStatus('Viewing ' + selected.name + ' • ' + seasonCount + ' season(s) • ' + episodeCount + ' episode(s).');
@@ -1723,6 +2531,8 @@ function buildPageHtml(rendererName) {
         if (Number.isFinite(Number(result.metadataVersion))) {
           lastMetadataVersion = Number(result.metadataVersion);
         }
+
+        applyCategories(result.categories);
 
         watchedItemIds.clear();
         const watchedKeys = Array.isArray(result.watchedKeys) ? result.watchedKeys : [];
@@ -2035,14 +2845,129 @@ function buildPageHtml(rendererName) {
       setBackButton(false);
     });
 
-    addFolderBtn.addEventListener('click', async () => {
-      addFolderBtn.disabled = true;
-      setStatus('Opening folder picker...');
+    addFolderBtn.addEventListener('click', () => {
+      openFolderModal();
+    });
+
+    function renderCategoryChoices() {
+      categoryChoices.innerHTML = '';
+
+      const options = [{
+        id: 'auto',
+        label: 'Detect automatically',
+        hint: 'Sort by folder names (Movies, TV Shows, Anime...)',
+      }];
+
+      for (const item of availableCategories) {
+        options.push({
+          id: item.id,
+          label: item.label,
+          hint: (item.kind === 'shows' ? 'Grouped by show' : 'Flat list')
+            + (Number(item.itemCount) > 0 ? ' - ' + item.itemCount + ' item(s)' : ''),
+        });
+      }
+
+      for (const option of options) {
+        const choice = document.createElement('button');
+        choice.type = 'button';
+        choice.className = 'category-choice' + (option.id === pendingFolderCategory ? ' selected' : '');
+        choice.dataset.choice = option.id;
+
+        const name = document.createElement('span');
+        name.className = 'name';
+        name.textContent = option.label;
+
+        const hint = document.createElement('span');
+        hint.className = 'hint';
+        hint.textContent = option.hint;
+
+        choice.appendChild(name);
+        choice.appendChild(hint);
+        choice.addEventListener('click', () => {
+          pendingFolderCategory = option.id;
+          newCategoryForm.hidden = true;
+          renderCategoryChoices();
+        });
+        categoryChoices.appendChild(choice);
+      }
+
+      const createChoice = document.createElement('button');
+      createChoice.type = 'button';
+      createChoice.className = 'category-choice is-new' + (pendingFolderCategory === 'new' ? ' selected' : '');
+      createChoice.dataset.choice = 'new';
+
+      const createName = document.createElement('span');
+      createName.className = 'name';
+      createName.textContent = 'New category';
+
+      const createHint = document.createElement('span');
+      createHint.className = 'hint';
+      createHint.textContent = 'Name your own group for these files';
+
+      createChoice.appendChild(createName);
+      createChoice.appendChild(createHint);
+      createChoice.addEventListener('click', () => {
+        pendingFolderCategory = 'new';
+        newCategoryForm.hidden = false;
+        renderCategoryChoices();
+        newCategoryName.focus();
+      });
+      categoryChoices.appendChild(createChoice);
+    }
+
+    function openFolderModal() {
+      pendingFolderCategory = 'auto';
+      newCategoryName.value = '';
+      newCategoryForm.hidden = true;
+      renderCategoryChoices();
+      folderModal.hidden = false;
+      folderModalConfirm.focus();
+    }
+
+    function closeFolderModal() {
+      folderModal.hidden = true;
+      addFolderBtn.disabled = false;
+    }
+
+    async function createPendingCategory() {
+      const label = String(newCategoryName.value || '').trim();
+      if (!label) {
+        throw new Error('Enter a name for the new category.');
+      }
+
+      const kindInput = document.querySelector('input[name="newCategoryKind"]:checked');
+      const kind = kindInput ? kindInput.value : 'movies';
+
+      const response = await fetch('/api/categories', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label: label, kind: kind }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.ok) {
+        throw new Error(result.error || ('HTTP ' + response.status));
+      }
+
+      applyCategories(result.categories);
+      return result.category.id;
+    }
+
+    async function submitFolderChoice() {
+      folderModalConfirm.disabled = true;
       try {
+        let category = pendingFolderCategory;
+        if (category === 'new') {
+          category = await createPendingCategory();
+        }
+
+        closeFolderModal();
+        addFolderBtn.disabled = true;
+        setStatus('Opening folder picker...');
+
         let response = await fetch('/api/media-folders/add', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({}),
+          body: JSON.stringify({ category: category }),
         });
         let result = await response.json();
 
@@ -2055,7 +2980,7 @@ function buildPageHtml(rendererName) {
           response = await fetch('/api/media-folders/add', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ path: manualPath }),
+            body: JSON.stringify({ path: manualPath, category: category }),
           });
           result = await response.json();
         }
@@ -2064,14 +2989,58 @@ function buildPageHtml(rendererName) {
           throw new Error(result.error || ('HTTP ' + response.status));
         }
 
+        if (Array.isArray(result.categories)) {
+          applyCategories(result.categories);
+        }
+
+        if (result.category) {
+          currentCategory = result.category;
+          selectedShowName = null;
+          expandedSeasonName = null;
+          setBackButton(false);
+          syncActiveCategoryButton();
+        }
+
         await loadLibrary(true);
-        setStatus('Folder added. Total folders: ' + result.folderCount + '. Movies indexed: ' + result.movieCount + '.');
+        setStatus(
+          'Folder added'
+          + (result.categoryLabel ? ' to ' + result.categoryLabel : '')
+          + '. Total folders: ' + result.folderCount
+          + '. Titles indexed: ' + result.movieCount + '.',
+        );
       } catch (error) {
         setStatus('Add folder failed: ' + error.message, true);
       } finally {
+        folderModalConfirm.disabled = false;
         addFolderBtn.disabled = false;
       }
+    }
+
+    folderModalCancel.addEventListener('click', closeFolderModal);
+    folderModalConfirm.addEventListener('click', submitFolderChoice);
+
+    folderModal.addEventListener('click', (event) => {
+      if (event.target === folderModal) {
+        closeFolderModal();
+      }
     });
+
+    newCategoryName.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        submitFolderChoice();
+      }
+    });
+
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && !folderModal.hidden) {
+        closeFolderModal();
+      }
+    });
+
+    window.addEventListener('scroll', () => {
+      document.body.classList.toggle('scrolled', window.scrollY > 12);
+    }, { passive: true });
 
     stopBtn.addEventListener('click', async () => {
       stopBtn.disabled = true;
@@ -2111,6 +3080,7 @@ function buildPageHtml(rendererName) {
       }
     });
 
+    renderCategoryTabs();
     setBackButton(false);
     syncActiveCategoryButton();
     loadRenderers(true);
@@ -2332,10 +3302,194 @@ function createCastUiServer({
   onWatchedKeysChanged,
   initialResumePositions = {},
   onResumePositionsChanged,
+  initialCustomCategories = [],
+  initialFolderCategories = {},
+  onCategoriesChanged,
   allowLanAccess = false,
 }) {
   let server = null;
   const requestedUiHost = uiHost;
+
+  // ---- Category registry -------------------------------------------------
+  // Built-in categories plus any the user created. Each media root folder may
+  // be pinned to one of them; unpinned folders keep the original filename and
+  // folder-name heuristics.
+  const customCategories = [];
+  const folderCategories = new Map();
+
+  const getAllCategories = () => BUILT_IN_CATEGORIES.concat(customCategories);
+
+  const findCategory = (id) => {
+    const needle = String(id || '').trim();
+    return getAllCategories().find((item) => item.id === needle) || null;
+  };
+
+  const categoryKind = (id) => {
+    const category = findCategory(id);
+    return category ? category.kind : CATEGORY_KIND_MOVIES;
+  };
+
+  const isShowsCategory = (id) => categoryKind(id) === CATEGORY_KIND_SHOWS;
+
+  const registerCustomCategory = (label, kind) => {
+    const cleanLabel = String(label || '').trim().slice(0, 60);
+    if (!cleanLabel) {
+      throw new Error('Category name is required.');
+    }
+
+    const baseSlug = slugifyCategoryLabel(cleanLabel);
+    if (!baseSlug) {
+      throw new Error('Category name must contain at least one letter or number.');
+    }
+
+    const existing = getAllCategories()
+      .find((item) => item.label.toLowerCase() === cleanLabel.toLowerCase());
+    if (existing) {
+      return existing;
+    }
+
+    let id = baseSlug;
+    let suffix = 2;
+    while (findCategory(id)) {
+      id = baseSlug + '-' + suffix;
+      suffix += 1;
+    }
+
+    const category = {
+      id,
+      label: cleanLabel,
+      kind: kind === CATEGORY_KIND_SHOWS ? CATEGORY_KIND_SHOWS : CATEGORY_KIND_MOVIES,
+      builtIn: false,
+    };
+    customCategories.push(category);
+    return category;
+  };
+
+  const setFolderCategory = (folderPath, categoryId) => {
+    const key = normalizeFolderKey(folderPath);
+    if (!key) {
+      return;
+    }
+    if (!categoryId || categoryId === CATEGORY_AUTO || !findCategory(categoryId)) {
+      folderCategories.delete(key);
+      return;
+    }
+    folderCategories.set(key, categoryId);
+  };
+
+  // Longest matching pinned root wins, so a nested folder can override its parent.
+  const assignedRootFor = (filePath) => {
+    const target = normalizeFolderKey(filePath);
+    let bestKey = '';
+    let bestCategory = null;
+
+    for (const [key, categoryId] of folderCategories.entries()) {
+      if (target === key || target.startsWith(key + '/')) {
+        if (key.length > bestKey.length) {
+          bestKey = key;
+          bestCategory = categoryId;
+        }
+      }
+    }
+
+    return bestCategory ? { key: bestKey, categoryId: bestCategory } : null;
+  };
+
+  const resolveCategory = (filePath) => {
+    const assigned = assignedRootFor(filePath);
+    if (assigned && findCategory(assigned.categoryId)) {
+      return assigned.categoryId;
+    }
+    return categoryFromPath(filePath);
+  };
+
+  // Folders that hold episodes rather than name a show, so we look past them.
+  const isSeasonContainerFolder = (folderName) => {
+    const normalized = String(folderName || '')
+      .replace(/[._-]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+
+    if (!normalized) {
+      return false;
+    }
+
+    return /^season\s*\d{1,3}$/.test(normalized)
+      || /^s\d{1,3}$/.test(normalized)
+      || /^specials?$/.test(normalized)
+      || /^(?:disc|disk|part|vol|volume)\s*\d{1,3}$/.test(normalized)
+      || /^extras?$/.test(normalized);
+  };
+
+  // For pinned folders the show name comes from the folder that actually holds the
+  // episodes, stepping past "Season 01"-style containers. That keeps grouping tied to
+  // the folder names inside the media folder however deeply the library is nested.
+  const seriesNameFor = (filePath, categoryId) => {
+    const assigned = assignedRootFor(filePath);
+    if (!assigned) {
+      return extractSeriesName(filePath, categoryId);
+    }
+
+    const rootKey = assigned.key;
+    let current = path.dirname(path.resolve(filePath));
+
+    // Walk up while the folder only describes a season/disc, never past the root.
+    for (let step = 0; step < 3; step += 1) {
+      if (normalizeFolderKey(current) === rootKey) {
+        break;
+      }
+      if (!isSeasonContainerFolder(path.basename(current))) {
+        break;
+      }
+
+      const parent = path.dirname(current);
+      if (!parent || parent === current) {
+        break;
+      }
+      current = parent;
+    }
+
+    // Files sitting directly in the media folder group under that folder's name.
+    const folderName = path.basename(current);
+    return normalizeSeriesFolderName(safeBasename(folderName));
+  };
+
+  const persistCategories = () => {
+    if (typeof onCategoriesChanged === 'function') {
+      onCategoriesChanged({
+        customCategories: customCategories.map((item) => ({
+          id: item.id,
+          label: item.label,
+          kind: item.kind,
+        })),
+        folderCategories: Object.fromEntries(folderCategories.entries()),
+      });
+    }
+  };
+
+  for (const item of (Array.isArray(initialCustomCategories) ? initialCustomCategories : [])) {
+    const label = String(item && item.label ? item.label : '').trim();
+    const id = String(item && item.id ? item.id : '').trim();
+    if (!label || !id || findCategory(id)) {
+      continue;
+    }
+    customCategories.push({
+      id,
+      label,
+      kind: item && item.kind === CATEGORY_KIND_SHOWS ? CATEGORY_KIND_SHOWS : CATEGORY_KIND_MOVIES,
+      builtIn: false,
+    });
+  }
+
+  for (const [folderPath, categoryId] of Object.entries(
+    initialFolderCategories && typeof initialFolderCategories === 'object' ? initialFolderCategories : {},
+  )) {
+    const key = normalizeFolderKey(folderPath);
+    if (key && findCategory(String(categoryId || ''))) {
+      folderCategories.set(key, String(categoryId));
+    }
+  }
   const normalizedUiHost = String(uiHost || '').toLowerCase();
   const isLoopbackUiHost = normalizedUiHost === '127.0.0.1' || normalizedUiHost === 'localhost';
   // Binding a loopback host to 0.0.0.0 would silently publish the UI to the whole LAN.
@@ -2495,8 +3649,7 @@ function createCastUiServer({
     if (!media || !media.filePath) {
       return false;
     }
-    const category = categoryFromPath(media.filePath);
-    return category === CATEGORY_TV_SHOWS || category === CATEGORY_ANIME_SHOWS;
+    return isShowsCategory(resolveCategory(media.filePath));
   };
 
   const mediaEpisodeIndexInfo = (media) => {
@@ -2504,73 +3657,46 @@ function createCastUiServer({
       return null;
     }
 
-    const category = categoryFromPath(media.filePath);
-    if (category !== CATEGORY_TV_SHOWS && category !== CATEGORY_ANIME_SHOWS) {
+    const category = resolveCategory(media.filePath);
+    if (!isShowsCategory(category)) {
       return null;
     }
 
-    const showName = extractSeriesName(media.filePath, category);
     const episodeInfo = extractSeasonEpisodeInfo(media.filePath);
-    if (!Number.isFinite(episodeInfo.seasonNumber) || !Number.isFinite(episodeInfo.episodeNumber)) {
-      return null;
-    }
 
     return {
       category,
-      showName,
+      showName: seriesNameFor(media.filePath, category),
       seasonNumber: episodeInfo.seasonNumber,
       episodeNumber: episodeInfo.episodeNumber,
+      seasonSort: Number.isFinite(episodeInfo.seasonSort) ? episodeInfo.seasonSort : 999,
+      episodeSort: Number.isFinite(episodeInfo.episodeSort) ? episodeInfo.episodeSort : 9999,
+      sortName: String(media.name || path.basename(media.filePath) || ''),
     };
   };
 
-  const findAdjacentEpisode = (currentMedia, direction) => {
-    const currentInfo = mediaEpisodeIndexInfo(currentMedia);
-    if (!currentInfo) {
-      return null;
+  // "Part 2" must sort before "Part 10", so compare numbers inside names numerically.
+  const compareSequenceEntries = (a, b) => {
+    if (a.seasonSort !== b.seasonSort) {
+      return a.seasonSort - b.seasonSort;
+    }
+    if (a.episodeSort !== b.episodeSort) {
+      return a.episodeSort - b.episodeSort;
     }
 
-    const episodeCandidates = mediaServer.library
-      .filter((item) => isLikelyMovie(item))
-      .map((item) => {
-        const info = mediaEpisodeIndexInfo(item);
-        if (!info) {
-          return null;
-        }
-        if (info.category !== currentInfo.category || info.showName !== currentInfo.showName) {
-          return null;
-        }
-        return {
-          media: item,
-          seasonNumber: info.seasonNumber,
-          episodeNumber: info.episodeNumber,
-        };
-      })
-      .filter(Boolean)
-      .sort((a, b) => {
-        if (a.seasonNumber !== b.seasonNumber) {
-          return a.seasonNumber - b.seasonNumber;
-        }
-        if (a.episodeNumber !== b.episodeNumber) {
-          return a.episodeNumber - b.episodeNumber;
-        }
-        return String(a.media.filePath || '').localeCompare(String(b.media.filePath || ''));
-      });
-
-    const currentIndex = episodeCandidates.findIndex((entry) => entry.media.id === currentMedia.id);
-    if (currentIndex < 0) {
-      return null;
+    const byName = String(a.sortName || '').localeCompare(
+      String(b.sortName || ''),
+      undefined,
+      { numeric: true, sensitivity: 'base' },
+    );
+    if (byName !== 0) {
+      return byName;
     }
 
-    const safeDirection = Number(direction);
-    if (!Number.isFinite(safeDirection) || safeDirection === 0) {
-      return null;
-    }
-
-    const targetEntry = episodeCandidates[currentIndex + (safeDirection > 0 ? 1 : -1)] || null;
-    return targetEntry ? targetEntry.media : null;
+    return String(a.media.filePath || '').localeCompare(String(b.media.filePath || ''));
   };
 
-  const getEpisodeSequenceForMedia = (currentMedia) => {
+  const sequenceEntriesFor = (currentMedia) => {
     const currentInfo = mediaEpisodeIndexInfo(currentMedia);
     if (!currentInfo) {
       return [];
@@ -2586,24 +3712,34 @@ function createCastUiServer({
         if (info.category !== currentInfo.category || info.showName !== currentInfo.showName) {
           return null;
         }
-        return {
-          media: item,
-          seasonNumber: info.seasonNumber,
-          episodeNumber: info.episodeNumber,
-        };
+        return Object.assign({ media: item }, info);
       })
       .filter(Boolean)
-      .sort((a, b) => {
-        if (a.seasonNumber !== b.seasonNumber) {
-          return a.seasonNumber - b.seasonNumber;
-        }
-        if (a.episodeNumber !== b.episodeNumber) {
-          return a.episodeNumber - b.episodeNumber;
-        }
-        return String(a.media.filePath || '').localeCompare(String(b.media.filePath || ''));
-      })
-      .map((entry) => entry.media);
+      .sort(compareSequenceEntries);
   };
+
+  const findAdjacentEpisode = (currentMedia, direction) => {
+    const episodeCandidates = sequenceEntriesFor(currentMedia);
+    if (episodeCandidates.length === 0) {
+      return null;
+    }
+
+    const currentIndex = episodeCandidates.findIndex((entry) => entry.media.id === currentMedia.id);
+    if (currentIndex < 0) {
+      return null;
+    }
+
+    const safeDirection = Number(direction);
+    if (!Number.isFinite(safeDirection) || safeDirection === 0) {
+      return null;
+    }
+
+    const targetEntry = episodeCandidates[currentIndex + (safeDirection > 0 ? 1 : -1)] || null;
+    return targetEntry ? targetEntry.media : null;
+  };
+
+  const getEpisodeSequenceForMedia = (currentMedia) => sequenceEntriesFor(currentMedia)
+    .map((entry) => entry.media);
 
   const buildEpisodePlaylistContext = (media) => {
     if (!isShowCategoryFromMedia(media)) {
@@ -2998,16 +4134,16 @@ function createCastUiServer({
   };
 
   const buildLocalMetadata = (item) => {
-    const category = categoryFromPath(item.filePath);
-    const showName = category === CATEGORY_TV_SHOWS || category === CATEGORY_ANIME_SHOWS
-      ? extractSeriesName(item.filePath, category)
-      : null;
-    const seasonInfo = (category === CATEGORY_TV_SHOWS || category === CATEGORY_ANIME_SHOWS)
-      ? extractSeasonEpisodeInfo(item.filePath)
-      : null;
+    const category = resolveCategory(item.filePath);
+    const categoryIsShows = isShowsCategory(category);
+    const showName = categoryIsShows ? seriesNameFor(item.filePath, category) : null;
+    const seasonInfo = categoryIsShows ? extractSeasonEpisodeInfo(item.filePath) : null;
+    if (seasonInfo && !Number.isFinite(seasonInfo.seasonNumber)) {
+      seasonInfo.seasonLabel = 'Episodes';
+    }
     const fallbackSeriesTitle = extractSeriesTitleFromEpisodeName(item.name);
     const searchTitle = showName || fallbackSeriesTitle || extractMovieTitle(item.name);
-    const isShowCategory = category === CATEGORY_TV_SHOWS || category === CATEGORY_ANIME_SHOWS;
+    const isShowCategory = categoryIsShows;
     const displayTitle = showName
       ? safeBasename(path.basename(item.name, path.extname(item.name)).replace(/[._]+/g, ' ').trim())
       : searchTitle;
@@ -3153,7 +4289,7 @@ function createCastUiServer({
 
   const getCategoryPayload = async (category, sortMode = 'alpha') => {
     const normalizedSort = sortMode === 'recent' ? 'recent' : 'alpha';
-    const items = getMovieItems().filter((item) => categoryFromPath(item.filePath) === category);
+    const items = getMovieItems().filter((item) => resolveCategory(item.filePath) === category);
     const enrichedItems = await enrichItemsWithMetadata(items);
 
     const sortByTitle = (a, b) => {
@@ -3171,7 +4307,7 @@ function createCastUiServer({
       return sortByTitle(a, b);
     };
 
-    if (category === CATEGORY_TV_SHOWS || category === CATEGORY_ANIME_SHOWS) {
+    if (isShowsCategory(category)) {
       const groupsMap = new Map();
 
       for (const item of enrichedItems) {
@@ -3205,7 +4341,11 @@ function createCastUiServer({
                   return epA - epB;
                 }
 
-                return (a.movieTitle || '').localeCompare(b.movieTitle || '');
+                return String(a.name || '').localeCompare(
+                  String(b.name || ''),
+                  undefined,
+                  { numeric: true, sensitivity: 'base' },
+                );
               });
 
               const first = sortedItems[0] || {};
@@ -3257,6 +4397,28 @@ function createCastUiServer({
 
     const sortedItems = [...enrichedItems].sort(normalizedSort === 'recent' ? sortByRecent : sortByTitle);
     return { items: sortedItems, groups: [] };
+  };
+
+  const categorySummaries = () => {
+    const counts = new Map();
+    for (const item of getMovieItems()) {
+      const id = resolveCategory(item.filePath);
+      counts.set(id, (counts.get(id) || 0) + 1);
+    }
+
+    const pinnedFolders = new Map();
+    for (const categoryId of folderCategories.values()) {
+      pinnedFolders.set(categoryId, (pinnedFolders.get(categoryId) || 0) + 1);
+    }
+
+    return getAllCategories().map((item) => ({
+      id: item.id,
+      label: item.label,
+      kind: item.kind,
+      builtIn: Boolean(item.builtIn),
+      itemCount: counts.get(item.id) || 0,
+      folderCount: pinnedFolders.get(item.id) || 0,
+    }));
   };
 
   async function handleRequest(req, res) {
@@ -3343,6 +4505,7 @@ function createCastUiServer({
           ok: true,
           noFolders,
           category,
+          categories: categorySummaries(),
           items: payload.items,
           groups: payload.groups,
           metadataVersion,
@@ -3584,6 +4747,48 @@ function createCastUiServer({
       return;
     }
 
+    if (req.method === 'GET' && parsed.pathname === '/api/categories') {
+      sendJson(res, 200, {
+        ok: true,
+        categories: categorySummaries(),
+      });
+      return;
+    }
+
+    if (req.method === 'POST' && parsed.pathname === '/api/categories') {
+      try {
+        if (!isLocalRequest(req)) {
+          sendJson(res, 403, {
+            ok: false,
+            error: 'Categories can only be created from the machine running MediaCast.',
+          });
+          return;
+        }
+
+        const body = await readRequestBody(req);
+        const payload = JSON.parse(body || '{}');
+        const category = registerCustomCategory(payload.label, payload.kind);
+        persistCategories();
+
+        sendJson(res, 200, {
+          ok: true,
+          category: {
+            id: category.id,
+            label: category.label,
+            kind: category.kind,
+            builtIn: false,
+          },
+          categories: categorySummaries(),
+        });
+      } catch (error) {
+        sendJson(res, 400, {
+          ok: false,
+          error: error.message,
+        });
+      }
+      return;
+    }
+
     if (req.method === 'POST' && parsed.pathname === '/api/media-folders/add') {
       try {
         if (!isLocalRequest(req)) {
@@ -3610,20 +4815,38 @@ function createCastUiServer({
           return;
         }
 
+        const requestedCategory = String(payload.category || CATEGORY_AUTO).trim();
+        if (requestedCategory && requestedCategory !== CATEGORY_AUTO && !findCategory(requestedCategory)) {
+          sendJson(res, 400, {
+            ok: false,
+            error: 'Unknown category: ' + requestedCategory,
+          });
+          return;
+        }
+
         const added = mediaServer.addRootDir(folderPath);
+        setFolderCategory(folderPath, requestedCategory);
+        persistCategories();
+
         await mediaServer.buildLibrary();
         metadataMap.clear();
+        metadataVersion += 1;
 
         if (typeof onMediaFoldersChanged === 'function') {
           onMediaFoldersChanged(mediaServer.getRootDirs());
         }
 
+        const assignedCategory = requestedCategory === CATEGORY_AUTO ? null : requestedCategory;
+
         sendJson(res, 200, {
           ok: true,
           added,
           folderPath,
+          category: assignedCategory,
+          categoryLabel: assignedCategory ? (findCategory(assignedCategory) || {}).label : null,
           folderCount: mediaServer.getRootDirs().length,
           movieCount: getMovieItems().length,
+          categories: categorySummaries(),
         });
       } catch (error) {
         sendJson(res, 500, {
