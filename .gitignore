@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+
+# Packaged builds
+dist/
+
+# Local scratch / test data
+tmp-appdata-test/
+
+# Environment and secrets
+.env
+.env.local
+*.pfx
+signing/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS noise
+.DS_Store
+Thumbs.db

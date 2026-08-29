@@ -111,19 +111,20 @@ function needsTranscoding(probe) {
 }
 
 async function shouldTranscode(filePath, options = {}) {
-  // Disable transcode on Windows due to pipe handling issues
-  // Media server will gracefully fall back to direct play
-  // TODO: Implement file-based transcode or use a different streaming approach
-  if (process.platform === 'win32') {
-    console.log(`[TRANSCODE_SKIP] Windows detected - using direct play for ${path.basename(filePath)}`);
-    return false;
-  }
-
+  // Explicit flags win over the platform default below.
   if (options.forceTranscode) {
     return true;
   }
 
   if (options.skipTranscode) {
+    return false;
+  }
+
+  // Auto-detection stays off on Windows: FFmpeg pipe streaming is unreliable there,
+  // so unflagged files default to direct play.
+  // TODO: Implement file-based transcode or use a different streaming approach
+  if (process.platform === 'win32') {
+    console.log(`[TRANSCODE_SKIP] Windows detected - using direct play for ${path.basename(filePath)}`);
     return false;
   }
 

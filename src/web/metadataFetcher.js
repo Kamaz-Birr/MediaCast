@@ -4,6 +4,39 @@ import path from 'path';
 // In-memory cache for metadata lookups to avoid repeated API calls
 const metadataCache = new Map();
 
+// Keys come from the environment or from configureMetadataApiKeys(); they are never
+// baked into the source. Without them, lookups are skipped and posters fall back to
+// the local placeholder.
+let tmdbApiKey = String(process.env.TMDB_API_KEY || '').trim();
+let omdbApiKey = String(process.env.OMDB_API_KEY || '').trim();
+let missingKeyWarningShown = false;
+
+export function configureMetadataApiKeys(keys = {}) {
+  if (keys && typeof keys === 'object') {
+    if (keys.tmdbApiKey !== undefined) {
+      tmdbApiKey = String(keys.tmdbApiKey || '').trim();
+    }
+    if (keys.omdbApiKey !== undefined) {
+      omdbApiKey = String(keys.omdbApiKey || '').trim();
+    }
+  }
+
+  return {
+    tmdb: Boolean(tmdbApiKey),
+    omdb: Boolean(omdbApiKey),
+  };
+}
+
+function warnIfNoApiKeys() {
+  if (missingKeyWarningShown || tmdbApiKey || omdbApiKey) {
+    return;
+  }
+
+  missingKeyWarningShown = true;
+  console.warn('[Metadata] No TMDB/OMDB API key configured — posters, plots and ratings will be placeholders.');
+  console.warn('[Metadata] Set TMDB_API_KEY / OMDB_API_KEY, or add "tmdbApiKey" / "omdbApiKey" to cast-ui.json.');
+}
+
 export function extractMovieTitle(filename) {
   const baseName = path.basename(filename, path.extname(filename));
   // Remove common patterns like year (2020), quality (1080p, BluRay, etc.)
@@ -23,7 +56,7 @@ export function extractMovieTitle(filename) {
 }
 
 function fetchFromTmdb(title, isSeries = false) {
-  const apiKey = process.env.TMDB_API_KEY || 'REDACTED_TMDB_KEY';
+  const apiKey = tmdbApiKey;
   if (!apiKey) {
     return Promise.resolve(null);
   }
@@ -51,7 +84,9 @@ function fetchFromTmdb(title, isSeries = false) {
                   : (result.release_date ? result.release_date.split('-')[0] : null),
                 posterUrl: `https://image.tmdb.org/t/p/w400${result.poster_path}`,
                 plot: result.overview || null,
-                imdbRating: null,
+                rating: Number.isFinite(Number(result.vote_average)) && Number(result.vote_average) > 0
+                  ? String(Math.round(Number(result.vote_average) * 10) / 10)
+                  : null,
                 tmdbId: result.id,
               });
             } else {
@@ -69,7 +104,7 @@ function fetchFromTmdb(title, isSeries = false) {
 }
 
 function fetchFromOmdb(title, isSeries = false) {
-  const apiKey = process.env.OMDB_API_KEY || 'REDACTED_OMDB_KEY';
+  const apiKey = omdbApiKey;
   if (!apiKey) {
     return Promise.resolve(null);
   }
@@ -112,7 +147,7 @@ function fetchFromOmdb(title, isSeries = false) {
 }
 
 function fetchEpisodeFromTmdb(seriesTitle, seasonNumber, episodeNumber) {
-  const apiKey = process.env.TMDB_API_KEY || 'REDACTED_TMDB_KEY';
+  const apiKey = tmdbApiKey;
   if (!apiKey || !Number.isFinite(seasonNumber) || !Number.isFinite(episodeNumber)) {
     return Promise.resolve(null);
   }
@@ -177,7 +212,7 @@ function fetchEpisodeFromTmdb(seriesTitle, seasonNumber, episodeNumber) {
 }
 
 function fetchEpisodeFromOmdb(seriesTitle, seasonNumber, episodeNumber) {
-  const apiKey = process.env.OMDB_API_KEY || 'REDACTED_OMDB_KEY';
+  const apiKey = omdbApiKey;
   if (!apiKey || !Number.isFinite(seasonNumber) || !Number.isFinite(episodeNumber)) {
     return Promise.resolve(null);
   }
@@ -223,6 +258,7 @@ function getPlaceholderPosterUrl() {
 }
 
 async function fetchTitleMetadata(title, isSeries = false) {
+  warnIfNoApiKeys();
   const cacheKey = `${isSeries ? 'series' : 'movie'}:${title.toLowerCase()}`;
 
   if (metadataCache.has(cacheKey)) {
@@ -240,7 +276,12 @@ async function fetchTitleMetadata(title, isSeries = false) {
       year: (tmdbMetadata && tmdbMetadata.year) || (omdbMetadata && omdbMetadata.year) || null,
       posterUrl: (tmdbMetadata && tmdbMetadata.posterUrl) || (omdbMetadata && omdbMetadata.posterUrl) || getPlaceholderPosterUrl(),
       plot: (omdbMetadata && omdbMetadata.plot) || (tmdbMetadata && tmdbMetadata.plot) || null,
-      imdbRating: (omdbMetadata && omdbMetadata.imdbRating) || null,
+      // OMDB gives a true IMDb score; TMDB's vote_average stands in when OMDB is unavailable.
+      // ratingSource keeps the UI from labelling a TMDB score as IMDb.
+      imdbRating: (omdbMetadata && omdbMetadata.imdbRating) || (tmdbMetadata && tmdbMetadata.rating) || null,
+      ratingSource: (omdbMetadata && omdbMetadata.imdbRating)
+        ? 'IMDb'
+        : ((tmdbMetadata && tmdbMetadata.rating) ? 'TMDB' : null),
       tmdbId: tmdbMetadata ? tmdbMetadata.tmdbId : null,
       imdbId: omdbMetadata ? omdbMetadata.imdbId : null,
     };
@@ -253,6 +294,7 @@ async function fetchTitleMetadata(title, isSeries = false) {
       posterUrl: getPlaceholderPosterUrl(),
       plot: null,
       imdbRating: null,
+      ratingSource: null,
       year: null,
       tmdbId: null,
       imdbId: null,
@@ -287,7 +329,10 @@ export async function fetchEpisodeMetadata(seriesTitle, seasonNumber, episodeNum
     year: (omdbEpisode && omdbEpisode.year) || (tmdbEpisode && tmdbEpisode.year) || null,
     posterUrl: (omdbEpisode && omdbEpisode.posterUrl) || (tmdbEpisode && tmdbEpisode.posterUrl) || null,
     plot: (omdbEpisode && omdbEpisode.plot) || (tmdbEpisode && tmdbEpisode.plot) || null,
-    imdbRating: (omdbEpisode && omdbEpisode.imdbRating) || null,
+    imdbRating: (omdbEpisode && omdbEpisode.imdbRating) || (tmdbEpisode && tmdbEpisode.imdbRating) || null,
+    ratingSource: (omdbEpisode && omdbEpisode.imdbRating)
+      ? 'IMDb'
+      : ((tmdbEpisode && tmdbEpisode.imdbRating) ? 'TMDB' : null),
   };
 
   metadataCache.set(cacheKey, metadata);

@@ -32,6 +32,57 @@ A minimal UPnP/DLNA casting stack in JavaScript with **real-time FFmpeg transcod
 npm install
 ```
 
+## Poster metadata API keys
+
+Posters, plots and ratings come from TMDB and OMDB. No keys ship with the app — supply
+your own, or the library falls back to placeholder posters.
+
+Either set environment variables:
+
+```bash
+set TMDB_API_KEY=your_tmdb_key
+set OMDB_API_KEY=your_omdb_key
+```
+
+…or add them to the config file the app already writes
+(`%APPDATA%MediaCastcast-ui.json` on Windows, `~/.config/MediaCast/cast-ui.json` elsewhere):
+
+```json
+{
+  "tmdbApiKey": "your_tmdb_key",
+  "omdbApiKey": "your_omdb_key"
+}
+```
+
+Environment variables take precedence over the config file.
+
+## Package as an executable
+
+Build native executables with `pkg`:
+
+```bash
+npm run package:windows
+npm run package:mac:x64
+npm run package:mac:arm64
+```
+
+The Windows build produces `dist/MediaCast-Windows-x64.exe`. The macOS builds produce platform-specific binaries under `dist/`.
+Tagged pushes now publish the packaged binaries to GitHub Releases automatically.
+Optional signing is supported in CI when these secrets are set: `WINDOWS_SIGNING_CERT_B64`, `WINDOWS_SIGNING_CERT_PASSWORD`, `MACOS_SIGNING_CERT_B64`, `MACOS_SIGNING_CERT_PASSWORD`, and `MACOS_SIGNING_IDENTITY`.
+
+Launching the packaged executable with no arguments now opens the `cast-ui` workflow by default instead of exiting immediately.
+If no renderer is available at startup, the UI still opens and lets you refresh discovery from the browser.
+
+The web app binds to this machine only by default. Pass `--ui-lan` to reach it from a phone or
+tablet on the same network; adding media folders stays restricted to the machine running MediaCast
+regardless of that flag.
+
+Notes:
+- The packaged app still expects `ffmpeg` and `ffprobe` on PATH for probing and transcoding on macOS/Linux.
+- Windows binaries default to direct play because FFmpeg pipe-based auto-transcoding is unreliable on Windows. Passing `--force-transcode` overrides that default.
+- Build the macOS binaries on macOS runners or machines; Windows builds should be produced on Windows.
+- Apple notarization is not automated yet for the raw CLI binary format; once you switch macOS distribution to a signed `.zip`, `.dmg`, or `.pkg`, the same workflow can be extended with `xcrun notarytool`.
+
 ## Commands
 
 ### Discover renderers

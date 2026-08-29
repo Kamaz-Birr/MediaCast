@@ -1,5 +1,6 @@
 import { spawn } from 'child_process';
 import { EventEmitter } from 'events';
+import { Readable } from 'stream';
 
 export class FFmpegTranscoder extends EventEmitter {
   constructor(filePath, options = {}) {
@@ -158,7 +159,6 @@ export class FFmpegTranscoder extends EventEmitter {
   }
 
   getErrorStream() {
-    const { Readable } = require('stream');
     const stream = new Readable({
       read() {
         // Stream is empty; will be closed immediately

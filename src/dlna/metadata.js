@@ -9,14 +9,24 @@ function escapeXml(value) {
     .replace(/'/g, '&apos;');
 }
 
-export function buildDidlLite({ title, filePath, mediaUrl, subtitleUrl }) {
+export function buildDidlLite({
+  title,
+  filePath,
+  mediaUrl,
+  subtitleUrl,
+  upnpClassOverride,
+  protocolInfoOverride,
+}) {
   if (!mediaUrl || typeof mediaUrl !== 'string') {
     throw new Error('mediaUrl is required and must be a string');
   }
 
-  const protocolInfo = getDlnaProtocolInfo(filePath);
+  const protocolInfo = protocolInfoOverride || getDlnaProtocolInfo(filePath);
   const kind = mediaKind(filePath);
-  const upnpClass = kind === 'audio' ? 'object.item.audioItem.musicTrack' : 'object.item.videoItem.movie';
+  const upnpClass = upnpClassOverride || (kind === 'audio'
+    ? 'object.item.audioItem.musicTrack'
+    : 'object.item.videoItem.movie');
+  const isContainer = String(upnpClass).toLowerCase().startsWith('object.container');
 
   const safeName = escapeXml(title || 'Unknown Media');
   const safeMimeType = escapeXml(protocolInfo);
@@ -39,12 +49,12 @@ export function buildDidlLite({ title, filePath, mediaUrl, subtitleUrl }) {
            xmlns:dc="http://purl.org/dc/elements/1.1/"
            xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"
            xmlns:sec="http://www.sec.co.kr/">
-  <item id="0" parentID="0" restricted="1">
+  <${isContainer ? 'container' : 'item'} id="0" parentID="0" restricted="1">
     <dc:title>${safeName}</dc:title>
     <upnp:class>${upnpClass}</upnp:class>
-    <res protocolInfo="${safeMimeType}">${safeUrl}</res>
+${isContainer ? '' : `    <res protocolInfo="${safeMimeType}">${safeUrl}</res>`}
 ${subtitleNode}
-  </item>
+  </${isContainer ? 'container' : 'item'}>
 </DIDL-Lite>`;
 }
 

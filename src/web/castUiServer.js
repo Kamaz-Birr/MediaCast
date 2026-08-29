@@ -4,11 +4,13 @@ import path from 'path';
 import { buildDidlLite } from '../dlna/metadata.js';
 import {
   setAvTransportUri,
+  setNextAvTransportUri,
   play,
   stop,
   seek,
   getTransportInfo,
   getPositionInfo,
+  getMediaInfo,
 } from '../upnp/soap.js';
 import { discoverRenderers } from '../upnp/discovery.js';
 import {
@@ -48,8 +50,8 @@ const CATEGORY_MOVIES = 'movies';
 const CATEGORY_TV_SHOWS = 'tv-shows';
 const CATEGORY_ANIME_MOVIES = 'anime-movies';
 const CATEGORY_ANIME_SHOWS = 'anime-shows';
-const AUTO_NEXT_CREDITS_PROGRESS = 0.92;
-const AUTO_NEXT_CREDITS_REMAINING_SEC = 90;
+const AUTO_NEXT_MIN_CREDITS_WATCH_SEC = 5;
+const WATCHED_COMPLETION_PROGRESS = 0.99;
 
 function splitPathParts(filePath) {
   return path.resolve(filePath).split(/[\\/]+/).filter(Boolean);
@@ -201,6 +203,7 @@ async function fetchSeriesMetadataWithFallback(candidates) {
       posterUrl: null,
       plot: null,
       imdbRating: null,
+      ratingSource: null,
       year: null,
       tmdbId: null,
       imdbId: null,
@@ -831,6 +834,7 @@ function buildPageHtml(rendererName) {
       'anime-movies': 'Anime Movies',
       'anime-shows': 'Anime Shows',
     };
+    const WATCHED_PROGRESS_THRESHOLD = ${WATCHED_COMPLETION_PROGRESS};
 
     let currentCategory = 'movies';
     let currentSort = 'alpha';
@@ -854,6 +858,7 @@ function buildPageHtml(rendererName) {
       timerInterval: null,
       playButtonRef: null,
       lastUpdate: 0,
+      lastStoppedSec: 0,
     };
     const categoryTabs = document.getElementById('categoryTabs');
     const targetRendererName = document.getElementById('targetRendererName');
@@ -1032,6 +1037,43 @@ function buildPageHtml(rendererName) {
       return String(minutes).padStart(2, '0') + ':' + String(secs).padStart(2, '0');
     }
 
+    function clearActivePlaybackTimer() {
+      if (activePlayback && activePlayback.timerInterval) {
+        clearInterval(activePlayback.timerInterval);
+        activePlayback.timerInterval = null;
+      }
+    }
+
+    function startActivePlaybackTimer() {
+      clearActivePlaybackTimer();
+      activePlayback.timerInterval = setInterval(() => {
+        if (!activePlayback || !activePlayback.mediaId) {
+          return;
+        }
+
+        activePlayback.positionSec = Math.max(0, Math.floor(Number(activePlayback.positionSec) || 0) + 1);
+        activePlayback.lastUpdate = Date.now();
+
+        if (activePlayback.playButtonRef) {
+          activePlayback.playButtonRef.textContent = 'Playback ' + formatResumeClock(activePlayback.positionSec);
+        }
+      }, 1000);
+    }
+
+    function resetActivePlaybackState(options = {}) {
+      const keepLastStopped = Boolean(options.keepLastStopped);
+      const lastStopped = keepLastStopped ? (Number(activePlayback.lastStoppedSec) || 0) : 0;
+      clearActivePlaybackTimer();
+      activePlayback.mediaId = null;
+      activePlayback.resumeKey = null;
+      activePlayback.rendererName = null;
+      activePlayback.positionSec = 0;
+      activePlayback.durationSec = null;
+      activePlayback.lastUpdate = 0;
+      activePlayback.playButtonRef = null;
+      activePlayback.lastStoppedSec = lastStopped;
+    }
+
     function findActiveSessionByMediaId(mediaId) {
       const id = String(mediaId || '').trim();
       if (!id) {
@@ -1059,7 +1101,7 @@ function buildPageHtml(rendererName) {
         ? explicitProgress
         : (durationSec > 0 ? (positionSec / durationSec) : null);
 
-      if (!positionSec || (Number.isFinite(progress) && progress >= 0.95)) {
+      if (!positionSec || (Number.isFinite(progress) && progress >= WATCHED_PROGRESS_THRESHOLD)) {
         return null;
       }
 
@@ -1073,12 +1115,16 @@ function buildPageHtml(rendererName) {
 
     function setResumeCardState(card, isResumable) {
       const existingTag = card.querySelector('.resume-tag');
+      const watchedKey = card && card.__watchedKey;
+      const isWatched = watchedKey ? watchedItemIds.has(watchedKey) : false;
       // Find the item id for this card
       const cardId = card && card.__mediaId;
       const activeSession = findActiveSessionByMediaId(cardId);
-      const isCasting = Boolean(activeSession && activeSession.rendererName);
+      const isCasting = !isWatched && Boolean(activeSession && activeSession.rendererName);
       const isStoppedResume = activePlayback && activePlayback.lastStoppedSec && !isCasting && activePlayback.playButtonRef && activePlayback.playButtonRef.closest('.movie-card') === card;
-      if (isResumable && !existingTag) {
+      const showResumeTag = !isWatched && Boolean(isResumable);
+
+      if (showResumeTag && !existingTag) {
         const tag = document.createElement('div');
         tag.className = 'resume-tag';
 
@@ -1098,7 +1144,7 @@ function buildPageHtml(rendererName) {
         tag.appendChild(dot);
         tag.appendChild(label);
         card.appendChild(tag);
-      } else if (isResumable && existingTag) {
+      } else if (showResumeTag && existingTag) {
         // Update label if needed
         const label = existingTag.querySelector('.label');
         if (label) {
@@ -1112,7 +1158,7 @@ function buildPageHtml(rendererName) {
         }
       }
 
-      if (!isResumable && existingTag) {
+      if (!showResumeTag && existingTag) {
         existingTag.remove();
       }
     }
@@ -1174,14 +1220,7 @@ function buildPageHtml(rendererName) {
         activePlayback.durationSec = resumeInfo && resumeInfo.durationSec ? resumeInfo.durationSec : null;
         activePlayback.lastUpdate = Date.now();
         activePlayback.playButtonRef = button;
-        if (activePlayback.timerInterval) clearInterval(activePlayback.timerInterval);
-        activePlayback.timerInterval = setInterval(() => {
-          activePlayback.positionSec++;
-          // Update play button text in real time if still casting
-          if (activePlayback.playButtonRef && activePlayback.mediaId === item.id) {
-            activePlayback.playButtonRef.textContent = 'Playback ' + formatResumeClock(activePlayback.positionSec);
-          }
-        }, 1000);
+        startActivePlaybackTimer();
         if (resumedFromSec > 0) {
           setStatus('Resumed on ' + currentRendererName + ': ' + (item.movieTitle || item.name) + ' at ' + formatResumeClock(resumedFromSec) + '.');
         } else {
@@ -1223,6 +1262,7 @@ function buildPageHtml(rendererName) {
         const card = document.createElement('article');
         card.className = 'movie-card';
         card.__mediaId = item.id;
+        card.__watchedKey = item.watchedKey || item.filePath || item.id;
 
         if (item.posterUrl) {
           const img = document.createElement('img');
@@ -1254,7 +1294,7 @@ function buildPageHtml(rendererName) {
         meta.className = 'movie-meta';
         const parts = [];
         if (item.year) parts.push(item.year);
-        if (item.imdbRating) parts.push('IMDb ' + item.imdbRating + '/10');
+        if (item.imdbRating) parts.push((item.ratingSource || 'IMDb') + ' ' + item.imdbRating + '/10');
         parts.push(formatSize(item.size));
         meta.textContent = parts.join(' • ');
 
@@ -1264,6 +1304,7 @@ function buildPageHtml(rendererName) {
 
         const playButton = document.createElement('button');
         playButton.className = 'neu-btn';
+        playButton.dataset.role = 'play';
         const initialResumeInfo = getResumeInfo(item);
         function updatePlayButtonText() {
             const activeSession = findActiveSessionByMediaId(item.id);
@@ -1299,6 +1340,7 @@ function buildPageHtml(rendererName) {
         // Watched button
         const watchedButton = document.createElement('button');
         watchedButton.className = 'neu-btn secondary';
+        watchedButton.dataset.role = 'watched';
         watchedButton.textContent = 'Watched';
         watchedButton.addEventListener('click', async (event) => {
           event.stopPropagation();
@@ -1343,17 +1385,7 @@ function buildPageHtml(rendererName) {
                 || activePlayback.playButtonRef === playButton;
 
               if (isSameItem) {
-                if (activePlayback.timerInterval) {
-                  clearInterval(activePlayback.timerInterval);
-                }
-                activePlayback.mediaId = null;
-                activePlayback.resumeKey = null;
-                activePlayback.rendererName = null;
-                activePlayback.positionSec = 0;
-                activePlayback.durationSec = null;
-                activePlayback.lastUpdate = 0;
-                activePlayback.playButtonRef = null;
-                activePlayback.lastStoppedSec = 0;
+                resetActivePlaybackState({ keepLastStopped: false });
               }
             }
 
@@ -1395,17 +1427,6 @@ function buildPageHtml(rendererName) {
         setWatchedCardState(card, watchedButton, watchedItemIds.has(watchedKey));
         // Update resume badge to match play button state
         setResumeCardState(card, Boolean(initialResumeInfo) || Boolean(findActiveSessionByMediaId(item.id)));
-    // Listen for stop cast to clear active playback
-    stopBtn.addEventListener('click', () => {
-      if (activePlayback.timerInterval) clearInterval(activePlayback.timerInterval);
-      activePlayback.mediaId = null;
-      activePlayback.resumeKey = null;
-      activePlayback.rendererName = null;
-      activePlayback.positionSec = 0;
-      activePlayback.durationSec = null;
-      activePlayback.lastUpdate = 0;
-    });
-
         card.addEventListener('click', () => castItem(item, playButton));
         card.appendChild(overlay);
         return card;
@@ -1477,7 +1498,10 @@ function buildPageHtml(rendererName) {
       const metaParts = [];
       if (group.year || (representative && representative.year)) metaParts.push(group.year || representative.year);
       if (group.imdbRating || (representative && representative.imdbRating)) {
-        metaParts.push('IMDb ' + (group.imdbRating || representative.imdbRating) + '/10');
+        const ratingLabel = group.ratingSource
+          || (representative && representative.ratingSource)
+          || 'IMDb';
+        metaParts.push(ratingLabel + ' ' + (group.imdbRating || representative.imdbRating) + '/10');
       }
       metaParts.push(getGroupEpisodeCount(group) + ' episodes');
       meta.textContent = metaParts.join(' • ');
@@ -1806,14 +1830,122 @@ function buildPageHtml(rendererName) {
         }
 
         activeSessions = Array.isArray(result.sessions) ? result.sessions : [];
+
+        const watchedKeys = Array.isArray(result.watchedKeys) ? result.watchedKeys : [];
+        watchedItemIds.clear();
+        watchedKeys.forEach((key) => {
+          const safeKey = String(key || '').trim();
+          if (safeKey) {
+            watchedItemIds.add(safeKey);
+          }
+        });
+
+        const resumePositions = result.resumePositions && typeof result.resumePositions === 'object'
+          ? result.resumePositions
+          : {};
+        resumeByKey.clear();
+        for (const [resumeKey, entry] of Object.entries(resumePositions)) {
+          const key = String(resumeKey || '').trim();
+          const positionSec = Number(entry && entry.positionSec);
+          if (!key || !Number.isFinite(positionSec) || positionSec <= 0) {
+            continue;
+          }
+
+          const durationSec = Number(entry && entry.durationSec);
+          const progress = Number(entry && entry.progress);
+          resumeByKey.set(key, {
+            positionSec,
+            durationSec: Number.isFinite(durationSec) && durationSec > 0 ? durationSec : null,
+            progress: Number.isFinite(progress) ? progress : null,
+            updatedAt: entry && entry.updatedAt ? entry.updatedAt : null,
+          });
+        }
+
+        const selectedMediaId = String(result && result.mediaId || '').trim();
+        const selectedSession = selectedMediaId
+          ? (activeSessions.find((session) => String(session && session.mediaId || '') === selectedMediaId) || null)
+          : null;
+        if (selectedSession && selectedSession.mediaId) {
+          const nextMediaId = String(selectedSession.mediaId);
+          const nextPosition = Math.max(0, Math.floor(Number(selectedSession.positionSec) || 0));
+          const nextDuration = Number.isFinite(Number(selectedSession.durationSec))
+            ? Math.floor(Number(selectedSession.durationSec))
+            : null;
+
+          if (activePlayback.mediaId !== nextMediaId) {
+            clearActivePlaybackTimer();
+            activePlayback.mediaId = nextMediaId;
+            activePlayback.resumeKey = selectedSession.resumeKey || null;
+            activePlayback.rendererName = selectedSession.rendererName || result.rendererName || currentRendererName;
+            activePlayback.positionSec = nextPosition;
+            activePlayback.durationSec = nextDuration;
+            activePlayback.lastUpdate = Date.now();
+            activePlayback.playButtonRef = null;
+            startActivePlaybackTimer();
+          } else if (Math.abs((Number(activePlayback.positionSec) || 0) - nextPosition) > 2) {
+            activePlayback.positionSec = nextPosition;
+            activePlayback.durationSec = nextDuration;
+            activePlayback.lastUpdate = Date.now();
+          }
+        } else if (activePlayback.mediaId) {
+          resetActivePlaybackState({ keepLastStopped: true });
+        }
+
         const cards = document.querySelectorAll('.movie-card');
         cards.forEach((card) => {
           const cardId = card && card.__mediaId;
+          const watchedKey = card && card.__watchedKey;
+          const playButton = card ? card.querySelector('button[data-role="play"]') : null;
+          const watchedButton = card ? card.querySelector('button[data-role="watched"]') : null;
+          const isWatched = watchedKey ? watchedItemIds.has(watchedKey) : false;
+          const activeSession = findActiveSessionByMediaId(cardId);
           const hasResumeTag = Boolean(card.querySelector('.resume-tag'));
-          const resumeInfo = cardId
-            ? resumeByKey.get(cardId)
-            : null;
-          setResumeCardState(card, hasResumeTag || Boolean(resumeInfo) || Boolean(findActiveSessionByMediaId(cardId)));
+          const resumeEntry = watchedKey ? resumeByKey.get(watchedKey) : null;
+          let resumeInfo = null;
+          if (!isWatched && resumeEntry) {
+            const positionSec = Math.max(0, Math.floor(Number(resumeEntry.positionSec) || 0));
+            const durationSec = Math.floor(Number(resumeEntry.durationSec) || 0);
+            const explicitProgress = Number(resumeEntry.progress);
+            const progress = Number.isFinite(explicitProgress)
+              ? explicitProgress
+              : (durationSec > 0 ? (positionSec / durationSec) : null);
+            if (positionSec > 0 && (!Number.isFinite(progress) || progress < WATCHED_PROGRESS_THRESHOLD)) {
+              resumeInfo = {
+                positionSec,
+                durationSec: durationSec > 0 ? durationSec : null,
+              };
+            }
+          }
+
+          if (watchedButton) {
+            setWatchedCardState(card, watchedButton, isWatched);
+          }
+
+          if (playButton) {
+            if (isWatched) {
+              playButton.textContent = 'Play';
+              playButton.classList.remove('resume');
+              if (activePlayback && String(activePlayback.mediaId || '') === String(cardId || '')) {
+                resetActivePlaybackState({ keepLastStopped: false });
+              }
+            } else if (activeSession && activeSession.rendererName) {
+              if (activePlayback && String(activePlayback.mediaId || '') === String(cardId || '')) {
+                playButton.textContent = 'Playback ' + formatResumeClock(activePlayback.positionSec);
+                activePlayback.playButtonRef = playButton;
+              } else {
+                playButton.textContent = 'Playback';
+              }
+              playButton.classList.add('resume');
+            } else if (resumeInfo) {
+              playButton.textContent = 'Resume ' + formatResumeClock(resumeInfo.positionSec);
+              playButton.classList.add('resume');
+            } else {
+              playButton.textContent = 'Play';
+              playButton.classList.remove('resume');
+            }
+          }
+
+          setResumeCardState(card, hasResumeTag || Boolean(resumeInfo) || Boolean(activeSession));
         });
 
         const event = result.autoAdvance;
@@ -1970,14 +2102,7 @@ function buildPageHtml(rendererName) {
           }
         }
         // Clear active playback state except lastStoppedSec
-        if (activePlayback.timerInterval) clearInterval(activePlayback.timerInterval);
-        activePlayback.mediaId = null;
-        activePlayback.resumeKey = null;
-        activePlayback.rendererName = null;
-        activePlayback.positionSec = 0;
-        activePlayback.durationSec = null;
-        activePlayback.lastUpdate = 0;
-        activePlayback.playButtonRef = null;
+        resetActivePlaybackState({ keepLastStopped: true });
         // Do not clear lastStoppedSec so resume can use it
       } catch (error) {
         setStatus('Stop failed: ' + error.message, true);
@@ -2041,16 +2166,61 @@ function formatSecondsAsDlnaClock(value) {
   return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
 }
 
+function parseMediaIdFromPlaylistPath(pathname) {
+  const raw = String(pathname || '');
+  const match = raw.match(/^\/playlist\/series\/([^/]+)\.m3u$/i);
+  if (!match || !match[1]) {
+    return null;
+  }
+
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    return null;
+  }
+}
+
+function playlistIdFromMedia(media) {
+  if (!media || !media.id) {
+    return '';
+  }
+  return `series-${String(media.id).trim()}`;
+}
+
+function mediaIdFromTrackUri(trackUri) {
+  const raw = String(trackUri || '').trim();
+  if (!raw) {
+    return null;
+  }
+
+  try {
+    const parsed = new URL(raw);
+    const match = parsed.pathname.match(/^\/media\/([^/]+)/i);
+    return match && match[1] ? decodeURIComponent(match[1]) : null;
+  } catch {
+    return null;
+  }
+}
+
 async function castMediaItem(renderer, mediaServer, media, options = {}) {
   const startSeconds = Math.max(0, Math.floor(Number(options.startSeconds) || 0));
-  const mediaUrl = mediaServer.getMediaUrl(media.id);
+  const playlistContext = options.playlistContext && typeof options.playlistContext === 'object'
+    ? options.playlistContext
+    : null;
+  let effectivePlaylistContext = playlistContext;
+  const directMediaUrl = mediaServer.getMediaUrl(media.id);
+  let mediaUrl = effectivePlaylistContext && effectivePlaylistContext.playlistUrl
+    ? String(effectivePlaylistContext.playlistUrl)
+    : directMediaUrl;
   const subtitleUrl = await mediaServer.getSubtitleUrl(media.id, { allowDownload: true });
   console.log(`[CastUI] Subtitle for ${media.name}: ${subtitleUrl || 'none'}`);
-  const metadata = buildDidlLite({
+  let metadata = buildDidlLite({
     title: media.name,
-    filePath: media.filePath,
+    filePath: effectivePlaylistContext ? `${media.filePath}.m3u` : media.filePath,
     mediaUrl,
-    subtitleUrl,
+    subtitleUrl: effectivePlaylistContext ? null : subtitleUrl,
+    upnpClassOverride: effectivePlaylistContext ? 'object.container.playlistContainer' : undefined,
+    protocolInfoOverride: effectivePlaylistContext ? 'http-get:*:audio/mpegurl:*' : undefined,
   });
 
   try {
@@ -2067,6 +2237,27 @@ async function castMediaItem(renderer, mediaServer, media, options = {}) {
     await setAvTransportUri(renderer, mediaUrl, metadata);
   } catch (err) {
     const message = String(err && err.message ? err.message : '');
+    if (effectivePlaylistContext && message.includes('errorCode>716</errorCode>')) {
+      console.warn('[CastUI] Renderer could not resolve episode playlist URL; falling back to direct media URL.');
+      effectivePlaylistContext = null;
+      mediaUrl = directMediaUrl;
+      metadata = buildDidlLite({
+        title: media.name,
+        filePath: media.filePath,
+        mediaUrl,
+        subtitleUrl,
+      });
+      try {
+        await setAvTransportUri(renderer, mediaUrl, metadata);
+      } catch (retryErr) {
+        const retryMsg = String(retryErr && retryErr.message ? retryErr.message : '');
+        if (retryMsg.includes('errorCode>714</errorCode>') || retryMsg.includes('Illegal MIME-type')) {
+          await setAvTransportUri(renderer, mediaUrl, '');
+        } else {
+          throw retryErr;
+        }
+      }
+    } else
     if (message.includes('errorCode>714</errorCode>') || message.includes('Illegal MIME-type')) {
       await setAvTransportUri(renderer, mediaUrl, '');
     } else {
@@ -2074,7 +2265,25 @@ async function castMediaItem(renderer, mediaServer, media, options = {}) {
     }
   }
 
-  if (startSeconds > 0) {
+  if (effectivePlaylistContext && Number.isFinite(Number(effectivePlaylistContext.selectedTrackNumber))) {
+    await play(renderer);
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    try {
+      await seek(renderer, String(Math.max(1, Math.floor(Number(effectivePlaylistContext.selectedTrackNumber)))), 'TRACK_NR');
+    } catch (err) {
+      console.warn(`[CastUI] Playlist track seek failed: ${err.message}`);
+    }
+
+    if (startSeconds > 0) {
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      try {
+        await seek(renderer, formatSecondsAsDlnaClock(startSeconds));
+      } catch (err) {
+        console.warn(`[CastUI] Resume seek after playlist track select failed: ${err.message}`);
+      }
+    }
+    await play(renderer);
+  } else if (startSeconds > 0) {
     await play(renderer);
     await new Promise((resolve) => setTimeout(resolve, 600));
     try {
@@ -2108,6 +2317,7 @@ async function castMediaItem(renderer, mediaServer, media, options = {}) {
     mediaUrl,
     transportState: state || 'unknown',
     resumedFromSec: startSeconds > 0 ? startSeconds : 0,
+    playlistModeUsed: Boolean(effectivePlaylistContext),
   };
 }
 
@@ -2122,8 +2332,15 @@ function createCastUiServer({
   onWatchedKeysChanged,
   initialResumePositions = {},
   onResumePositionsChanged,
+  allowLanAccess = false,
 }) {
   let server = null;
+  const requestedUiHost = uiHost;
+  const normalizedUiHost = String(uiHost || '').toLowerCase();
+  const isLoopbackUiHost = normalizedUiHost === '127.0.0.1' || normalizedUiHost === 'localhost';
+  // Binding a loopback host to 0.0.0.0 would silently publish the UI to the whole LAN.
+  const serverListenHost = (isLoopbackUiHost && allowLanAccess) ? '0.0.0.0' : uiHost;
+  let boundUiPort = Number(uiPort);
   let selectedRenderer = renderer || null;
   let availableRenderers = selectedRenderer ? [selectedRenderer] : [];
   let progressPollTimer = null;
@@ -2222,7 +2439,7 @@ function createCastUiServer({
       : null;
     const progress = safeDuration ? (safePosition / safeDuration) : null;
 
-    if (!safePosition || (Number.isFinite(progress) && progress >= 0.95)) {
+    if (!safePosition || (Number.isFinite(progress) && progress >= WATCHED_COMPLETION_PROGRESS)) {
       if (resumePositions.delete(resumeKey)) {
         persistResumePositions();
       }
@@ -2246,6 +2463,32 @@ function createCastUiServer({
     if (resumePositions.delete(resumeKey)) {
       persistResumePositions();
     }
+  };
+
+  const markMediaWatched = (media) => {
+    if (!media) {
+      return false;
+    }
+
+    const watchedKey = trackingKeyFromMedia(media);
+    if (!watchedKey) {
+      return false;
+    }
+
+    const wasAdded = !watchedMediaKeys.has(watchedKey);
+    watchedMediaKeys.add(watchedKey);
+
+    clearResumePositionForIdentifiers([
+      watchedKey,
+      media.id,
+      media.filePath,
+    ]);
+
+    if (wasAdded && typeof onWatchedKeysChanged === 'function') {
+      onWatchedKeysChanged(Array.from(watchedMediaKeys));
+    }
+
+    return wasAdded;
   };
 
   const isShowCategoryFromMedia = (media) => {
@@ -2280,7 +2523,7 @@ function createCastUiServer({
     };
   };
 
-  const findNextEpisode = (currentMedia) => {
+  const findAdjacentEpisode = (currentMedia, direction) => {
     const currentInfo = mediaEpisodeIndexInfo(currentMedia);
     if (!currentInfo) {
       return null;
@@ -2318,8 +2561,119 @@ function createCastUiServer({
       return null;
     }
 
-    const nextEntry = episodeCandidates[currentIndex + 1] || null;
-    return nextEntry ? nextEntry.media : null;
+    const safeDirection = Number(direction);
+    if (!Number.isFinite(safeDirection) || safeDirection === 0) {
+      return null;
+    }
+
+    const targetEntry = episodeCandidates[currentIndex + (safeDirection > 0 ? 1 : -1)] || null;
+    return targetEntry ? targetEntry.media : null;
+  };
+
+  const getEpisodeSequenceForMedia = (currentMedia) => {
+    const currentInfo = mediaEpisodeIndexInfo(currentMedia);
+    if (!currentInfo) {
+      return [];
+    }
+
+    return mediaServer.library
+      .filter((item) => isLikelyMovie(item))
+      .map((item) => {
+        const info = mediaEpisodeIndexInfo(item);
+        if (!info) {
+          return null;
+        }
+        if (info.category !== currentInfo.category || info.showName !== currentInfo.showName) {
+          return null;
+        }
+        return {
+          media: item,
+          seasonNumber: info.seasonNumber,
+          episodeNumber: info.episodeNumber,
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => {
+        if (a.seasonNumber !== b.seasonNumber) {
+          return a.seasonNumber - b.seasonNumber;
+        }
+        if (a.episodeNumber !== b.episodeNumber) {
+          return a.episodeNumber - b.episodeNumber;
+        }
+        return String(a.media.filePath || '').localeCompare(String(b.media.filePath || ''));
+      })
+      .map((entry) => entry.media);
+  };
+
+  const buildEpisodePlaylistContext = (media) => {
+    if (!isShowCategoryFromMedia(media)) {
+      return null;
+    }
+
+    const sequence = getEpisodeSequenceForMedia(media);
+    if (sequence.length < 2) {
+      return null;
+    }
+
+    const selectedIndex = sequence.findIndex((item) => item.id === media.id);
+    if (selectedIndex < 0) {
+      return null;
+    }
+
+    const lines = ['#EXTM3U'];
+    for (const item of sequence) {
+      const title = safeBasename(path.basename(item.name, path.extname(item.name)).replace(/[._]+/g, ' ').trim());
+      lines.push(`#EXTINF:-1,${title}`);
+      lines.push(mediaServer.getMediaUrl(item.id));
+    }
+
+    const playlistId = playlistIdFromMedia(media);
+    const playlistUrl = mediaServer.registerPlaylist(playlistId, lines);
+    if (!playlistUrl) {
+      return null;
+    }
+
+    return {
+      sequence,
+      selectedTrackNumber: selectedIndex + 1,
+      playlistUrl,
+    };
+  };
+
+  const findNextEpisode = (currentMedia) => findAdjacentEpisode(currentMedia, 1);
+
+  const findPreviousEpisode = (currentMedia) => findAdjacentEpisode(currentMedia, -1);
+
+  const configureRendererNextEpisode = async (renderer, currentMedia) => {
+    if (!renderer) {
+      return;
+    }
+
+    const nextEpisode = findNextEpisode(currentMedia);
+    if (!nextEpisode) {
+      await setNextAvTransportUri(renderer, '', '').catch(() => {});
+      return;
+    }
+
+    const nextMediaUrl = mediaServer.getMediaUrl(nextEpisode.id);
+    const nextSubtitleUrl = await mediaServer.getSubtitleUrl(nextEpisode.id, { allowDownload: true });
+    const nextMetadata = buildDidlLite({
+      title: nextEpisode.name,
+      filePath: nextEpisode.filePath,
+      mediaUrl: nextMediaUrl,
+      subtitleUrl: nextSubtitleUrl,
+    });
+
+    try {
+      await setNextAvTransportUri(renderer, nextMediaUrl, nextMetadata);
+    } catch (err) {
+      const message = String(err && err.message ? err.message : '');
+      if (message.includes('errorCode>714</errorCode>') || message.includes('Illegal MIME-type')) {
+        await setNextAvTransportUri(renderer, nextMediaUrl, '');
+      } else {
+        throw err;
+      }
+    }
   };
 
   const shouldAutoAdvanceToNextEpisode = (media, relTimeSec, durationSec) => {
@@ -2333,13 +2687,12 @@ function createCastUiServer({
       return false;
     }
 
-    const progress = relTimeSec / durationSec;
     const remaining = durationSec - relTimeSec;
-    return progress >= AUTO_NEXT_CREDITS_PROGRESS || remaining <= AUTO_NEXT_CREDITS_REMAINING_SEC;
+    return remaining <= AUTO_NEXT_MIN_CREDITS_WATCH_SEC;
   };
 
   const autoAdvanceToNextEpisode = async (sessionKey, session) => {
-    if (!session || session.autoAdvanceInProgress || !session.mediaId || !session.renderer) {
+    if (!session || session.playlistMode || session.autoAdvanceInProgress || !session.mediaId || !session.renderer) {
       return;
     }
 
@@ -2356,6 +2709,7 @@ function createCastUiServer({
     session.autoAdvanceInProgress = true;
     activePlaybacks.set(sessionKey, session);
     try {
+      markMediaWatched(currentMedia);
       console.log(`[CastUI] Auto-advancing to next episode: ${nextEpisode.name}`);
       const fromTitle = safeBasename(path.basename(currentMedia.name, path.extname(currentMedia.name)).replace(/[._]+/g, ' ').trim());
       const toTitle = safeBasename(path.basename(nextEpisode.name, path.extname(nextEpisode.name)).replace(/[._]+/g, ' ').trim());
@@ -2376,10 +2730,13 @@ function createCastUiServer({
         mediaId: nextEpisode.id,
         resumeKey: nextResumeKey,
         renderer: session.renderer,
+        positionSec: 0,
         durationSec: null,
         autoAdvanceInProgress: false,
+        playlistMode: false,
       };
       activePlaybacks.set(sessionKey, updatedSession);
+      await configureRendererNextEpisode(updatedSession.renderer, nextEpisode).catch(() => {});
 
       // Capture initial position for the new episode quickly.
       await pollActivePlaybackPosition(sessionKey, updatedSession).catch(() => {});
@@ -2397,12 +2754,36 @@ function createCastUiServer({
     }
   };
 
+  const clearPlaybackSession = (sessionKey) => {
+    if (!activePlaybacks.has(sessionKey)) {
+      return;
+    }
+
+    activePlaybacks.delete(sessionKey);
+    if (activePlaybacks.size === 0) {
+      stopPlaybackProgressPolling();
+    }
+  };
+
   const pollActivePlaybackPosition = async (sessionKey, session) => {
     if (!session || !session.renderer || !session.resumeKey) {
       return;
     }
 
+    const transportInfo = await getTransportInfo(session.renderer).catch(() => null);
+    const transportState = transportInfo
+      && transportInfo['s:Envelope']
+      && transportInfo['s:Envelope']['s:Body']
+      && transportInfo['s:Envelope']['s:Body']['u:GetTransportInfoResponse']
+      && transportInfo['s:Envelope']['s:Body']['u:GetTransportInfoResponse']['CurrentTransportState'];
+    const isTerminalTransport = transportState === 'STOPPED' || transportState === 'NO_MEDIA_PRESENT';
+    if (isTerminalTransport && !session.autoAdvanceInProgress && Number(session.positionSec) > 0) {
+      clearPlaybackSession(sessionKey);
+      return;
+    }
+
     const positionInfo = await getPositionInfo(session.renderer);
+    const mediaInfo = await getMediaInfo(session.renderer).catch(() => null);
     const response = positionInfo
       && positionInfo['s:Envelope']
       && positionInfo['s:Envelope']['s:Body']
@@ -2412,6 +2793,41 @@ function createCastUiServer({
       return;
     }
 
+    const trackUri = String(response.TrackURI || '').trim()
+      || String(
+        mediaInfo
+        && mediaInfo['s:Envelope']
+        && mediaInfo['s:Envelope']['s:Body']
+        && mediaInfo['s:Envelope']['s:Body']['u:GetMediaInfoResponse']
+        && mediaInfo['s:Envelope']['s:Body']['u:GetMediaInfoResponse']['CurrentURI']
+      || '').trim();
+    const trackMediaId = mediaIdFromTrackUri(trackUri);
+    const trackMedia = trackMediaId ? mediaServer.getMediaById(trackMediaId) : null;
+
+    if (trackMedia && trackMedia.id && trackMedia.id !== session.mediaId) {
+      const previousMedia = mediaServer.getMediaById(session.mediaId);
+      const previousNext = previousMedia ? findNextEpisode(previousMedia) : null;
+      if (previousMedia && previousNext && previousNext.id === trackMedia.id && Number(session.positionSec) > 0) {
+        markMediaWatched(previousMedia);
+      }
+
+      session.mediaId = trackMedia.id;
+      session.resumeKey = trackingKeyFromMedia(trackMedia);
+      session.positionSec = 0;
+      session.durationSec = null;
+      activePlaybacks.set(sessionKey, session);
+
+      if (!session.playlistMode) {
+        await configureRendererNextEpisode(session.renderer, trackMedia).catch(() => {});
+      }
+
+      const previousEpisode = trackMedia ? findPreviousEpisode(trackMedia) : null;
+      console.log(
+        `[CastUI] Renderer switched episode via on-screen controls: ${trackMedia.name}`
+        + `${previousEpisode ? ` (previous: ${previousEpisode.name})` : ''}`,
+      );
+    }
+
     const relTimeSec = parseDlnaClockToSeconds(response.RelTime);
     const durationSec = parseDlnaClockToSeconds(response.TrackDuration) || session.durationSec || null;
     if (!Number.isFinite(relTimeSec) || relTimeSec <= 0) {
@@ -2419,11 +2835,23 @@ function createCastUiServer({
     }
 
     setResumePosition(session.resumeKey, relTimeSec, durationSec);
+    session.positionSec = relTimeSec;
     session.durationSec = durationSec;
     activePlaybacks.set(sessionKey, session);
 
     const currentMedia = mediaServer.getMediaById(session.mediaId);
-    if (currentMedia && shouldAutoAdvanceToNextEpisode(currentMedia, relTimeSec, durationSec)) {
+    const progress = Number.isFinite(durationSec) && durationSec > 0
+      ? (relTimeSec / durationSec)
+      : null;
+    if (currentMedia && isShowCategoryFromMedia(currentMedia) && Number.isFinite(progress) && progress >= WATCHED_COMPLETION_PROGRESS) {
+      markMediaWatched(currentMedia);
+      if (!findNextEpisode(currentMedia)) {
+        clearPlaybackSession(sessionKey);
+        return;
+      }
+    }
+
+    if (!session.playlistMode && currentMedia && shouldAutoAdvanceToNextEpisode(currentMedia, relTimeSec, durationSec)) {
       await autoAdvanceToNextEpisode(sessionKey, session);
     }
   };
@@ -2446,6 +2874,19 @@ function createCastUiServer({
       pollAllActivePlaybackPositions().catch(() => {});
     }, 15000);
   };
+
+  const isLoopbackAddress = (address) => {
+    const raw = String(address || '').trim().toLowerCase();
+    if (!raw) {
+      return false;
+    }
+    const normalized = raw.startsWith('::ffff:') ? raw.slice('::ffff:'.length) : raw;
+    return normalized === '::1' || normalized.startsWith('127.');
+  };
+
+  // Adding a media folder reaches the host filesystem, so it stays local-only
+  // even when the UI itself is published to the LAN.
+  const isLocalRequest = (req) => isLoopbackAddress(req && req.socket && req.socket.remoteAddress);
 
   const rendererKey = (item) => String((item && (item.udn || item.location)) || '').trim();
 
@@ -2586,6 +3027,7 @@ function createCastUiServer({
         showPosterUrl: null,
         showPlot: null,
         showImdbRating: null,
+        showRatingSource: null,
         showYear: null,
         seasonLabel: seasonInfo ? seasonInfo.seasonLabel : null,
         seasonNumber: seasonInfo ? seasonInfo.seasonNumber : null,
@@ -2596,6 +3038,7 @@ function createCastUiServer({
         year: null,
         plot: null,
         imdbRating: null,
+        ratingSource: null,
       },
     };
   };
@@ -2647,6 +3090,9 @@ function createCastUiServer({
         const episodePoster = (episodeMetadata && episodeMetadata.posterUrl) || (metadata && metadata.posterUrl) || null;
         const episodePlot = (episodeMetadata && episodeMetadata.plot) || (metadata && metadata.plot) || null;
         const episodeRating = (episodeMetadata && episodeMetadata.imdbRating) || (metadata && metadata.imdbRating) || null;
+        const episodeRatingSource = (episodeMetadata && episodeMetadata.imdbRating)
+          ? (episodeMetadata.ratingSource || null)
+          : ((metadata && metadata.imdbRating) ? (metadata.ratingSource || null) : null);
         const episodeYear = (episodeMetadata && episodeMetadata.year) || (metadata && metadata.year) || null;
 
         metadataMap.set(item.id, {
@@ -2656,6 +3102,7 @@ function createCastUiServer({
           showPosterUrl: local.isShowCategory ? ((metadata && metadata.posterUrl) || null) : null,
           showPlot: local.isShowCategory ? ((metadata && metadata.plot) || null) : null,
           showImdbRating: local.isShowCategory ? ((metadata && metadata.imdbRating) || null) : null,
+          showRatingSource: local.isShowCategory ? ((metadata && metadata.ratingSource) || null) : null,
           showYear: local.isShowCategory ? ((metadata && metadata.year) || null) : null,
           seasonLabel: local.seasonInfo ? local.seasonInfo.seasonLabel : null,
           seasonNumber: local.seasonInfo ? local.seasonInfo.seasonNumber : null,
@@ -2666,6 +3113,7 @@ function createCastUiServer({
           year: episodeYear,
           plot: episodePlot,
           imdbRating: episodeRating,
+          ratingSource: episodeRatingSource,
         });
         metadataVersion += 1;
       } catch {
@@ -2787,6 +3235,7 @@ function createCastUiServer({
             year: firstWithPoster.showYear || firstWithPoster.year || null,
             plot: firstWithPoster.showPlot || firstWithPoster.plot || null,
             imdbRating: firstWithPoster.showImdbRating || firstWithPoster.imdbRating || null,
+            ratingSource: firstWithPoster.showRatingSource || firstWithPoster.ratingSource || null,
             latestAddedAtMs,
             seasons,
             items: [],
@@ -2928,6 +3377,17 @@ function createCastUiServer({
         : (selectedRenderer && selectedRenderer.friendlyName ? selectedRenderer.friendlyName : 'Unknown Renderer');
       const sessions = Array.from(activePlaybacks.values()).map((session) => {
         const media = mediaServer.getMediaById(session.mediaId);
+        const resume = session.resumeKey ? resumePositions.get(session.resumeKey) : null;
+        const safePosition = Math.max(
+          0,
+          Math.floor(Number(session.positionSec ?? (resume && resume.positionSec) ?? 0) || 0),
+        );
+        const safeDuration = Number.isFinite(Number(session.durationSec ?? (resume && resume.durationSec)))
+          ? Math.floor(Number(session.durationSec ?? (resume && resume.durationSec)))
+          : null;
+        const progress = safeDuration && safeDuration > 0
+          ? (safePosition / safeDuration)
+          : null;
         return {
           mediaId: session.mediaId || null,
           mediaName: media ? media.name : null,
@@ -2936,6 +3396,9 @@ function createCastUiServer({
             ? session.renderer.friendlyName
             : 'Unknown Renderer',
           resumeKey: session.resumeKey || null,
+          positionSec: safePosition,
+          durationSec: safeDuration,
+          progress: Number.isFinite(progress) ? progress : null,
         };
       });
       sendJson(res, 200, {
@@ -2947,6 +3410,8 @@ function createCastUiServer({
         rendererName,
         sessions,
         autoAdvance: lastAutoAdvanceEvent,
+        watchedKeys: Array.from(watchedMediaKeys),
+        resumePositions: Object.fromEntries(resumePositions.entries()),
       });
       return;
     }
@@ -2975,20 +3440,28 @@ function createCastUiServer({
         const startSeconds = requestedResume && savedResume
           ? Math.max(0, Math.floor(Number(savedResume.positionSec) || 0))
           : 0;
+        const playlistContext = null;
 
         const result = await castMediaItem(selectedRenderer, mediaServer, media, {
           startSeconds,
+          playlistContext,
         });
+        const playlistModeUsed = Boolean(result && result.playlistModeUsed);
         const selectedKey = rendererKey(selectedRenderer);
         activePlaybacks.set(selectedKey, {
           mediaId: media.id,
           resumeKey,
           renderer: selectedRenderer,
+          positionSec: startSeconds,
           durationSec: savedResume && Number.isFinite(savedResume.durationSec)
             ? Math.floor(Number(savedResume.durationSec))
             : null,
           autoAdvanceInProgress: false,
+          playlistMode: playlistModeUsed,
         });
+        if (!playlistModeUsed) {
+          await configureRendererNextEpisode(selectedRenderer, media).catch(() => {});
+        }
         startPlaybackProgressPolling();
         pollAllActivePlaybackPositions().catch(() => {});
 
@@ -3002,6 +3475,7 @@ function createCastUiServer({
           transportState: result.transportState,
           mediaUrl: result.mediaUrl,
           resumedFromSec: result.resumedFromSec || 0,
+          playlistMode: playlistModeUsed,
         });
       } catch (error) {
         sendJson(res, 500, {
@@ -3112,6 +3586,14 @@ function createCastUiServer({
 
     if (req.method === 'POST' && parsed.pathname === '/api/media-folders/add') {
       try {
+        if (!isLocalRequest(req)) {
+          sendJson(res, 403, {
+            ok: false,
+            error: 'Media folders can only be added from the machine running MediaCast.',
+          });
+          return;
+        }
+
         const body = await readRequestBody(req);
         const payload = JSON.parse(body || '{}');
         let folderPath = String(payload.path || '').trim();
@@ -3152,6 +3634,44 @@ function createCastUiServer({
       return;
     }
 
+    if (req.method === 'GET' && parsed.pathname.startsWith('/playlist/series/')) {
+      try {
+        const mediaId = parseMediaIdFromPlaylistPath(parsed.pathname);
+        const media = mediaId ? mediaServer.getMediaById(mediaId) : null;
+        if (!media) {
+          res.statusCode = 404;
+          res.end('Not found');
+          return;
+        }
+
+        const sequence = getEpisodeSequenceForMedia(media);
+        if (sequence.length === 0) {
+          res.statusCode = 404;
+          res.end('Not found');
+          return;
+        }
+
+        const lines = ['#EXTM3U'];
+        for (const item of sequence) {
+          const title = safeBasename(path.basename(item.name, path.extname(item.name)).replace(/[._]+/g, ' ').trim());
+          lines.push(`#EXTINF:-1,${title}`);
+          lines.push(mediaServer.getMediaUrl(item.id));
+        }
+
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'audio/mpegurl; charset=utf-8');
+        res.setHeader('Content-Disposition', 'inline; filename="series-playlist.m3u"');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.end(lines.join('\r\n') + '\r\n');
+      } catch (error) {
+        sendJson(res, 500, {
+          ok: false,
+          error: error.message,
+        });
+      }
+      return;
+    }
+
     res.statusCode = 404;
     res.end('Not found');
   }
@@ -3175,7 +3695,7 @@ function createCastUiServer({
         try {
           await new Promise((resolve, reject) => {
             server.once('error', reject);
-            server.listen(attemptPort, uiHost, () => resolve());
+            server.listen(attemptPort, serverListenHost, () => resolve());
           });
           break;
         } catch (error) {
@@ -3196,14 +3716,15 @@ function createCastUiServer({
       }
 
       const address = server.address();
+      boundUiPort = address.port;
       return {
-        host: uiHost,
+        host: requestedUiHost,
         port: address.port,
       };
     },
     stop: () => {
       stopPlaybackProgressPolling();
-      activePlayback = null;
+      activePlaybacks.clear();
       if (!server) {
         return Promise.resolve();
       }

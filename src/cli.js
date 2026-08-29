@@ -3,7 +3,7 @@
 import path from 'path';
 import process from 'process';
 import fs from 'fs';
-import { execFile } from 'child_process';
+import { execFile, spawn } from 'child_process';
 import readline from 'readline/promises';
 import os from 'os';
 import { fileURLToPath } from 'url';
@@ -23,17 +23,61 @@ import {
 import { printSupportedFormats } from './utils/media.js';
 import { getLocalIPForRenderer } from './utils/network.js';
 import { createCastUiServer } from './web/castUiServer.js';
+import { configureMetadataApiKeys } from './web/metadataFetcher.js';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const runtimeFilename = typeof __filename === 'string'
+  ? __filename
+  : fileURLToPath(import.meta.url);
+const runtimeDirname = typeof __dirname === 'string'
+  ? __dirname
+  : path.dirname(runtimeFilename);
 
 async function getRendererOrThrow(rendererQuery, timeoutMs, rendererIp) {
+  const extractRendererAddress = (renderer) => {
+    if (!renderer || !renderer.location) {
+      return null;
+    }
+
+    try {
+      return new URL(renderer.location).hostname;
+    } catch {
+      const urlMatch = String(renderer.location).match(/http:\/\/([^:]+):/);
+      return urlMatch ? urlMatch[1] : null;
+    }
+  };
+
   if (rendererIp) {
     const byIp = await getRendererByIp(rendererIp);
-    if (!byIp) {
-      throw new Error(`Could not resolve renderer at ${rendererIp}.`);
+    if (byIp) {
+      return { renderer: byIp, renderers: [byIp], rendererAddress: rendererIp };
     }
-    return { renderer: byIp, renderers: [byIp], rendererAddress: rendererIp };
+
+    // Graceful fallback: if IP is stale, use discovery results when unambiguous.
+    const discovered = await discoverRenderers(Number(timeoutMs) || 5000);
+    if (discovered.length === 1) {
+      const fallbackRenderer = discovered[0];
+      const fallbackAddress = extractRendererAddress(fallbackRenderer);
+      console.warn(
+        `[Renderer] Could not resolve renderer at ${rendererIp}; using discovered renderer ${fallbackRenderer.friendlyName}${fallbackAddress ? ` (${fallbackAddress})` : ''}.`,
+      );
+      return {
+        renderer: fallbackRenderer,
+        renderers: discovered,
+        rendererAddress: fallbackAddress || rendererIp,
+      };
+    }
+
+    if (discovered.length > 1) {
+      const hints = discovered
+        .map((item) => {
+          const address = extractRendererAddress(item);
+          return `${item.friendlyName}${address ? ` (${address})` : ''}`;
+        })
+        .join(', ');
+      throw new Error(`Could not resolve renderer at ${rendererIp}. Discovered renderers: ${hints}`);
+    }
+
+    throw new Error(`Could not resolve renderer at ${rendererIp}. No renderers discovered on the network.`);
   }
 
   const renderers = await discoverRenderers(timeoutMs);
@@ -47,14 +91,7 @@ async function getRendererOrThrow(rendererQuery, timeoutMs, rendererIp) {
     throw new Error(`Renderer not found: "${rendererQuery}". Available: ${names}`);
   }
 
-  // Extract IP from renderer's device description location URL
-  let rendererAddress = null;
-  if (renderer.location) {
-    const urlMatch = renderer.location.match(/http:\/\/([^:]+):/);
-    if (urlMatch) {
-      rendererAddress = urlMatch[1];
-    }
-  }
+  const rendererAddress = extractRendererAddress(renderer);
 
   return { renderer, renderers, rendererAddress };
 }
@@ -143,7 +180,9 @@ async function resolveMediaDirectory(inputDir) {
 }
 
 // The app's own root directory — never allowed as a media source
-const APP_ROOT = path.resolve(__dirname, '..');
+const APP_ROOT = process.pkg
+  ? path.dirname(process.execPath)
+  : path.resolve(runtimeDirname, '..');
 
 function isAppDirectory(dirPath) {
   const resolved = path.resolve(dirPath);
@@ -188,6 +227,63 @@ function updateCastUiConfig(patch) {
   writeCastUiConfig({
     ...existing,
     ...(patch && typeof patch === 'object' ? patch : {}),
+  });
+}
+
+function toBrowserFriendlyHost(host) {
+  const normalized = String(host || '').trim();
+  if (!normalized || normalized === '0.0.0.0' || normalized === '::') {
+    return 'localhost';
+  }
+
+  return normalized;
+}
+
+async function openUrlInDefaultBrowser(url) {
+  if (process.platform === 'win32') {
+    const escapedUrl = String(url || '').replace(/'/g, "''");
+    const tryExec = (command, args) => new Promise((resolve) => {
+      execFile(
+        command,
+        args,
+        { windowsHide: true },
+        (error) => {
+          resolve(!error);
+        },
+      );
+    });
+
+    if (await tryExec('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `Start-Process '${escapedUrl}'`])) {
+      return true;
+    }
+
+    if (await tryExec('cmd.exe', ['/c', 'start', '', url])) {
+      return true;
+    }
+
+    if (await tryExec('rundll32.exe', ['url.dll,FileProtocolHandler', url])) {
+      return true;
+    }
+
+    if (await tryExec('explorer.exe', [url])) {
+      return true;
+    }
+
+    return false;
+  }
+
+  return new Promise((resolve) => {
+    const command = process.platform === 'darwin' ? 'open' : 'xdg-open';
+    const child = spawn(command, [url], {
+      detached: true,
+      stdio: 'ignore',
+    });
+
+    child.once('error', () => resolve(false));
+    child.once('spawn', () => {
+      child.unref();
+      resolve(true);
+    });
   });
 }
 
@@ -342,7 +438,35 @@ const program = new Command();
 program
   .name('mediacast')
   .description('UPnP/DLNA JavaScript casting stack')
-  .version('1.0.0');
+  .version('1.3.0');
+
+if (process.pkg) {
+  const knownCommands = new Set([
+    'info',
+    'discover',
+    'serve',
+    'cast-file',
+    'cast-url',
+    'cast-ui',
+    'pause',
+    'stop',
+    'volume',
+    'network',
+  ]);
+
+  const rawArgs = process.argv.slice(2).map((item) => String(item || '').trim()).filter(Boolean);
+  const hasKnownCommand = rawArgs.some((arg) => knownCommands.has(arg.toLowerCase()));
+  const hasTopLevelFlag = rawArgs.some((arg) => (
+    arg === '-h'
+    || arg === '--help'
+    || arg === '-V'
+    || arg === '--version'
+  ));
+
+  if (!hasKnownCommand && !hasTopLevelFlag) {
+    process.argv.push('cast-ui');
+  }
+}
 
 program
   .command('info')
@@ -615,6 +739,7 @@ program
   .option('-h, --host <host>', 'Bind host/IP for media URL')
   .option('--ui-port <port>', 'Web app port', '8787')
   .option('--ui-host <host>', 'Web app host', '127.0.0.1')
+  .option('--ui-lan', 'Expose the web app to your local network (default: this machine only)')
   .option('--no-transcode', 'Disable FFmpeg transcoding (direct play only)')
   .option('--force-transcode', 'Force transcoding to H.264+AAC')
   .option('--subtitle-delay-ms <ms>', 'Shift subtitles by milliseconds (positive delays subtitle, negative advances)', '0')
@@ -626,17 +751,34 @@ program
   .action(async (options) => {
     let mediaServer = null;
     let uiServer = null;
+    let renderer = null;
+    let rendererAddress = null;
 
     try {
       const mediaDirs = await resolveInitialMediaDirectories(options.dir);
       const isFirstRun = mediaDirs.length === 0;
 
-      // Discover renderer first to determine correct network interface
-      const { renderer, rendererAddress } = await getRendererOrThrow(
-        options.renderer,
-        Number(options.timeout),
-        options.rendererIp,
-      );
+      const savedConfig = readCastUiConfig();
+      configureMetadataApiKeys({
+        tmdbApiKey: process.env.TMDB_API_KEY || savedConfig.tmdbApiKey,
+        omdbApiKey: process.env.OMDB_API_KEY || savedConfig.omdbApiKey,
+      });
+
+      try {
+        // Discover renderer first to determine correct network interface when one is available.
+        ({ renderer, rendererAddress } = await getRendererOrThrow(
+          options.renderer,
+          Number(options.timeout),
+          options.rendererIp,
+        ));
+      } catch (error) {
+        const message = String(error?.message || '');
+        if (message.includes('No DLNA/UPnP MediaRenderer devices found on the network.')) {
+          console.warn('No renderer found yet. The web UI will start and you can refresh discovery there.');
+        } else {
+          throw error;
+        }
+      }
 
       // Auto-detect media server host if not provided
       let mediaHost = options.host;
@@ -677,6 +819,7 @@ program
         renderer,
         uiHost: options.uiHost,
         uiPort: Number(options.uiPort),
+        allowLanAccess: Boolean(options.uiLan),
         chooseMediaFolder: () => resolveMediaDirectory(''),
         onMediaFoldersChanged: (dirs) => saveMediaDirectories(dirs),
         initialWatchedKeys: loadWatchedMediaKeys(),
@@ -693,7 +836,7 @@ program
       } else {
         console.log(`Media folders: ${mediaDirs.join(' | ')}`);
       }
-      console.log(`Renderer: ${renderer.friendlyName}`);
+      console.log(`Renderer: ${renderer && renderer.friendlyName ? renderer.friendlyName : 'No renderer selected'}`);
       if (Number(options.subtitleDelayMs) !== 0) {
         console.log(`Subtitle delay: ${Number(options.subtitleDelayMs)}ms`);
       }
@@ -712,7 +855,18 @@ program
       if (uiInfo.port !== requestedUiPort) {
         console.log(`Web app port requested: ${requestedUiPort} (occupied, fell back to ${uiInfo.port})`);
       }
-      console.log(`Web app: http://${uiInfo.host}:${uiInfo.port}`);
+      const browserUrl = `http://${toBrowserFriendlyHost(uiInfo.host)}:${uiInfo.port}`;
+      console.log(`Web app: ${browserUrl}`);
+      if (options.uiLan) {
+        console.log('Web app access: local network (adding media folders stays restricted to this machine).');
+      } else {
+        console.log('Web app access: this machine only (use --ui-lan to allow other devices).');
+      }
+      if (await openUrlInDefaultBrowser(browserUrl)) {
+        console.log('Opened web app in your default browser.');
+      } else {
+        console.warn('Could not auto-open browser. Open the web app URL manually.');
+      }
       if (isFirstRun) {
         console.log('First run: open the web app and click "Add Media Folder" to get started.');
       } else {

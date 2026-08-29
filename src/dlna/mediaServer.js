@@ -85,6 +85,7 @@ class MediaServer {
     this.subtitles = {
       delayMs: Number.isFinite(Number(subtitles.delayMs)) ? Number(subtitles.delayMs) : 0,
     };
+    this.playlists = new Map();
   }
 
 
@@ -244,6 +245,28 @@ class MediaServer {
     return `http://${this.host}:${this.port}/media/${encodeURIComponent(id)}/${encodeURIComponent(fileName)}`;
   }
 
+  registerPlaylist(playlistId, lines) {
+    const key = String(playlistId || '').trim();
+    if (!key) {
+      return null;
+    }
+
+    const normalizedLines = Array.isArray(lines)
+      ? lines.map((line) => String(line || ''))
+      : [];
+    if (normalizedLines.length === 0) {
+      this.playlists.delete(key);
+      return null;
+    }
+
+    this.playlists.set(key, {
+      lines: normalizedLines,
+      updatedAt: Date.now(),
+    });
+
+    return `http://${this.host}:${this.port}/playlist/${encodeURIComponent(key)}.m3u`;
+  }
+
   _subtitlePathForMedia(media) {
     const dir = path.dirname(media.filePath);
     const base = path.basename(media.filePath, path.extname(media.filePath));
@@ -370,9 +393,7 @@ class MediaServer {
 
     let willTranscode = false;
 
-    if (this.transcoding.enabled && this.transcoding.forceTranscode) {
-      willTranscode = true;
-    } else if (this.transcoding.enabled && !this.transcoding.skipTranscode) {
+    if (this.transcoding.enabled) {
       try {
         willTranscode = await shouldTranscode(media.filePath, {
           forceTranscode: this.transcoding.forceTranscode,
@@ -612,6 +633,23 @@ class MediaServer {
           : 0;
         const shiftedContent = this._applySubtitleDelay(subtitleContent, subtitleDelayMs);
         res.end(shiftedContent);
+        return;
+      }
+
+      if (parsed.pathname.startsWith('/playlist/')) {
+        const playlistKeyRaw = decodeURIComponent(parsed.pathname.replace('/playlist/', ''));
+        const playlistKey = String(playlistKeyRaw || '').replace(/\.m3u$/i, '').trim();
+        const playlist = this.playlists.get(playlistKey);
+        if (!playlist || !Array.isArray(playlist.lines) || playlist.lines.length === 0) {
+          sendNotFound(res);
+          return;
+        }
+
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'audio/mpegurl; charset=utf-8');
+        res.setHeader('Content-Disposition', 'inline; filename="series-playlist.m3u"');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.end(playlist.lines.join('\r\n') + '\r\n');
         return;
       }
 

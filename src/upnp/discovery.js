@@ -34,29 +34,54 @@ function findService(device, serviceTypeNeedle) {
   return services.find((service) => String(service.serviceType || '').includes(serviceTypeNeedle));
 }
 
-async function parseDeviceDescription(location) {
-  const response = await axios.get(location, { timeout: 6000 });
+function getAllDevices(device) {
+  if (!device) {
+    return [];
+  }
+
+  const embeddedDevices = asArray(device?.deviceList?.device);
+  return [
+    device,
+    ...embeddedDevices.flatMap((item) => getAllDevices(item)),
+  ];
+}
+
+function findFirstDeviceWithService(rootDevice, serviceTypeNeedle) {
+  const devices = getAllDevices(rootDevice);
+  return devices.find((device) => findService(device, serviceTypeNeedle)) || null;
+}
+
+async function parseDeviceDescription(location, timeoutMs = 6000) {
+  const response = await axios.get(location, { timeout: timeoutMs });
   const xml = parser.parse(response.data);
   const root = xml?.root;
-  const device = root?.device;
+  const rootDevice = root?.device;
 
-  if (!device) {
+  if (!rootDevice) {
     return null;
   }
 
-  const avTransport = findService(device, 'AVTransport');
+  const avDevice = findFirstDeviceWithService(rootDevice, 'AVTransport');
+  if (!avDevice) {
+    return null;
+  }
+
+  const avTransport = findService(avDevice, 'AVTransport');
   if (!avTransport) {
     return null;
   }
 
-  const renderingControl = findService(device, 'RenderingControl');
+  const renderingDevice = findFirstDeviceWithService(rootDevice, 'RenderingControl');
+  const renderingControl = renderingDevice
+    ? findService(renderingDevice, 'RenderingControl')
+    : null;
 
   return {
     location,
-    friendlyName: device.friendlyName || 'Unknown Renderer',
-    manufacturer: device.manufacturer || '',
-    modelName: device.modelName || '',
-    udn: device.UDN || '',
+    friendlyName: avDevice.friendlyName || rootDevice.friendlyName || 'Unknown Renderer',
+    manufacturer: avDevice.manufacturer || rootDevice.manufacturer || '',
+    modelName: avDevice.modelName || rootDevice.modelName || '',
+    udn: avDevice.UDN || rootDevice.UDN || '',
     services: {
       avTransport: {
         serviceType: avTransport.serviceType,
@@ -102,6 +127,7 @@ async function getRendererByIp(ip, port = 1029) {
     80,
     1400,
     1029,
+    1291,
     1527,
   ].filter((value) => Number.isFinite(value) && value > 0)));
 
@@ -111,18 +137,24 @@ async function getRendererByIp(ip, port = 1029) {
       `http://${targetIp}:${candidatePort}/description.xml`,
       `http://${targetIp}:${candidatePort}/DeviceDescription.xml`,
       `http://${targetIp}:${candidatePort}/dmr/description.xml`,
+      `http://${targetIp}:${candidatePort}/ssdp/device-desc.xml`,
       `http://${targetIp}:${candidatePort}/`,
     );
   }
 
-  for (const location of candidates) {
-    try {
-      const renderer = await parseDeviceDescription(location);
-      if (renderer?.services?.avTransport?.controlUrl) {
-        return renderer;
+  const probed = await Promise.all(
+    candidates.map(async (location) => {
+      try {
+        return await parseDeviceDescription(location, 2000);
+      } catch {
+        return null;
       }
-    } catch {
-      continue;
+    }),
+  );
+
+  for (const renderer of probed) {
+    if (renderer?.services?.avTransport?.controlUrl) {
+      return renderer;
     }
   }
 

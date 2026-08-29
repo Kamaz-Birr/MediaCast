@@ -1,0 +1,101 @@
+name: Package Executables
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  package:
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runs-on: windows-latest
+            target: node18-win-x64
+            output: dist/MediaCast-Windows-x64.exe
+            artifact: MediaCast-Windows-x64
+          - runs-on: macos-latest
+            target: node18-macos-x64
+            output: dist/MediaCast-macOS-x64
+            artifact: MediaCast-macOS-x64
+          - runs-on: macos-latest
+            target: node18-macos-arm64
+            output: dist/MediaCast-macOS-arm64
+            artifact: MediaCast-macOS-arm64
+
+    runs-on: ${{ matrix.runs-on }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Package executable
+        run: npm run package -- --targets ${{ matrix.target }} --output ${{ matrix.output }}
+
+      - name: Import macOS signing certificate
+        if: ${{ startsWith(matrix.runs-on, 'macos') && secrets.MACOS_SIGNING_CERT_B64 != '' && secrets.MACOS_SIGNING_CERT_PASSWORD != '' && secrets.MACOS_SIGNING_IDENTITY != '' }}
+        uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.MACOS_SIGNING_CERT_B64 }}
+          p12-password: ${{ secrets.MACOS_SIGNING_CERT_PASSWORD }}
+
+      - name: Sign macOS binary
+        if: ${{ startsWith(matrix.runs-on, 'macos') && secrets.MACOS_SIGNING_CERT_B64 != '' && secrets.MACOS_SIGNING_CERT_PASSWORD != '' && secrets.MACOS_SIGNING_IDENTITY != '' }}
+        run: codesign --force --timestamp --options runtime --sign "${{ secrets.MACOS_SIGNING_IDENTITY }}" "${{ matrix.output }}"
+
+      - name: Decode Windows signing certificate
+        if: ${{ matrix.runs-on == 'windows-latest' && secrets.WINDOWS_SIGNING_CERT_B64 != '' && secrets.WINDOWS_SIGNING_CERT_PASSWORD != '' }}
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path signing | Out-Null
+          $certBytes = [Convert]::FromBase64String('${{ secrets.WINDOWS_SIGNING_CERT_B64 }}')
+          [System.IO.File]::WriteAllBytes('signing\mediacast-signing.pfx', $certBytes)
+
+      - name: Sign Windows executable
+        if: ${{ matrix.runs-on == 'windows-latest' && secrets.WINDOWS_SIGNING_CERT_B64 != '' && secrets.WINDOWS_SIGNING_CERT_PASSWORD != '' }}
+        shell: pwsh
+        run: |
+          $signtool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Recurse -Filter signtool.exe | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $signtool) {
+            throw 'signtool.exe was not found on the runner.'
+          }
+
+          & $signtool sign /f signing\mediacast-signing.pfx /p '${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}' /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 "${{ matrix.output }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.output }}
+
+  release:
+    needs: package
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: MediaCast-*
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*

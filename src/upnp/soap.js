@@ -82,6 +82,19 @@ async function setAvTransportUri(renderer, mediaUrl, metadata = '') {
   });
 }
 
+async function setNextAvTransportUri(renderer, mediaUrl, metadata = '') {
+  return sendSoapAction({
+    controlUrl: renderer.services.avTransport.controlUrl,
+    serviceType: renderer.services.avTransport.serviceType,
+    action: 'SetNextAVTransportURI',
+    params: {
+      InstanceID: '0',
+      NextURI: String(mediaUrl || ''),
+      NextURIMetaData: metadata ? xmlEscape(metadata) : '',
+    },
+  });
+}
+
 async function getTransportInfo(renderer) {
   try {
     const result = await sendSoapAction({
@@ -143,6 +156,22 @@ async function getPositionInfo(renderer) {
     });
   } catch (err) {
     console.warn(`[GetPositionInfo] Failed: ${err.message}`);
+    return null;
+  }
+}
+
+async function getMediaInfo(renderer) {
+  try {
+    return await sendSoapAction({
+      controlUrl: renderer.services.avTransport.controlUrl,
+      serviceType: renderer.services.avTransport.serviceType,
+      action: 'GetMediaInfo',
+      params: {
+        InstanceID: '0',
+      },
+    });
+  } catch (err) {
+    console.warn(`[GetMediaInfo] Failed: ${err.message}`);
     return null;
   }
 }
@@ -220,6 +249,7 @@ async function setVolume(renderer, desiredVolume) {
 
 export {
   setAvTransportUri,
+  setNextAvTransportUri,
   play,
   pause,
   stop,
@@ -227,5 +257,6 @@ export {
   getTransportInfo,
   getCurrentTransportActions,
   getPositionInfo,
+  getMediaInfo,
   seek,
 };
