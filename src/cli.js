@@ -452,6 +452,48 @@ function getSubtitlesDir() {
   return path.join(path.dirname(getCastUiConfigPath()), 'subtitles');
 }
 
+// Kept out of cast-ui.json: that file is rewritten whenever a resume position
+// moves, and the metadata cache is far too large to rewrite that often.
+function getMetadataCachePath() {
+  return path.join(path.dirname(getCastUiConfigPath()), 'metadata-cache.json');
+}
+
+function loadMetadataCache() {
+  const cachePath = getMetadataCachePath();
+  if (!fs.existsSync(cachePath)) {
+    return {};
+  }
+
+  try {
+    const parsed = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return {};
+    }
+    return parsed.entries && typeof parsed.entries === 'object' ? parsed.entries : {};
+  } catch (error) {
+    console.warn(`[Metadata] Ignoring unreadable metadata cache: ${error.message}`);
+    return {};
+  }
+}
+
+function saveMetadataCache(entries) {
+  const cachePath = getMetadataCachePath();
+  try {
+    fs.mkdirSync(path.dirname(cachePath), { recursive: true });
+    const payload = {
+      version: 1,
+      savedAt: new Date().toISOString(),
+      entries: entries && typeof entries === 'object' ? entries : {},
+    };
+    // Write then rename so an interrupted save cannot leave a truncated file.
+    const tempPath = cachePath + '.tmp';
+    fs.writeFileSync(tempPath, JSON.stringify(payload), 'utf8');
+    fs.renameSync(tempPath, cachePath);
+  } catch (error) {
+    console.warn(`[Metadata] Could not write the metadata cache: ${error.message}`);
+  }
+}
+
 function normalizeMediaOverrides(source) {
   const input = source && typeof source === 'object' && !Array.isArray(source) ? source : {};
   const normalized = {};
@@ -933,6 +975,8 @@ program
         onCategoriesChanged: (payload) => saveCategoryConfig(payload),
         initialMediaOverrides: loadMediaOverrides(),
         onMediaOverridesChanged: (overrides) => saveMediaOverrides(overrides),
+        initialMetadataCache: loadMetadataCache(),
+        onMetadataCacheChanged: (entries) => saveMetadataCache(entries),
         coversDir: getCoversDir(),
         subtitlesDir: getSubtitlesDir(),
       });

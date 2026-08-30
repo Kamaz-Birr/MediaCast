@@ -1155,6 +1155,57 @@ function buildPageHtml(rendererName) {
       .form-grid { grid-template-columns: 1fr; }
     }
 
+    /* ---------- Local player ---------- */
+
+    .player-modal {
+      width: min(1100px, 100%);
+      padding: 0;
+      overflow: hidden;
+      background: #05080f;
+    }
+
+    .player-frame {
+      position: relative;
+      background: #000;
+      line-height: 0;
+    }
+
+    .player-frame video {
+      width: 100%;
+      max-height: 74vh;
+      display: block;
+      background: #000;
+    }
+
+    .player-bar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 14px 18px;
+      flex-wrap: wrap;
+      line-height: 1.4;
+    }
+
+    .player-title {
+      font-weight: 800;
+      font-size: 0.95rem;
+      color: var(--text);
+      flex: 1 1 240px;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .player-note {
+      color: var(--faint);
+      font-size: 0.73rem;
+      font-weight: 600;
+      flex: 1 1 100%;
+    }
+
+    .player-note.warn { color: #fcd34d; }
+
     /* ---------- Status bar ---------- */
 
     .status {
@@ -1726,6 +1777,20 @@ function buildPageHtml(rendererName) {
     </div>
   </div>
 
+  <div class="modal-backdrop" id="playerModal" hidden>
+    <div class="modal player-modal" role="dialog" aria-modal="true" aria-labelledby="playerTitle">
+      <button class="modal-close" id="playerClose" aria-label="Close player">&times;</button>
+      <div class="player-frame">
+        <video id="playerVideo" controls playsinline preload="metadata"></video>
+      </div>
+      <div class="player-bar">
+        <span class="player-title" id="playerTitle"></span>
+        <button class="neu-btn secondary" id="playerTranscode">Force Transcode</button>
+        <span class="player-note" id="playerNote"></span>
+      </div>
+    </div>
+  </div>
+
   <div class="modal-backdrop" id="detailModal" hidden>
     <div class="modal detail-modal" role="dialog" aria-modal="true" aria-labelledby="detailTitle">
       <button class="modal-close" id="detailClose" aria-label="Close">&times;</button>
@@ -1759,6 +1824,7 @@ function buildPageHtml(rendererName) {
 
           <div class="modal-actions detail-actions">
             <button class="neu-btn" id="detailPlay">Play</button>
+            <button class="neu-btn secondary" id="detailPlayHere">Play Here</button>
             <button class="neu-btn secondary" id="detailWatched">Watched</button>
             <button class="neu-btn secondary" id="detailEdit">Edit Info</button>
           </div>
@@ -1874,6 +1940,17 @@ function buildPageHtml(rendererName) {
     const detailPlot = document.getElementById('detailPlot');
     const detailFile = document.getElementById('detailFile');
     const detailPlay = document.getElementById('detailPlay');
+    const detailPlayHere = document.getElementById('detailPlayHere');
+    const playerModal = document.getElementById('playerModal');
+    const playerVideo = document.getElementById('playerVideo');
+    const playerTitle = document.getElementById('playerTitle');
+    const playerNote = document.getElementById('playerNote');
+    const playerClose = document.getElementById('playerClose');
+    const playerTranscode = document.getElementById('playerTranscode');
+    let playerItem = null;
+    let playerReportTimer = null;
+    let playerUsedTranscode = false;
+    let playerLastTracks = null;
     const detailWatched = document.getElementById('detailWatched');
     const detailEdit = document.getElementById('detailEdit');
     const detailEditForm = document.getElementById('detailEditForm');
@@ -3394,6 +3471,13 @@ function buildPageHtml(rendererName) {
       detailWatched.textContent = isWatched ? 'Unmark' : 'Watched';
       detailWatched.classList.toggle('watched', isWatched);
 
+      const hasRenderer = availableRenderers.length > 0 && currentRendererName
+        && currentRendererName !== 'Unknown Renderer'
+        && currentRendererName !== 'No renderer selected';
+      detailPlayHere.classList.toggle('secondary', hasRenderer);
+      detailPlay.classList.toggle('secondary', !hasRenderer);
+      detailPlay.title = hasRenderer ? '' : 'No renderer found - use Play Here instead';
+
       trackSection.hidden = true;
       trackNote.textContent = '';
       detailModal.hidden = false;
@@ -3902,6 +3986,162 @@ function buildPageHtml(rendererName) {
       }
     });
 
+    function reportPlayerPosition(finished) {
+      if (!playerItem) {
+        return;
+      }
+
+      const positionSec = Math.floor(playerVideo.currentTime || 0);
+      const durationSec = Number.isFinite(playerVideo.duration) ? Math.floor(playerVideo.duration) : null;
+      if (!finished && positionSec <= 0) {
+        return;
+      }
+
+      fetch('/api/media/position', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: playerItem.id,
+          positionSec,
+          durationSec,
+          finished: Boolean(finished),
+        }),
+      }).catch(() => {});
+    }
+
+    function setPlayerSource(item, tracks, useTranscode) {
+      playerUsedTranscode = Boolean(useTranscode);
+      const baseUrl = tracks && tracks.mediaUrl ? tracks.mediaUrl : null;
+      if (!baseUrl) {
+        playerNote.textContent = 'This item has no reachable stream URL.';
+        playerNote.classList.add('warn');
+        return;
+      }
+
+      while (playerVideo.firstChild) {
+        playerVideo.removeChild(playerVideo.firstChild);
+      }
+
+      playerVideo.src = useTranscode
+        ? baseUrl + (baseUrl.indexOf('?') >= 0 ? '&' : '?') + 'transcode=1'
+        : baseUrl;
+
+      if (tracks && tracks.subtitleUrl) {
+        const track = document.createElement('track');
+        track.kind = 'subtitles';
+        track.label = 'Subtitles';
+        track.srclang = 'en';
+        track.src = tracks.subtitleUrl;
+        track.default = true;
+        playerVideo.appendChild(track);
+      }
+
+      playerNote.classList.toggle('warn', Boolean(useTranscode));
+      playerNote.textContent = useTranscode
+        ? 'Transcoding live for the browser. Seeking is unavailable while transcoding.'
+        : 'Playing the original file. If it stays black or silent, use Force Transcode.';
+
+      playerVideo.load();
+
+      const resumeInfo = getResumeInfo(item);
+      const startAt = resumeInfo ? resumeInfo.positionSec : 0;
+      if (startAt > 0 && !useTranscode) {
+        playerVideo.addEventListener('loadedmetadata', () => {
+          try {
+            playerVideo.currentTime = startAt;
+          } catch (error) {
+            // Some streams refuse an initial seek; starting at zero is fine.
+          }
+        }, { once: true });
+      }
+
+      playerVideo.play().catch(() => {
+        // Autoplay can be blocked; the controls are right there.
+      });
+    }
+
+    async function openLocalPlayer(item) {
+      playerItem = item;
+      playerTitle.textContent = item.movieTitle || item.name;
+      playerNote.textContent = 'Loading...';
+      playerNote.classList.remove('warn');
+      playerModal.hidden = false;
+
+      let tracks = detailTracks;
+      if (!tracks || !tracks.mediaUrl) {
+        try {
+          const response = await fetch('/api/media/tracks?id=' + encodeURIComponent(item.id));
+          tracks = await response.json();
+        } catch (error) {
+          tracks = null;
+        }
+      }
+
+      playerLastTracks = tracks;
+      setPlayerSource(item, tracks, false);
+
+      if (playerReportTimer) {
+        clearInterval(playerReportTimer);
+      }
+      playerReportTimer = setInterval(() => {
+        if (!playerVideo.paused) {
+          reportPlayerPosition(false);
+        }
+      }, 10000);
+    }
+
+    function closeLocalPlayer() {
+      reportPlayerPosition(false);
+      if (playerReportTimer) {
+        clearInterval(playerReportTimer);
+        playerReportTimer = null;
+      }
+      playerVideo.pause();
+      playerVideo.removeAttribute('src');
+      playerVideo.load();
+      playerModal.hidden = true;
+      playerItem = null;
+      loadLibrary(false, { silent: true });
+    }
+
+    playerClose.addEventListener('click', closeLocalPlayer);
+
+    playerModal.addEventListener('click', (event) => {
+      if (event.target === playerModal) {
+        closeLocalPlayer();
+      }
+    });
+
+    playerTranscode.addEventListener('click', () => {
+      if (playerItem) {
+        setPlayerSource(playerItem, playerLastTracks, true);
+      }
+    });
+
+    playerVideo.addEventListener('pause', () => reportPlayerPosition(false));
+    playerVideo.addEventListener('ended', () => reportPlayerPosition(true));
+
+    // A codec the browser cannot decode fails here; retry once through FFmpeg.
+    playerVideo.addEventListener('error', () => {
+      if (!playerItem || playerUsedTranscode) {
+        playerNote.textContent = 'This file could not be played in the browser.';
+        playerNote.classList.add('warn');
+        return;
+      }
+      playerNote.textContent = 'The browser cannot decode this file directly. Transcoding...';
+      playerNote.classList.add('warn');
+      setPlayerSource(playerItem, playerLastTracks, true);
+    });
+
+    detailPlayHere.addEventListener('click', () => {
+      const item = detailItem;
+      if (!item) {
+        return;
+      }
+      closeDetailModal();
+      openLocalPlayer(item);
+    });
+
     function renderCategoryChoices() {
       categoryChoices.innerHTML = '';
 
@@ -4089,7 +4329,9 @@ function buildPageHtml(rendererName) {
       if (event.key !== 'Escape') {
         return;
       }
-      if (!detailModal.hidden) {
+      if (!playerModal.hidden) {
+        closeLocalPlayer();
+      } else if (!detailModal.hidden) {
         closeDetailModal();
       } else if (!folderModal.hidden) {
         closeFolderModal();
@@ -4367,6 +4609,8 @@ function createCastUiServer({
   onCategoriesChanged,
   initialMediaOverrides = {},
   onMediaOverridesChanged,
+  initialMetadataCache = {},
+  onMetadataCacheChanged,
   coversDir,
   subtitlesDir,
   allowLanAccess = false,
@@ -5425,9 +5669,60 @@ function createCastUiServer({
       };
     });
 
+  // Keyed by file path, not media id: ids are positional and shift on every
+  // rescan, whereas paths let a cached lookup survive restarts.
   const metadataMap = new Map();
   const metadataPending = new Map();
   let metadataVersion = 0;
+  let metadataSaveTimer = null;
+
+  const metaKey = (item) => normalizeFolderKey(item && item.filePath ? item.filePath : '');
+
+  // A result with no identifiers is a placeholder; retry those occasionally in
+  // case the title later becomes available, but keep real results forever.
+  const UNRESOLVED_RETRY_MS = 7 * 24 * 60 * 60 * 1000;
+
+  const isResolvedMetadata = (entry) => Boolean(
+    entry && (entry.tmdbId || entry.imdbId || entry.plot || entry.imdbRating || entry.year),
+  );
+
+  for (const [key, value] of Object.entries(
+    initialMetadataCache && typeof initialMetadataCache === 'object' ? initialMetadataCache : {},
+  )) {
+    const cacheKey = String(key || '').trim();
+    if (!cacheKey || !value || typeof value !== 'object') {
+      continue;
+    }
+
+    if (!isResolvedMetadata(value)) {
+      const fetchedAt = Date.parse(value.fetchedAt || '');
+      if (!Number.isFinite(fetchedAt) || (Date.now() - fetchedAt) > UNRESOLVED_RETRY_MS) {
+        continue;
+      }
+    }
+
+    metadataMap.set(cacheKey, value);
+  }
+
+  // Batched so a burst of lookups results in one write, not hundreds.
+  const scheduleMetadataSave = () => {
+    if (typeof onMetadataCacheChanged !== 'function' || metadataSaveTimer) {
+      return;
+    }
+
+    metadataSaveTimer = setTimeout(() => {
+      metadataSaveTimer = null;
+      try {
+        onMetadataCacheChanged(Object.fromEntries(metadataMap.entries()));
+      } catch (error) {
+        console.warn('[Metadata] Could not save the metadata cache: ' + error.message);
+      }
+    }, 2500);
+
+    if (typeof metadataSaveTimer.unref === 'function') {
+      metadataSaveTimer.unref();
+    }
+  };
   const MAX_METADATA_CONCURRENCY = 4;
   const metadataQueue = [];
   let metadataInFlight = 0;
@@ -5493,7 +5788,8 @@ function createCastUiServer({
   };
 
   const queueMetadataFetch = (item, local) => {
-    if (metadataMap.has(item.id) || metadataPending.has(item.id)) {
+    const cacheKey = metaKey(item);
+    if (!cacheKey || metadataMap.has(cacheKey) || metadataPending.has(cacheKey)) {
       return;
     }
 
@@ -5501,7 +5797,7 @@ function createCastUiServer({
     const pendingPromise = new Promise((resolve) => {
       resolvePending = resolve;
     });
-    metadataPending.set(item.id, pendingPromise);
+    metadataPending.set(cacheKey, pendingPromise);
 
     metadataQueue.push(async () => {
       try {
@@ -5544,7 +5840,8 @@ function createCastUiServer({
           : ((metadata && metadata.imdbRating) ? (metadata.ratingSource || null) : null);
         const episodeYear = (episodeMetadata && episodeMetadata.year) || (metadata && metadata.year) || null;
 
-        metadataMap.set(item.id, {
+        metadataMap.set(cacheKey, {
+          fetchedAt: new Date().toISOString(),
           movieTitle: episodeTitle,
           showName: local.showName,
           showDisplayTitle: local.isShowCategory ? ((metadata && metadata.title) || local.showName) : null,
@@ -5565,10 +5862,11 @@ function createCastUiServer({
           ratingSource: episodeRatingSource,
         });
         metadataVersion += 1;
+        scheduleMetadataSave();
       } catch {
         // Ignore metadata fetch failures.
       } finally {
-        metadataPending.delete(item.id);
+        metadataPending.delete(cacheKey);
         if (resolvePending) {
           resolvePending();
         }
@@ -5604,10 +5902,11 @@ function createCastUiServer({
     const result = [];
 
     for (const item of items) {
-      if (metadataMap.has(item.id)) {
+      const cacheKey = metaKey(item);
+      if (metadataMap.has(cacheKey)) {
         result.push(withOverride(item, {
           ...item,
-          ...metadataMap.get(item.id),
+          ...metadataMap.get(cacheKey),
         }));
       } else {
         const local = buildLocalMetadata(item);
@@ -5827,7 +6126,6 @@ function createCastUiServer({
       try {
         if (parsed.searchParams.get('refresh') === '1') {
           await mediaServer.buildLibrary();
-          metadataMap.clear();
           metadataVersion += 1;
         }
         const category = String(parsed.searchParams.get('category') || CATEGORY_MOVIES);
@@ -6178,6 +6476,8 @@ function createCastUiServer({
         sendJson(res, 200, {
           ok: true,
           id: media.id,
+          mediaUrl: mediaServer.getLocalMediaUrl(media.id),
+          subtitleUrl: mediaServer.getLocalSubtitleUrl(media.id),
           audio,
           subtitles,
           hasSidecar: fs.existsSync(sidecarPath),
@@ -6188,6 +6488,38 @@ function createCastUiServer({
         });
       } catch (error) {
         sendJson(res, 500, { ok: false, error: error.message });
+      }
+      return;
+    }
+
+    if (req.method === 'POST' && parsed.pathname === '/api/media/position') {
+      try {
+        const body = await readRequestBody(req);
+        const payload = JSON.parse(body || '{}');
+        const media = mediaServer.getMediaById(String(payload.id || ''));
+
+        if (!media) {
+          sendJson(res, 404, { ok: false, error: 'Media item not found.' });
+          return;
+        }
+
+        const positionSec = Math.max(0, Math.floor(Number(payload.positionSec) || 0));
+        const durationSec = Number(payload.durationSec);
+        const resumeKey = trackingKeyFromMedia(media);
+
+        if (payload.finished === true) {
+          markMediaWatched(media);
+        } else {
+          setResumePosition(
+            resumeKey,
+            positionSec,
+            Number.isFinite(durationSec) && durationSec > 0 ? durationSec : null,
+          );
+        }
+
+        sendJson(res, 200, { ok: true, positionSec });
+      } catch (error) {
+        sendJson(res, 400, { ok: false, error: error.message });
       }
       return;
     }
@@ -6381,7 +6713,6 @@ function createCastUiServer({
         persistCategories();
 
         await mediaServer.buildLibrary();
-        metadataMap.clear();
         metadataVersion += 1;
 
         if (typeof onMediaFoldersChanged === 'function') {

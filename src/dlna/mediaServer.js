@@ -33,6 +33,18 @@ export async function walkMedia(rootDir, list = [], batchSize = 50) {
   return list;
 }
 
+// WebVTT is SubRip with a header and dots instead of commas in timestamps.
+export function srtToVtt(subtitleContent) {
+  const body = String(subtitleContent || '')
+    .replace(/^\uFEFF/, '')
+    .replace(
+      /(\d{2}:\d{2}:\d{2}),(\d{3})\s+-->\s+(\d{2}:\d{2}:\d{2}),(\d{3})/g,
+      '$1.$2 --> $3.$4',
+    );
+
+  return 'WEBVTT' + String.fromCharCode(10) + String.fromCharCode(10) + body;
+}
+
 export function sendNotFound(res) {
   res.statusCode = 404;
   res.end('Not found');
@@ -278,6 +290,32 @@ class MediaServer {
     return `http://${this.host}:${this.port}/media/${encodeURIComponent(id)}/${encodeURIComponent(fileName)}`;
   }
 
+  getLocalMediaUrl(id) {
+    const media = this.getMediaById(id);
+    if (!media) {
+      return null;
+    }
+
+    const host = this.host || '127.0.0.1';
+    const fileName = path.basename(media.filePath);
+    return `http://${host}:${this.port}/media/${encodeURIComponent(id)}/${encodeURIComponent(fileName)}`;
+  }
+
+  getLocalSubtitleUrl(id) {
+    const media = this.getMediaById(id);
+    if (!media) {
+      return null;
+    }
+
+    const subtitlePath = this._subtitlePathForMedia(media);
+    if (!subtitlePath || !fs.existsSync(subtitlePath)) {
+      return null;
+    }
+
+    const host = this.host || '127.0.0.1';
+    return `http://${host}:${this.port}/subtitles/${encodeURIComponent(String(id))}?format=vtt`;
+  }
+
   registerPlaylist(playlistId, lines) {
     const key = String(playlistId || '').trim();
     if (!key) {
@@ -430,6 +468,13 @@ class MediaServer {
   async _handleMediaRequest(req, res, media) {
     console.log(`[HTTP] Request for media: ${media.name}`);
 
+    let forcedByQuery = false;
+    try {
+      forcedByQuery = new URL(req.url, 'http://localhost').searchParams.get('transcode') === '1';
+    } catch {
+      forcedByQuery = false;
+    }
+
     const playbackOptions = this.playbackOptions.get(String(media.id)) || {};
     const audioStreamIndex = Number.isInteger(playbackOptions.audioStreamIndex)
       ? playbackOptions.audioStreamIndex
@@ -442,13 +487,13 @@ class MediaServer {
 
     if (this.transcoding.enabled) {
       try {
-        willTranscode = needsAudioSelection || await shouldTranscode(media.filePath, {
+        willTranscode = forcedByQuery || needsAudioSelection || await shouldTranscode(media.filePath, {
           forceTranscode: this.transcoding.forceTranscode,
           skipTranscode: this.transcoding.skipTranscode,
         });
       } catch (err) {
         console.warn(`[PROBE] Failed to detect transcode: ${err.message}`);
-        willTranscode = needsAudioSelection;
+        willTranscode = forcedByQuery || needsAudioSelection;
       }
     }
 
@@ -677,13 +722,21 @@ class MediaServer {
           sendNotFound(res);
           return;
         }
-        res.setHeader('Content-Type', 'application/x-subrip; charset=utf-8');
-        res.setHeader('Content-Disposition', `inline; filename="${base}.srt"`);
         const subtitleContent = fs.readFileSync(srtPath, 'utf8');
         const subtitleDelayMs = this.subtitles && Number.isFinite(Number(this.subtitles.delayMs))
           ? Number(this.subtitles.delayMs)
           : 0;
         const shiftedContent = this._applySubtitleDelay(subtitleContent, subtitleDelayMs);
+
+        if (parsed.searchParams.get('format') === 'vtt') {
+          res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
+          res.setHeader('Access-Control-Allow-Origin', '*');
+          res.end(srtToVtt(shiftedContent));
+          return;
+        }
+
+        res.setHeader('Content-Type', 'application/x-subrip; charset=utf-8');
+        res.setHeader('Content-Disposition', `inline; filename="${base}.srt"`);
         res.end(shiftedContent);
         return;
       }
