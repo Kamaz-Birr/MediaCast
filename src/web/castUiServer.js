@@ -15,6 +15,7 @@ import {
   getMediaInfo,
 } from '../upnp/soap.js';
 import { discoverRenderers } from '../upnp/discovery.js';
+import { isImageFile } from '../utils/media.js';
 import {
   fetchMovieMetadata,
   fetchSeriesMetadata,
@@ -37,8 +38,6 @@ function isLikelyMovie(media) {
     return false;
   }
 
-  console.log(`[Categorization] Checking if media is a movie: ${media.filePath}`);
-
   if (/\.d\.ts$/i.test(media.filePath)) {
     return false;
   }
@@ -48,10 +47,20 @@ function isLikelyMovie(media) {
   return videoExts.has(ext);
 }
 
+// Anything the grid should show. Episode sequencing still uses isLikelyMovie,
+// since a photo has no "next episode".
+function isLibraryItem(media) {
+  if (!media || !media.filePath) {
+    return false;
+  }
+  return isLikelyMovie(media) || isImageFile(media.filePath);
+}
+
 const CATEGORY_MOVIES = 'movies';
 const CATEGORY_TV_SHOWS = 'tv-shows';
 const CATEGORY_ANIME_MOVIES = 'anime-movies';
 const CATEGORY_ANIME_SHOWS = 'anime-shows';
+const CATEGORY_PHOTOS = 'photos';
 const CATEGORY_KIND_MOVIES = 'movies';
 const CATEGORY_KIND_SHOWS = 'shows';
 const CATEGORY_AUTO = 'auto';
@@ -62,6 +71,7 @@ const BUILT_IN_CATEGORIES = [
   { id: CATEGORY_TV_SHOWS, label: 'TV Shows', kind: CATEGORY_KIND_SHOWS, builtIn: true },
   { id: CATEGORY_ANIME_MOVIES, label: 'Anime Movies', kind: CATEGORY_KIND_MOVIES, builtIn: true },
   { id: CATEGORY_ANIME_SHOWS, label: 'Anime Shows', kind: CATEGORY_KIND_SHOWS, builtIn: true },
+  { id: CATEGORY_PHOTOS, label: 'Photos', kind: CATEGORY_KIND_MOVIES, builtIn: true },
 ];
 
 const COVER_MIME_EXTENSIONS = {
@@ -1005,6 +1015,9 @@ function buildPageHtml(rendererName) {
 
     .detail-poster .placeholder { font-size: 60px; }
 
+    .detail-poster.is-photo { aspect-ratio: 4 / 3; }
+    .detail-poster.is-photo img { object-fit: contain; background: #05080f; }
+
     .detail-info { padding: 26px 26px 22px; min-width: 0; }
 
     .detail-info .modal-title { font-size: 1.55rem; margin-bottom: 8px; }
@@ -1205,6 +1218,68 @@ function buildPageHtml(rendererName) {
     }
 
     .player-note.warn { color: #fcd34d; }
+
+    /* ---------- Photo viewer ---------- */
+
+    .viewer-image {
+      width: 100%;
+      max-height: 74vh;
+      object-fit: contain;
+      display: block;
+      background: #000;
+    }
+
+    .viewer-nav {
+      position: absolute;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 46px;
+      height: 46px;
+      border-radius: 999px;
+      border: 1px solid var(--stroke-hi);
+      background: rgba(6, 11, 22, 0.72);
+      color: #fff;
+      font-size: 20px;
+      line-height: 1;
+      cursor: pointer;
+      backdrop-filter: blur(8px);
+      opacity: 0;
+      transition: opacity 220ms var(--ease-soft), background 200ms var(--ease-soft);
+      z-index: 3;
+    }
+
+    .player-frame:hover .viewer-nav,
+    .viewer-nav:focus-visible { opacity: 1; }
+
+    .viewer-nav:hover { background: rgba(251, 146, 60, 0.35); }
+    .viewer-nav.prev { left: 14px; }
+    .viewer-nav.next { right: 14px; }
+    .viewer-nav[hidden] { display: none; }
+
+    /* Photos in the grid are landscape more often than not. */
+    .movie-card.is-photo { aspect-ratio: 4 / 3; }
+    .movie-card.is-photo .movie-plot { display: none; }
+
+    /* The poster scrim is sized for tall artwork where the lower half is text.
+       On a short photo card it would swallow most of the picture. */
+    .movie-card.is-photo .movie-overlay {
+      background: linear-gradient(
+        to top,
+        rgba(4, 8, 16, 0.9) 0%,
+        rgba(4, 8, 16, 0.55) 22%,
+        transparent 48%
+      );
+    }
+
+    .movie-card.is-photo:hover .movie-overlay {
+      background: linear-gradient(
+        to top,
+        rgba(4, 8, 16, 0.94) 0%,
+        rgba(4, 8, 16, 0.7) 34%,
+        rgba(4, 8, 16, 0.25) 70%,
+        transparent 100%
+      );
+    }
 
     /* ---------- Status bar ---------- */
 
@@ -1782,6 +1857,9 @@ function buildPageHtml(rendererName) {
       <button class="modal-close" id="playerClose" aria-label="Close player">&times;</button>
       <div class="player-frame">
         <video id="playerVideo" controls playsinline preload="metadata"></video>
+        <img id="playerImage" class="viewer-image" alt="" hidden />
+        <button type="button" class="viewer-nav prev" id="viewerPrev" aria-label="Previous photo" hidden>&#8249;</button>
+        <button type="button" class="viewer-nav next" id="viewerNext" aria-label="Next photo" hidden>&#8250;</button>
       </div>
       <div class="player-bar">
         <span class="player-title" id="playerTitle"></span>
@@ -1948,6 +2026,11 @@ function buildPageHtml(rendererName) {
     const playerNote = document.getElementById('playerNote');
     const playerClose = document.getElementById('playerClose');
     const playerTranscode = document.getElementById('playerTranscode');
+    const playerImage = document.getElementById('playerImage');
+    const viewerPrev = document.getElementById('viewerPrev');
+    const viewerNext = document.getElementById('viewerNext');
+    let viewerList = [];
+    let viewerIndex = -1;
     let playerItem = null;
     let playerReportTimer = null;
     let playerUsedTranscode = false;
@@ -2563,7 +2646,9 @@ function buildPageHtml(rendererName) {
     function createMovieCard(item) {
         const card = document.createElement('article');
         card.className = 'movie-card';
-        if (item.seasonNumber !== null && item.seasonNumber !== undefined) {
+        if (item.mediaType === 'image') {
+          card.classList.add('is-photo');
+        } else if (item.seasonNumber !== null && item.seasonNumber !== undefined) {
           card.classList.add('is-episode');
         }
         card.__mediaId = item.id;
@@ -3433,6 +3518,7 @@ function buildPageHtml(rendererName) {
     function openDetailModal(item, card) {
       detailItem = item;
       detailCard = card || null;
+      const itemIsImage = isImageItem(item);
       pendingCoverDataUrl = '';
       detailEditForm.hidden = true;
       detailEdit.textContent = 'Edit Info';
@@ -3460,14 +3546,18 @@ function buildPageHtml(rendererName) {
         detailMeta.appendChild(chip);
       }
 
+      detailPosterWrap.classList.toggle('is-photo', itemIsImage);
+      // A photo has no synopsis to be missing.
+      detailPlot.hidden = itemIsImage && !item.plot;
       detailPlot.textContent = item.plot || 'No synopsis available for this title.';
       detailFile.textContent = item.filePath || item.name;
 
-      const resumeInfo = getResumeInfo(item);
-      detailPlay.textContent = resumeInfo
-        ? 'Resume ' + formatResumeClock(resumeInfo.positionSec)
-        : 'Play';
+      const resumeInfo = itemIsImage ? null : getResumeInfo(item);
+      detailPlay.textContent = itemIsImage
+        ? 'Cast To TV'
+        : (resumeInfo ? 'Resume ' + formatResumeClock(resumeInfo.positionSec) : 'Play');
       detailPlay.classList.toggle('resume', Boolean(resumeInfo));
+      detailPlayHere.textContent = itemIsImage ? 'View' : 'Play Here';
 
       const watchedKey = item.watchedKey || item.filePath || item.id;
       const isWatched = watchedItemIds.has(watchedKey);
@@ -3482,7 +3572,9 @@ function buildPageHtml(rendererName) {
       trackSection.hidden = true;
       trackNote.textContent = '';
       detailModal.hidden = false;
-      loadDetailTracks(item);
+      if (!itemIsImage) {
+        loadDetailTracks(item);
+      }
     }
 
     function addOption(select, value, label) {
@@ -3568,7 +3660,7 @@ function buildPageHtml(rendererName) {
         if (!response.ok || !result.ok) {
           throw new Error(result.error || ('HTTP ' + response.status));
         }
-        if (detailItem && detailItem.id === item.id) {
+        if (detailItem && detailItem.id === item.id && result.mediaType !== 'image') {
           renderTrackOptions(result);
         }
       } catch (error) {
@@ -4061,7 +4153,89 @@ function buildPageHtml(rendererName) {
       });
     }
 
+    function isImageItem(item) {
+      return Boolean(item && item.mediaType === 'image');
+    }
+
+    // Photos step through whatever is currently on screen, in display order.
+    function collectViewerList(item) {
+      const cards = [...document.querySelectorAll('.movie-card')];
+      const items = cards
+        .map((card) => card.__item)
+        .filter((candidate) => candidate && isImageItem(candidate));
+
+      viewerList = items.length ? items : [item];
+      viewerIndex = Math.max(0, viewerList.findIndex((candidate) => candidate.id === item.id));
+    }
+
+    function showViewerImage(item) {
+      playerItem = item;
+      playerTitle.textContent = item.movieTitle || item.name;
+      playerImage.alt = item.movieTitle || item.name;
+
+      // The grid shows a thumbnail; the viewer should show the original.
+      fetch('/api/media/tracks?id=' + encodeURIComponent(item.id))
+        .then((response) => response.json())
+        .then((tracks) => {
+          if (playerItem && playerItem.id === item.id) {
+            playerImage.src = (tracks && tracks.mediaUrl) || item.posterUrl || '';
+          }
+        })
+        .catch(() => {
+          playerImage.src = item.posterUrl || '';
+        });
+
+      const hasSiblings = viewerList.length > 1;
+      viewerPrev.hidden = !hasSiblings;
+      viewerNext.hidden = !hasSiblings;
+      playerNote.classList.remove('warn');
+      playerNote.textContent = hasSiblings
+        ? (viewerIndex + 1) + ' of ' + viewerList.length + ' - use the arrows or arrow keys'
+        : 'Viewing the original image.';
+    }
+
+    function stepViewer(delta) {
+      if (viewerList.length < 2) {
+        return;
+      }
+      viewerIndex = (viewerIndex + delta + viewerList.length) % viewerList.length;
+      showViewerImage(viewerList[viewerIndex]);
+    }
+
+    function openImageViewer(item) {
+      playerVideo.hidden = true;
+      playerVideo.removeAttribute('src');
+      playerImage.hidden = false;
+      playerTranscode.hidden = true;
+
+      collectViewerList(item);
+      playerModal.hidden = false;
+      showViewerImage(item);
+    }
+
+    viewerPrev.addEventListener('click', () => stepViewer(-1));
+    viewerNext.addEventListener('click', () => stepViewer(1));
+
+    document.addEventListener('keydown', (event) => {
+      if (playerModal.hidden || playerImage.hidden) {
+        return;
+      }
+      if (event.key === 'ArrowLeft') {
+        event.preventDefault();
+        stepViewer(-1);
+      } else if (event.key === 'ArrowRight') {
+        event.preventDefault();
+        stepViewer(1);
+      }
+    });
+
     async function openLocalPlayer(item) {
+      playerVideo.hidden = false;
+      playerImage.hidden = true;
+      playerImage.removeAttribute('src');
+      playerTranscode.hidden = false;
+      viewerPrev.hidden = true;
+      viewerNext.hidden = true;
       playerItem = item;
       playerTitle.textContent = item.movieTitle || item.name;
       playerNote.textContent = 'Loading...';
@@ -4092,6 +4266,16 @@ function buildPageHtml(rendererName) {
     }
 
     function closeLocalPlayer() {
+      if (!playerImage.hidden) {
+        playerImage.hidden = true;
+        playerImage.removeAttribute('src');
+        playerModal.hidden = true;
+        playerItem = null;
+        viewerList = [];
+        viewerIndex = -1;
+        return;
+      }
+
       reportPlayerPosition(false);
       if (playerReportTimer) {
         clearInterval(playerReportTimer);
@@ -4140,7 +4324,11 @@ function buildPageHtml(rendererName) {
         return;
       }
       closeDetailModal();
-      openLocalPlayer(item);
+      if (isImageItem(item)) {
+        openImageViewer(item);
+      } else {
+        openLocalPlayer(item);
+      }
     });
 
     function renderCategoryChoices() {
@@ -4538,7 +4726,9 @@ async function castMediaItem(renderer, mediaServer, media, options = {}) {
     }
   }
 
-  if (effectivePlaylistContext && Number.isFinite(Number(effectivePlaylistContext.selectedTrackNumber))) {
+  if (options.isImage) {
+    await play(renderer);
+  } else if (effectivePlaylistContext && Number.isFinite(Number(effectivePlaylistContext.selectedTrackNumber))) {
     await play(renderer);
     await new Promise((resolve) => setTimeout(resolve, 600));
     try {
@@ -4957,6 +5147,10 @@ function createCastUiServer({
     const assigned = assignedRootFor(filePath);
     if (assigned && findCategory(assigned.categoryId)) {
       return assigned.categoryId;
+    }
+    // Without an explicit pin, photos would otherwise all fall through to Movies.
+    if (isImageFile(filePath)) {
+      return CATEGORY_PHOTOS;
     }
     return categoryFromPath(filePath);
   };
@@ -5646,7 +5840,7 @@ function createCastUiServer({
   };
 
   const getMovieItems = () => mediaServer.library
-    .filter(isLikelyMovie)
+    .filter(isLibraryItem)
     .map((item) => {
       let size = null;
       let addedAtMs = null;
@@ -5743,6 +5937,52 @@ function createCastUiServer({
   };
 
   const buildLocalMetadata = (item) => {
+    if (isImageFile(item.filePath)) {
+      const displayName = safeBasename(
+        path.basename(item.name, path.extname(item.name)).replace(/[._]+/g, ' ').trim(),
+      );
+      let thumbUrl = null;
+      try {
+        thumbUrl = typeof mediaServer.getLocalThumbUrl === 'function'
+          ? mediaServer.getLocalThumbUrl(item.id)
+          : null;
+      } catch {
+        thumbUrl = null;
+      }
+
+      return {
+        category: resolveCategory(item.filePath),
+        showName: null,
+        seasonInfo: null,
+        fallbackSeriesTitle: '',
+        searchTitle: displayName,
+        isShowCategory: false,
+        isImage: true,
+        displayTitle: displayName,
+        enriched: {
+          movieTitle: displayName,
+          mediaType: 'image',
+          showName: null,
+          showDisplayTitle: null,
+          showPosterUrl: null,
+          showPlot: null,
+          showImdbRating: null,
+          showRatingSource: null,
+          showYear: null,
+          seasonLabel: null,
+          seasonNumber: null,
+          episodeNumber: null,
+          seasonSort: null,
+          episodeSort: null,
+          posterUrl: thumbUrl,
+          year: null,
+          plot: null,
+          imdbRating: null,
+          ratingSource: null,
+        },
+      };
+    }
+
     const category = resolveCategory(item.filePath);
     const categoryIsShows = isShowsCategory(category);
     const showName = categoryIsShows ? seriesNameFor(item.filePath, category) : null;
@@ -5765,8 +6005,10 @@ function createCastUiServer({
       searchTitle,
       isShowCategory,
       displayTitle,
+      isImage: false,
       enriched: {
         movieTitle: displayTitle,
+        mediaType: 'video',
         showName,
         showDisplayTitle: isShowCategory ? (showName || displayTitle) : null,
         showPosterUrl: null,
@@ -5789,6 +6031,10 @@ function createCastUiServer({
   };
 
   const queueMetadataFetch = (item, local) => {
+    if (local && local.isImage) {
+      return;
+    }
+
     const cacheKey = metaKey(item);
     if (!cacheKey || metadataMap.has(cacheKey) || metadataPending.has(cacheKey)) {
       return;
@@ -6240,14 +6486,19 @@ function createCastUiServer({
         const playlistContext = null;
 
         // Audio choice is applied when the stream is built for this item.
+        const mediaIsImage = isImageFile(media.filePath);
         const audioStreamIndex = Number(payload.audioStreamIndex);
         mediaServer.setPlaybackOptions(media.id, {
-          audioStreamIndex: Number.isInteger(audioStreamIndex) ? audioStreamIndex : null,
+          audioStreamIndex: (!mediaIsImage && Number.isInteger(audioStreamIndex))
+            ? audioStreamIndex
+            : null,
         });
 
         const subtitleMode = String(payload.subtitleMode || '').trim();
         let subtitleUrl;
-        if (subtitleMode === 'off') {
+        if (mediaIsImage) {
+          subtitleUrl = null;
+        } else if (subtitleMode === 'off') {
           subtitleUrl = null;
         } else if (subtitleMode) {
           subtitleUrl = await mediaServer.getSubtitleUrl(media.id, {
@@ -6256,9 +6507,10 @@ function createCastUiServer({
         }
 
         const result = await castMediaItem(selectedRenderer, mediaServer, media, {
-          startSeconds,
+          startSeconds: mediaIsImage ? 0 : startSeconds,
           playlistContext,
           subtitleUrl,
+          isImage: mediaIsImage,
         });
         const playlistModeUsed = Boolean(result && result.playlistModeUsed);
         const selectedKey = rendererKey(selectedRenderer);
@@ -6273,11 +6525,15 @@ function createCastUiServer({
           autoAdvanceInProgress: false,
           playlistMode: playlistModeUsed,
         });
-        if (!playlistModeUsed) {
-          await configureRendererNextEpisode(selectedRenderer, media).catch(() => {});
+        if (!mediaIsImage) {
+          if (!playlistModeUsed) {
+            await configureRendererNextEpisode(selectedRenderer, media).catch(() => {});
+          }
+          startPlaybackProgressPolling();
+          pollAllActivePlaybackPositions().catch(() => {});
+        } else {
+          activePlaybacks.delete(selectedKey);
         }
-        startPlaybackProgressPolling();
-        pollAllActivePlaybackPositions().catch(() => {});
 
         sendJson(res, 200, {
           ok: true,
@@ -6449,6 +6705,32 @@ function createCastUiServer({
         let subtitles = [];
         let probeError = null;
 
+        if (isImageFile(media.filePath)) {
+          let imageUrl = null;
+          try {
+            imageUrl = typeof mediaServer.getLocalMediaUrl === 'function'
+              ? mediaServer.getLocalMediaUrl(media.id)
+              : null;
+          } catch {
+            imageUrl = null;
+          }
+
+          sendJson(res, 200, {
+            ok: true,
+            id: media.id,
+            mediaType: 'image',
+            mediaUrl: imageUrl,
+            subtitleUrl: null,
+            audio: [],
+            subtitles: [],
+            hasSidecar: false,
+            hasUserSubtitle: false,
+            canSelectAudio: false,
+            probeError: null,
+          });
+          return;
+        }
+
         try {
           const probe = await probeMediaTracks(media);
           audio = probe.streams
@@ -6490,6 +6772,7 @@ function createCastUiServer({
         sendJson(res, 200, {
           ok: true,
           id: media.id,
+          mediaType: 'video',
           mediaUrl,
           subtitleUrl: localSubtitleUrl,
           audio,

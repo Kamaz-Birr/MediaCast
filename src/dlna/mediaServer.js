@@ -2,9 +2,17 @@ import http from 'http';
 import fs from 'fs';
 import path from 'path';
 import zlib from 'zlib';
+import crypto from 'crypto';
+import { spawn } from 'child_process';
 import axios from 'axios';
 import { getLocalIPv4 } from '../utils/network.js';
-import { getMimeType, isSupportedMediaFile, getDlnaProtocolInfo, getDlnaContentFeatures } from '../utils/media.js';
+import {
+  getMimeType,
+  isSupportedMediaFile,
+  getDlnaProtocolInfo,
+  getDlnaContentFeatures,
+  isImageFile,
+} from '../utils/media.js';
 import { shouldTranscode } from '../transcoding/detector.js';
 import { FFmpegTranscoder } from '../transcoding/transcoder.js';
 
@@ -70,7 +78,16 @@ export function normalizeRootDirectories({ rootDir, rootDirs }) {
 }
 
 class MediaServer {
-  constructor({ rootDir, rootDirs, port = 0, host, transcoding = {}, libraryCache, subtitles = {} }) {
+  constructor({
+    rootDir,
+    rootDirs,
+    port = 0,
+    host,
+    transcoding = {},
+    libraryCache,
+    subtitles = {},
+    thumbnailsDir,
+  }) {
     this.rootDirs = normalizeRootDirectories({ rootDir, rootDirs });
     // Allow starting with no directories — user can add one via the web UI
 
@@ -98,6 +115,8 @@ class MediaServer {
       delayMs: Number.isFinite(Number(subtitles.delayMs)) ? Number(subtitles.delayMs) : 0,
     };
     this.playlists = new Map();
+    this.thumbnailsDir = thumbnailsDir ? path.resolve(thumbnailsDir) : null;
+    this.thumbnailFailures = new Set();
     // Per-item playback choices made in the web UI, consumed on the next request.
     this.subtitleOverrides = new Map();
     this.playbackOptions = new Map();
@@ -288,6 +307,65 @@ class MediaServer {
     const media = this.getMediaById(id);
     const fileName = media ? path.basename(media.filePath) : 'media';
     return `http://${this.host}:${this.port}/media/${encodeURIComponent(id)}/${encodeURIComponent(fileName)}`;
+  }
+
+  _thumbnailPathFor(media) {
+    if (!this.thumbnailsDir) {
+      return null;
+    }
+    const stem = crypto.createHash('sha1')
+      .update(path.resolve(media.filePath).toLowerCase())
+      .digest('hex')
+      .slice(0, 16);
+    return path.join(this.thumbnailsDir, stem + '.jpg');
+  }
+
+  // Photo grids would otherwise pull full-resolution originals for every tile.
+  _ensureThumbnail(media) {
+    return new Promise((resolve, reject) => {
+      const outPath = this._thumbnailPathFor(media);
+      if (!outPath) {
+        reject(new Error('Thumbnail storage is not configured.'));
+        return;
+      }
+
+      if (fs.existsSync(outPath) && fs.statSync(outPath).size > 0) {
+        resolve(outPath);
+        return;
+      }
+
+      fs.mkdirSync(path.dirname(outPath), { recursive: true });
+
+      const proc = spawn('ffmpeg', [
+        '-y', '-hide_banner', '-loglevel', 'error',
+        '-i', media.filePath,
+        '-vf', "scale='min(480,iw)':-2",
+        '-frames:v', '1',
+        '-q:v', '4',
+        outPath,
+      ], { windowsHide: true });
+
+      let stderr = '';
+      proc.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+      proc.on('error', (err) => reject(err));
+      proc.on('close', (code) => {
+        if (code === 0 && fs.existsSync(outPath) && fs.statSync(outPath).size > 0) {
+          resolve(outPath);
+        } else {
+          reject(new Error('Thumbnail generation failed: ' + stderr.slice(0, 200)));
+        }
+      });
+    });
+  }
+
+  getLocalThumbUrl(id) {
+    const media = this.getMediaById(id);
+    if (!media || !isImageFile(media.filePath) || !this.thumbnailsDir) {
+      return null;
+    }
+
+    const host = this.host || '127.0.0.1';
+    return `http://${host}:${this.port}/thumb/${encodeURIComponent(String(id))}`;
   }
 
   getLocalMediaUrl(id) {
@@ -738,6 +816,45 @@ class MediaServer {
         res.setHeader('Content-Type', 'application/x-subrip; charset=utf-8');
         res.setHeader('Content-Disposition', `inline; filename="${base}.srt"`);
         res.end(shiftedContent);
+        return;
+      }
+
+      if (parsed.pathname.startsWith('/thumb/')) {
+        const thumbId = decodeURIComponent(parsed.pathname.replace('/thumb/', '')).split('/')[0];
+        const media = this.getMediaById(thumbId);
+        if (!media || !isImageFile(media.filePath)) {
+          sendNotFound(res);
+          return;
+        }
+
+        // A file ffmpeg could not read once will not read the next time either,
+        // so fall back to the original instead of re-spawning on every tile.
+        const serveOriginal = () => {
+          res.statusCode = 200;
+          res.setHeader('Content-Type', media.mimeType);
+          res.setHeader('Cache-Control', 'public, max-age=86400');
+          fs.createReadStream(media.filePath).pipe(res);
+        };
+
+        if (this.thumbnailFailures.has(String(thumbId))) {
+          serveOriginal();
+          return;
+        }
+
+        this._ensureThumbnail(media)
+          .then((thumbPath) => {
+            res.statusCode = 200;
+            res.setHeader('Content-Type', 'image/jpeg');
+            res.setHeader('Cache-Control', 'public, max-age=86400');
+            fs.createReadStream(thumbPath).pipe(res);
+          })
+          .catch((error) => {
+            console.warn(`[Thumb] ${media.name}: ${error.message}`);
+            this.thumbnailFailures.add(String(thumbId));
+            if (!res.headersSent) {
+              serveOriginal();
+            }
+          });
         return;
       }
 

@@ -23,9 +23,12 @@ export function buildDidlLite({
 
   const protocolInfo = protocolInfoOverride || getDlnaProtocolInfo(filePath);
   const kind = mediaKind(filePath);
-  const upnpClass = upnpClassOverride || (kind === 'audio'
+  const defaultUpnpClass = kind === 'audio'
     ? 'object.item.audioItem.musicTrack'
-    : 'object.item.videoItem.movie');
+    : (kind === 'image'
+      ? 'object.item.imageItem.photo'
+      : 'object.item.videoItem.movie');
+  const upnpClass = upnpClassOverride || defaultUpnpClass;
   const isContainer = String(upnpClass).toLowerCase().startsWith('object.container');
 
   const safeName = escapeXml(title || 'Unknown Media');

@@ -454,6 +454,10 @@ function getSubtitlesDir() {
 
 // Kept out of cast-ui.json: that file is rewritten whenever a resume position
 // moves, and the metadata cache is far too large to rewrite that often.
+function getThumbnailsDir() {
+  return path.join(path.dirname(getCastUiConfigPath()), 'thumbnails');
+}
+
 function getMetadataCachePath() {
   return path.join(path.dirname(getCastUiConfigPath()), 'metadata-cache.json');
 }
@@ -942,6 +946,7 @@ program
           load: () => loadMediaLibraryCache(),
           save: (cachePayload) => saveMediaLibraryCache(cachePayload),
         },
+        thumbnailsDir: getThumbnailsDir(),
         transcoding: {
           enabled: options.transcode,
           forceTranscode: options.forceTranscode,

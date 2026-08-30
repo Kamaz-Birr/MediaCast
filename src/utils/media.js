@@ -1,22 +1,50 @@
 import path from 'path';
 import mime from 'mime-types';
 
+const VIDEO_EXTENSIONS = ['.mp4', '.mkv', '.avi', '.mov', '.m4v', '.ts'];
+const AUDIO_EXTENSIONS = ['.mp3', '.aac', '.m4a', '.wav', '.flac'];
+const IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'];
+
 const SUPPORTED_EXTENSIONS = [
-  '.mp4',
-  '.mkv',
-  '.avi',
-  '.mp3',
-  '.aac',
-  '.m4a',
-  '.mov',
-  '.wav',
-  '.flac',
-  '.m4v',
-  '.ts',
+  ...VIDEO_EXTENSIONS,
+  ...AUDIO_EXTENSIONS,
+  ...IMAGE_EXTENSIONS,
 ];
+
+// Artwork that sits beside a video is not a library item in its own right.
+const ARTWORK_BASENAMES = new Set([
+  'folder', 'poster', 'cover', 'fanart', 'banner', 'thumb', 'thumbnail',
+  'backdrop', 'landscape', 'clearart', 'disc', 'logo', 'season-all-poster',
+]);
+
+export function isArtworkImage(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  if (!IMAGE_EXTENSIONS.includes(ext)) {
+    return false;
+  }
+
+  const base = path.basename(filePath, ext).toLowerCase().trim();
+  if (ARTWORK_BASENAMES.has(base)) {
+    return true;
+  }
+
+  // Kodi/Plex style companions such as "Movie Name-poster.jpg".
+  return /-(poster|fanart|banner|thumb|backdrop|landscape|clearart|logo|disc)$/.test(base);
+}
+
+export function isImageFile(filePath) {
+  return IMAGE_EXTENSIONS.includes(path.extname(filePath).toLowerCase());
+}
+
+export function isVideoFile(filePath) {
+  return VIDEO_EXTENSIONS.includes(path.extname(filePath).toLowerCase());
+}
 
 export function isSupportedMediaFile(filePath) {
   if (/\.d\.ts$/i.test(filePath)) {
+    return false;
+  }
+  if (isArtworkImage(filePath)) {
     return false;
   }
   const ext = path.extname(filePath).toLowerCase();
@@ -51,6 +79,20 @@ export function getDlnaContentFeatures(filePath) {
   if (ext === '.ts') {
     return `DLNA.ORG_PN=AVC_TS_MP_HD_AAC_MULT5;${flags}`;
   }
+
+  // Photos are shown, not streamed: renderers expect the interactive flag and
+  // no seek operations.
+  const imageFlags = 'DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=00900000000000000000000000000000';
+  if (ext === '.jpg' || ext === '.jpeg') {
+    return `DLNA.ORG_PN=JPEG_LRG;${imageFlags}`;
+  }
+  if (ext === '.png') {
+    return `DLNA.ORG_PN=PNG_LRG;${imageFlags}`;
+  }
+  if (ext === '.gif' || ext === '.webp' || ext === '.bmp') {
+    return imageFlags;
+  }
+
   return flags;
 }
 
@@ -68,12 +110,16 @@ export function mediaKind(filePath) {
   if (mimeType.startsWith('video/')) {
     return 'video';
   }
+  if (mimeType.startsWith('image/')) {
+    return 'image';
+  }
   return 'other';
 }
 
 export function printSupportedFormats() {
   return {
     containers: ['MP4', 'MKV', 'AVI', 'MOV', 'M4V', 'TS'],
+    images: ['JPEG', 'PNG', 'GIF', 'WEBP', 'BMP'],
     audio: ['MP3', 'AAC', 'M4A', 'WAV', 'FLAC', 'AC3 (renderer dependent passthrough)'],
     videoCodecs: [
       'H.264/AVC (widely supported)',
