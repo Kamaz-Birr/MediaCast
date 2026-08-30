@@ -1896,6 +1896,7 @@ function buildPageHtml(rendererName) {
     let selectedShowName = null;
     let expandedSeasonName = null;
     let currentRendererName = '${rendererName}';
+    let rendererCount = 0;
     let lastSeenAutoAdvanceAt = '';
     let activeSessions = [];
     const watchedItemIds = new Set();
@@ -2167,6 +2168,8 @@ function buildPageHtml(rendererName) {
 
         const renderers = Array.isArray(result.renderers) ? result.renderers : [];
         rendererDropdownMenu.innerHTML = '';
+
+        rendererCount = renderers.length;
 
         if (!renderers.length) {
           const emptyItem = document.createElement('li');
@@ -3471,9 +3474,7 @@ function buildPageHtml(rendererName) {
       detailWatched.textContent = isWatched ? 'Unmark' : 'Watched';
       detailWatched.classList.toggle('watched', isWatched);
 
-      const hasRenderer = availableRenderers.length > 0 && currentRendererName
-        && currentRendererName !== 'Unknown Renderer'
-        && currentRendererName !== 'No renderer selected';
+      const hasRenderer = rendererCount > 0;
       detailPlayHere.classList.toggle('secondary', hasRenderer);
       detailPlay.classList.toggle('secondary', !hasRenderer);
       detailPlay.title = hasRenderer ? '' : 'No renderer found - use Play Here instead';
@@ -6473,11 +6474,24 @@ function createCastUiServer({
           probeError = error.message;
         }
 
+        let mediaUrl = null;
+        let localSubtitleUrl = null;
+        try {
+          if (typeof mediaServer.getLocalMediaUrl === 'function') {
+            mediaUrl = mediaServer.getLocalMediaUrl(media.id);
+          }
+          if (typeof mediaServer.getLocalSubtitleUrl === 'function') {
+            localSubtitleUrl = mediaServer.getLocalSubtitleUrl(media.id);
+          }
+        } catch (error) {
+          console.warn('[CastUI] Could not build a local stream URL: ' + error.message);
+        }
+
         sendJson(res, 200, {
           ok: true,
           id: media.id,
-          mediaUrl: mediaServer.getLocalMediaUrl(media.id),
-          subtitleUrl: mediaServer.getLocalSubtitleUrl(media.id),
+          mediaUrl,
+          subtitleUrl: localSubtitleUrl,
           audio,
           subtitles,
           hasSidecar: fs.existsSync(sidecarPath),
