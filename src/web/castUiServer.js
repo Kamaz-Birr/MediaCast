@@ -15,8 +15,9 @@ import {
   getMediaInfo,
 } from '../upnp/soap.js';
 import { discoverRenderers } from '../upnp/discovery.js';
-import { isImageFile, isComicFile } from '../utils/media.js';
+import { isImageFile, isComicFile, isComicArchiveFile } from '../utils/media.js';
 import { listComicPages, readComicPage, comicArchiveKind } from '../comics/archive.js';
+import { collectComicBooks, buildComicGroups } from '../comics/library.js';
 import {
   fetchMovieMetadata,
   fetchSeriesMetadata,
@@ -74,7 +75,7 @@ const BUILT_IN_CATEGORIES = [
   { id: CATEGORY_ANIME_MOVIES, label: 'Anime Movies', kind: CATEGORY_KIND_MOVIES, builtIn: true },
   { id: CATEGORY_ANIME_SHOWS, label: 'Anime Shows', kind: CATEGORY_KIND_SHOWS, builtIn: true },
   { id: CATEGORY_PHOTOS, label: 'Photos', kind: CATEGORY_KIND_MOVIES, builtIn: true },
-  { id: CATEGORY_COMICS, label: 'Comics', kind: CATEGORY_KIND_MOVIES, builtIn: true },
+  { id: CATEGORY_COMICS, label: 'Comics', kind: CATEGORY_KIND_SHOWS, builtIn: true },
 ];
 
 const COVER_MIME_EXTENSIONS = {
@@ -2212,6 +2213,18 @@ function buildPageHtml(rendererName) {
       }
     }
 
+    function plural(count, word) {
+      return count + ' ' + word + (count === 1 ? '' : 's');
+    }
+
+    // Comics reuse the show grouping, so the wording has to follow the category.
+    function categoryNouns(category) {
+      if (category === 'comics') {
+        return { group: 'comic', groupPlural: 'comics', item: 'book', section: 'Books', volume: 'volume' };
+      }
+      return { group: 'show', groupPlural: 'shows', item: 'episode', section: 'Episodes', volume: 'season' };
+    }
+
     function isShowCategory(category) {
       const kind = CATEGORY_KINDS[category];
       if (kind) {
@@ -2960,7 +2973,7 @@ function buildPageHtml(rendererName) {
           || 'IMDb';
         metaParts.push(ratingLabel + ' ' + (group.imdbRating || representative.imdbRating) + '/10');
       }
-      metaParts.push(getGroupEpisodeCount(group) + ' episodes');
+      metaParts.push(plural(getGroupEpisodeCount(group), categoryNouns(currentCategory).item));
       meta.textContent = metaParts.join(' • ');
 
       const plot = document.createElement('p');
@@ -2991,6 +3004,7 @@ function buildPageHtml(rendererName) {
       card.__patch = (nextGroup) => {
         group = nextGroup;
         const nextRep = getGroupRepresentative(nextGroup);
+        const nouns = categoryNouns(currentCategory);
         title.textContent = nextGroup.displayTitle || nextGroup.name;
 
         const nextParts = [];
@@ -3001,7 +3015,7 @@ function buildPageHtml(rendererName) {
           const label = nextGroup.ratingSource || (nextRep && nextRep.ratingSource) || 'IMDb';
           nextParts.push(label + ' ' + (nextGroup.imdbRating || nextRep.imdbRating) + '/10');
         }
-        nextParts.push(getGroupEpisodeCount(nextGroup) + ' episodes');
+        nextParts.push(plural(getGroupEpisodeCount(nextGroup), nouns.item));
         meta.textContent = nextParts.join(' • ');
 
         plot.textContent = nextGroup.plot
@@ -3034,7 +3048,7 @@ function buildPageHtml(rendererName) {
 
       const meta = document.createElement('div');
       meta.className = 'movie-meta';
-      meta.textContent = ((season.items || []).length) + ' episodes';
+      meta.textContent = plural((season.items || []).length, categoryNouns(currentCategory).item);
 
       const plot = document.createElement('p');
       plot.className = 'movie-plot';
@@ -3065,7 +3079,7 @@ function buildPageHtml(rendererName) {
         season = nextSeason;
         const nextRep = getSeasonRepresentative(nextSeason);
         title.textContent = nextSeason.name;
-        meta.textContent = ((nextSeason.items || []).length) + ' episodes';
+        meta.textContent = plural((nextSeason.items || []).length, categoryNouns(currentCategory).item);
         syncCardPoster(card, nextRep && nextRep.posterUrl, nextSeason.name);
       };
 
@@ -3178,9 +3192,10 @@ function buildPageHtml(rendererName) {
         const episodesOk = episodes.length === 0
           || patchCards(grid, episodes, '[data-role="episodes"] > .movie-card');
         if (seasonsOk && episodesOk) {
+          const patchedNouns = categoryNouns(currentCategory);
           const patchedCount = getGroupEpisodeCount(selected);
-          setStatus('Viewing ' + selected.name + ' • ' + seasons.length
-            + ' season(s) • ' + patchedCount + ' episode(s).');
+          setStatus('Viewing ' + selected.name + ' • ' + plural(seasons.length, patchedNouns.volume)
+            + ' • ' + plural(patchedCount, patchedNouns.item) + '.');
           return;
         }
       }
@@ -3209,7 +3224,7 @@ function buildPageHtml(rendererName) {
 
         const episodesTitle = document.createElement('h3');
         episodesTitle.className = 'episodes-title';
-        episodesTitle.textContent = expandedSeason.name + ' Episodes';
+        episodesTitle.textContent = expandedSeason.name + ' ' + categoryNouns(currentCategory).section;
 
         const episodesGrid = document.createElement('div');
         episodesGrid.className = 'group-grid';
@@ -3226,9 +3241,11 @@ function buildPageHtml(rendererName) {
       grid.appendChild(section);
       applyStagger(section);
       grid.__signature = signature;
+      const nouns = categoryNouns(currentCategory);
       const seasonCount = seasons.length;
       const episodeCount = getGroupEpisodeCount(selected);
-      setStatus('Viewing ' + selected.name + ' • ' + seasonCount + ' season(s) • ' + episodeCount + ' episode(s).');
+      setStatus('Viewing ' + selected.name + ' • ' + plural(seasonCount, nouns.volume)
+        + ' • ' + plural(episodeCount, nouns.item) + '.');
     }
 
     function countGroupedItems(groups) {
@@ -3328,7 +3345,8 @@ function buildPageHtml(rendererName) {
             const categoryName = CATEGORY_LABELS[currentCategory] || 'Titles';
             const sortLabel = currentSort === 'recent' ? 'Recently Added' : 'Alphabetical';
             if (isShowCategory(currentCategory)) {
-              setStatus('Showing ' + (result.groups || []).length + ' show(s) in ' + categoryName + ' (' + sortLabel + ').');
+              setStatus('Showing ' + plural((result.groups || []).length, categoryNouns(currentCategory).group)
+                + ' in ' + categoryName + ' (' + sortLabel + ').');
             } else {
               setStatus('Showing ' + total + ' item(s) in ' + categoryName + ' (' + sortLabel + ').');
             }
@@ -3578,7 +3596,8 @@ function buildPageHtml(rendererName) {
       expandedSeasonName = null;
       renderGroupedItems(currentGroupedData, false, currentCategory);
       const categoryName = CATEGORY_LABELS[currentCategory] || 'Shows';
-      setStatus('Back to ' + categoryName + '. Showing ' + currentGroupedData.length + ' show(s).');
+      setStatus('Back to ' + categoryName + '. Showing '
+        + plural(currentGroupedData.length, categoryNouns(currentCategory).group) + '.');
       setBackButton(false);
     });
 
@@ -5127,33 +5146,105 @@ function createCastUiServer({
 
   const probeCache = new Map();
   const comicPageCache = new Map();
+  let comicIndex = null;
+  let comicIndexSignature = '';
+
+  const bookId = (book) => 'cb-' + crypto.createHash('sha1')
+    .update(normalizeFolderKey(book.path))
+    .digest('hex')
+    .slice(0, 16);
+
+  // Rebuilt only when the library actually changes; scanning 6000 files takes
+  // about 100ms, which is too much to repeat per request.
+  const getComicIndex = () => {
+    const library = mediaServer.library || [];
+    const signature = librarySignature();
+
+    if (comicIndex && comicIndexSignature === signature) {
+      return comicIndex;
+    }
+
+    const comicItems = library.filter((item) => (
+      isComicArchiveFile(item.filePath)
+      || (isImageFile(item.filePath) && resolveCategory(item.filePath) === CATEGORY_COMICS)
+      || isImageFile(item.filePath)
+    ));
+
+    const { books, pageImagePaths } = collectComicBooks(comicItems);
+    const groups = buildComicGroups({ books, rootDirs: mediaServer.getRootDirs() });
+
+    const byId = new Map();
+    for (const book of books) {
+      book.id = bookId(book);
+      try {
+        const stat = fs.statSync(book.path);
+        book.size = stat.isDirectory() ? null : stat.size;
+        book.addedAtMs = Number.isFinite(stat.mtimeMs) ? stat.mtimeMs : null;
+      } catch {
+        book.size = null;
+        book.addedAtMs = null;
+      }
+      byId.set(book.id, book);
+    }
+
+    comicIndex = { books, groups, byId, pageImagePaths };
+    comicIndexSignature = signature;
+    return comicIndex;
+  };
+
+  const findComicBook = (id) => getComicIndex().byId.get(String(id || '')) || null;
+
+  // Comic endpoints accept either a library media id or a synthetic book id,
+  // since a folder of pages is a book without being a file.
+  const resolveComicTarget = (id) => {
+    const book = findComicBook(id);
+    if (book) {
+      return book;
+    }
+
+    const media = mediaServer.getMediaById(String(id || ''));
+    if (media && isComicArchiveFile(media.filePath)) {
+      return {
+        id: String(id),
+        kind: 'archive',
+        path: media.filePath,
+        name: path.basename(media.filePath, path.extname(media.filePath)),
+      };
+    }
+    return null;
+  };
 
   const resolvedComicsDir = comicsDir
     ? path.resolve(comicsDir)
     : (coversDir ? path.join(path.dirname(path.resolve(coversDir)), 'comics') : null);
 
-  const comicCacheKey = (media) => crypto.createHash('sha1')
-    .update(normalizeFolderKey(media.filePath))
+  const comicCacheKey = (book) => crypto.createHash('sha1')
+    .update(normalizeFolderKey(book.path || book.filePath))
     .digest('hex')
     .slice(0, 16);
 
   // Page names are read once per archive: for RAR this means decoding the whole
   // archive, which is far too slow to repeat for every page request.
-  const getComicPageNames = async (media) => {
-    const key = comicCacheKey(media);
+  const getComicPageNames = async (book) => {
+    // A folder book already knows its pages; only archives need opening.
+    if (book.kind === 'folder') {
+      return book.pages || [];
+    }
+
+    const key = comicCacheKey(book);
     if (comicPageCache.has(key)) {
       return comicPageCache.get(key);
     }
 
-    const pages = await listComicPages(media.filePath);
+    const pages = await listComicPages(book.path);
     comicPageCache.set(key, pages);
     return pages;
   };
 
   // Extracted pages are cached on disk so re-reading a comic costs nothing,
   // which matters most for RAR where extraction is expensive.
-  const getComicPageFile = async (media, pageIndex) => {
-    const pages = await getComicPageNames(media);
+  const getComicPageFile = async (book, pageIndex) => {
+    const pages = await getComicPageNames(book);
     if (pageIndex < 0 || pageIndex >= pages.length) {
       const error = new Error('That page does not exist.');
       error.code = 'COMIC_PAGE_NOT_FOUND';
@@ -5163,28 +5254,34 @@ function createCastUiServer({
     const entryName = pages[pageIndex];
     const extension = (path.extname(entryName) || '.jpg').toLowerCase();
 
-    if (!resolvedComicsDir) {
-      return { buffer: await readComicPage(media.filePath, entryName), extension };
+    // Pages of a folder book are already files on disk; nothing to extract.
+    if (book.kind === 'folder') {
+      return { filePath: entryName, extension };
     }
 
-    const dir = path.join(resolvedComicsDir, comicCacheKey(media));
+    if (!resolvedComicsDir) {
+      return { buffer: await readComicPage(book.path, entryName), extension };
+    }
+
+    const dir = path.join(resolvedComicsDir, comicCacheKey(book));
     const cached = path.join(dir, String(pageIndex) + extension);
     if (fs.existsSync(cached) && fs.statSync(cached).size > 0) {
       return { filePath: cached, extension };
     }
 
-    const buffer = await readComicPage(media.filePath, entryName);
+    const buffer = await readComicPage(book.path, entryName);
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(cached, buffer);
     return { filePath: cached, extension };
   };
 
-  const comicCoverPath = (media) => (resolvedComicsDir
-    ? path.join(resolvedComicsDir, comicCacheKey(media) + '-cover.jpg')
+  const comicCoverPath = (book) => (resolvedComicsDir
+    ? path.join(resolvedComicsDir, comicCacheKey(book) + '-cover.jpg')
     : null);
 
-  const buildComicCover = async (media) => {
-    const outPath = comicCoverPath(media);
+  const buildComicCover = async (book) => {
+    const media = book;
+    const outPath = comicCoverPath(book);
     if (!outPath) {
       return null;
     }
@@ -5483,7 +5580,7 @@ function createCastUiServer({
     if (isImageFile(filePath)) {
       return CATEGORY_PHOTOS;
     }
-    if (isComicFile(filePath)) {
+    if (isComicArchiveFile(filePath)) {
       return CATEGORY_COMICS;
     }
     return categoryFromPath(filePath);
@@ -6173,30 +6270,52 @@ function createCastUiServer({
     return availableRenderers.find((item) => rendererKey(item) === needle) || null;
   };
 
-  const getMovieItems = () => mediaServer.library
-    .filter(isLibraryItem)
-    .map((item) => {
-      let size = null;
-      let addedAtMs = null;
-      try {
-        const stat = fs.statSync(item.filePath);
-        size = stat.size;
-        addedAtMs = Number.isFinite(stat.mtimeMs) ? stat.mtimeMs : null;
-      } catch (err) {
-        size = null;
-        addedAtMs = null;
-      }
+  let movieItemsCache = null;
+  let movieItemsSignature = '';
 
-      return {
-        id: item.id,
-        name: safeBasename(item.name),
-        filePath: item.filePath,
-        watchedKey: item.filePath,
-        mimeType: item.mimeType,
-        size,
-        addedAtMs,
-      };
-    });
+  const librarySignature = () => {
+    const library = mediaServer.library || [];
+    return library.length
+      + ':' + (library[0] ? library[0].filePath : '')
+      + ':' + (library[library.length - 1] ? library[library.length - 1].filePath : '');
+  };
+
+  // Stats every file, so it is memoised per library revision. With a few
+  // thousand files this was costing hundreds of milliseconds on every request,
+  // and it runs for the category counts on all of them.
+  const getMovieItems = () => {
+    const signature = librarySignature();
+    if (movieItemsCache && movieItemsSignature === signature) {
+      return movieItemsCache;
+    }
+
+    movieItemsCache = mediaServer.library
+      .filter(isLibraryItem)
+      .map((item) => {
+        let size = null;
+        let addedAtMs = null;
+        try {
+          const stat = fs.statSync(item.filePath);
+          size = stat.size;
+          addedAtMs = Number.isFinite(stat.mtimeMs) ? stat.mtimeMs : null;
+        } catch (err) {
+          size = null;
+          addedAtMs = null;
+        }
+
+        return {
+          id: item.id,
+          name: safeBasename(item.name),
+          filePath: item.filePath,
+          watchedKey: item.filePath,
+          mimeType: item.mimeType,
+          size,
+          addedAtMs,
+        };
+      });
+    movieItemsSignature = signature;
+    return movieItemsCache;
+  };
 
   // Keyed by file path, not media id: ids are positional and shift on every
   // rescan, whereas paths let a cached lookup survive restarts.
@@ -6540,10 +6659,109 @@ function createCastUiServer({
     return result;
   };
 
+  const comicBookItem = (book) => {
+    const base = {
+      id: book.id,
+      name: book.name,
+      filePath: book.path,
+      watchedKey: book.path,
+      mimeType: book.kind === 'folder' ? 'inode/directory' : 'application/vnd.comicbook',
+      size: book.size === undefined ? null : book.size,
+      addedAtMs: book.addedAtMs === undefined ? null : book.addedAtMs,
+      mediaType: 'comic',
+      movieTitle: book.name,
+      posterUrl: '/comic/' + encodeURIComponent(book.id) + '/cover',
+      showName: null,
+      showDisplayTitle: null,
+      showPosterUrl: null,
+      showPlot: null,
+      showImdbRating: null,
+      showRatingSource: null,
+      showYear: null,
+      seasonLabel: null,
+      seasonNumber: null,
+      episodeNumber: null,
+      seasonSort: null,
+      episodeSort: null,
+      year: null,
+      plot: null,
+      imdbRating: null,
+      ratingSource: null,
+    };
+
+    return withOverride({ filePath: book.path }, base);
+  };
+
+  // Comics come from the folder tree rather than from filename metadata, so they
+  // build their own comic -> volume -> book payload.
+  let comicPayloadCache = new Map();
+
+  const getComicsPayload = (sortMode) => {
+    const index = getComicIndex();
+    // metadataVersion moves whenever a user edit lands, which is the only other
+    // thing the payload depends on.
+    const cacheKey = comicIndexSignature + ':' + metadataVersion + ':' + sortMode;
+    if (comicPayloadCache.has(cacheKey)) {
+      return comicPayloadCache.get(cacheKey);
+    }
+    const groups = index.groups.map((group) => {
+      const seasons = group.volumes.map((volume) => ({
+        name: volume.name,
+        seasonSort: 0,
+        items: volume.books.map(comicBookItem),
+      }));
+
+      const firstBook = seasons.length && seasons[0].items.length ? seasons[0].items[0] : null;
+      const latestAddedAtMs = seasons.reduce((latest, season) => Math.max(
+        latest,
+        season.items.reduce((seasonMax, item) => Math.max(
+          seasonMax,
+          Number.isFinite(Number(item.addedAtMs)) ? Number(item.addedAtMs) : 0,
+        ), 0),
+      ), 0);
+
+      return {
+        name: group.name,
+        displayTitle: group.name,
+        posterUrl: firstBook ? firstBook.posterUrl : null,
+        year: null,
+        plot: null,
+        imdbRating: null,
+        ratingSource: null,
+        latestAddedAtMs,
+        seasons,
+        items: [],
+      };
+    });
+
+    if (sortMode === 'recent') {
+      groups.sort((a, b) => (b.latestAddedAtMs || 0) - (a.latestAddedAtMs || 0)
+        || String(a.name).localeCompare(String(b.name)));
+    }
+
+    const payload = { items: [], groups };
+    if (comicPayloadCache.size > 8) {
+      comicPayloadCache = new Map();
+    }
+    comicPayloadCache.set(cacheKey, payload);
+    return payload;
+  };
+
   const getCategoryPayload = async (category, sortMode = 'alpha') => {
     const normalizedSort = sortMode === 'recent' ? 'recent' : 'alpha';
-    const items = getMovieItems().filter((item) => resolveCategory(item.filePath) === category);
+
+    if (category === CATEGORY_COMICS) {
+      return getComicsPayload(normalizedSort);
+    }
+
+    // Pages that belong to a comic must not also appear as loose photos.
+    const comicPages = getComicIndex().pageImagePaths;
+    const items = getMovieItems().filter((item) => (
+      resolveCategory(item.filePath) === category
+      && !comicPages.has(normalizeFolderKey(item.filePath))
+    ));
     const enrichedItems = await enrichItemsWithMetadata(items);
+
 
     const sortByTitle = (a, b) => {
       const titleA = String(a.movieTitle || a.name || '').toLowerCase();
@@ -6654,10 +6872,18 @@ function createCastUiServer({
 
   const categorySummaries = () => {
     const counts = new Map();
+    const index = getComicIndex();
     for (const item of getMovieItems()) {
+      if (index.pageImagePaths.has(normalizeFolderKey(item.filePath))) {
+        continue;
+      }
       const id = resolveCategory(item.filePath);
+      if (id === CATEGORY_COMICS) {
+        continue;
+      }
       counts.set(id, (counts.get(id) || 0) + 1);
     }
+    counts.set(CATEGORY_COMICS, index.books.length);
 
     const pinnedFolders = new Map();
     for (const categoryId of folderCategories.values()) {
@@ -7061,18 +7287,18 @@ function createCastUiServer({
 
     if (req.method === 'GET' && parsed.pathname === '/api/comic/pages') {
       try {
-        const media = mediaServer.getMediaById(String(parsed.searchParams.get('id') || ''));
-        if (!media || !isComicFile(media.filePath)) {
+        const book = resolveComicTarget(parsed.searchParams.get('id'));
+        if (!book) {
           sendJson(res, 404, { ok: false, error: 'Comic not found.' });
           return;
         }
 
-        const pages = await getComicPageNames(media);
+        const pages = await getComicPageNames(book);
         sendJson(res, 200, {
           ok: true,
-          id: media.id,
-          title: safeBasename(path.basename(media.name, path.extname(media.name))),
-          archive: comicArchiveKind(media.filePath),
+          id: book.id,
+          title: safeBasename(book.name),
+          archive: book.kind === 'folder' ? 'folder' : comicArchiveKind(book.path),
           pageCount: pages.length,
         });
       } catch (error) {
@@ -7084,15 +7310,15 @@ function createCastUiServer({
     if (req.method === 'GET' && parsed.pathname.startsWith('/comic/')) {
       try {
         const rest = parsed.pathname.slice('/comic/'.length).split('/');
-        const media = mediaServer.getMediaById(decodeURIComponent(rest[0] || ''));
-        if (!media || !isComicFile(media.filePath)) {
+        const book = resolveComicTarget(decodeURIComponent(rest[0] || ''));
+        if (!book) {
           res.statusCode = 404;
           res.end('Not found');
           return;
         }
 
         if (rest[1] === 'cover') {
-          const coverPath = await buildComicCover(media);
+          const coverPath = await buildComicCover(book);
           if (!coverPath) {
             res.statusCode = 404;
             res.end('Not found');
@@ -7113,7 +7339,7 @@ function createCastUiServer({
             return;
           }
 
-          const page = await getComicPageFile(media, pageIndex);
+          const page = await getComicPageFile(book, pageIndex);
           res.statusCode = 200;
           res.setHeader('Content-Type', comicMimeFor(page.extension));
           res.setHeader('Cache-Control', 'public, max-age=86400');
@@ -7140,7 +7366,26 @@ function createCastUiServer({
 
     if (req.method === 'GET' && parsed.pathname === '/api/media/tracks') {
       try {
-        const media = mediaServer.getMediaById(String(parsed.searchParams.get('id') || ''));
+        const requestedId = String(parsed.searchParams.get('id') || '');
+        const comicTarget = resolveComicTarget(requestedId);
+        if (comicTarget) {
+          sendJson(res, 200, {
+            ok: true,
+            id: comicTarget.id,
+            mediaType: 'comic',
+            mediaUrl: null,
+            subtitleUrl: null,
+            audio: [],
+            subtitles: [],
+            hasSidecar: false,
+            hasUserSubtitle: false,
+            canSelectAudio: false,
+            probeError: null,
+          });
+          return;
+        }
+
+        const media = mediaServer.getMediaById(requestedId);
         if (!media) {
           sendJson(res, 404, { ok: false, error: 'Media item not found.' });
           return;
@@ -7358,7 +7603,10 @@ function createCastUiServer({
       try {
         const body = await readRequestBody(req, MAX_COVER_BYTES + 1024 * 64);
         const payload = JSON.parse(body || '{}');
-        const media = mediaServer.getMediaById(String(payload.id || ''));
+        const comicTarget = resolveComicTarget(payload.id);
+        const media = comicTarget
+          ? { id: comicTarget.id, filePath: comicTarget.path, name: comicTarget.name }
+          : mediaServer.getMediaById(String(payload.id || ''));
 
         if (!media) {
           sendJson(res, 404, { ok: false, error: 'Media item not found.' });

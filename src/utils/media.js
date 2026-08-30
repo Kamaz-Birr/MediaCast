@@ -5,6 +5,10 @@ const VIDEO_EXTENSIONS = ['.mp4', '.mkv', '.avi', '.mov', '.m4v', '.ts'];
 const AUDIO_EXTENSIONS = ['.mp3', '.aac', '.m4a', '.wav', '.flac'];
 const IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'];
 const COMIC_EXTENSIONS = ['.cbz', '.cbr'];
+// Plain .zip/.rar are only comics when they sit in a comics tree; indexing every
+// zip on the disk would be worse than useless.
+const AMBIGUOUS_ARCHIVE_EXTENSIONS = ['.zip', '.rar'];
+const COMICS_PATH_HINTS = ['comics', 'comic', 'manga', 'manhwa', 'manhua', 'graphic novel'];
 
 const SUPPORTED_EXTENSIONS = [
   ...VIDEO_EXTENSIONS,
@@ -46,12 +50,30 @@ export function isComicFile(filePath) {
   return COMIC_EXTENSIONS.includes(path.extname(filePath).toLowerCase());
 }
 
+export function looksLikeComicsPath(filePath) {
+  const parts = String(filePath || '').split(/[\\/]+/).map((part) => part.toLowerCase());
+  return parts.some((part) => COMICS_PATH_HINTS.some((hint) => part.includes(hint)));
+}
+
+// Any file openable as a comic book: .cbz/.cbr anywhere, or .zip/.rar that lives
+// inside a comics or manga folder.
+export function isComicArchiveFile(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  if (COMIC_EXTENSIONS.includes(ext)) {
+    return true;
+  }
+  return AMBIGUOUS_ARCHIVE_EXTENSIONS.includes(ext) && looksLikeComicsPath(filePath);
+}
+
 export function isSupportedMediaFile(filePath) {
   if (/\.d\.ts$/i.test(filePath)) {
     return false;
   }
   if (isArtworkImage(filePath)) {
     return false;
+  }
+  if (isComicArchiveFile(filePath)) {
+    return true;
   }
   const ext = path.extname(filePath).toLowerCase();
   return SUPPORTED_EXTENSIONS.includes(ext);
