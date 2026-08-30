@@ -31,20 +31,31 @@ export class FFmpegTranscoder extends EventEmitter {
       args.push('-vf', `subtitles='${this.subtitlesPath.replace(/'/g, "'\\''")}'`);
     }
 
-    // Video encoding options
-    args.push(
-      '-c:v',
-      this.options.videoCodec || 'libx264',
-      '-preset',
-      this.options.videoPreset || 'medium',
-      '-crf',
-      String(this.options.videoCrf || 23),
-    );
-
-    // Add maxrate and bufsize for smoother streaming (default for 4K: 20M)
+    // Video encoding options. A detected hardware encoder brings its own
+    // quality flags, since -crf and -preset are libx264 spellings that NVENC,
+    // QSV and AMF do not share.
     const maxrate = this.options.videoMaxrate || '20M';
     const bufsize = this.options.videoBufsize || '40M';
-    args.push('-maxrate', maxrate, '-bufsize', bufsize);
+    const encoder = this.options.videoEncoder;
+
+    if (encoder && typeof encoder.buildArgs === 'function') {
+      args.push(...encoder.buildArgs({
+        preset: this.options.videoPreset || 'medium',
+        crf: this.options.videoCrf || 23,
+        maxrate,
+        bufsize,
+      }));
+    } else {
+      args.push(
+        '-c:v',
+        this.options.videoCodec || 'libx264',
+        '-preset',
+        this.options.videoPreset || 'medium',
+        '-crf',
+        String(this.options.videoCrf || 23),
+      );
+      args.push('-maxrate', maxrate, '-bufsize', bufsize);
+    }
 
     // Keyframe interval (optional, default 2s for 30fps)
     if (this.options.videoGop) {
@@ -72,7 +83,10 @@ export class FFmpegTranscoder extends EventEmitter {
       'pipe:1',
     );
 
-    console.log(`[TRANSCODE_SPAWN] ${this.filePath}`);
+    const encoderLabel = this.options.videoEncoder
+      ? this.options.videoEncoder.label
+      : (this.options.videoCodec || 'libx264');
+    console.log(`[TRANSCODE_SPAWN] ${this.filePath} (${encoderLabel})`);
     console.log(`[TRANSCODE_ARGS] ${args.join(' ')}`);
 
     try {

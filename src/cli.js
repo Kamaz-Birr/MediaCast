@@ -21,6 +21,7 @@ import {
   getCurrentTransportActions,
 } from './upnp/soap.js';
 import { printSupportedFormats } from './utils/media.js';
+import { detectVideoEncoder } from './transcoding/hardware.js';
 import { getLocalIPForRenderer } from './utils/network.js';
 import { createCastUiServer } from './web/castUiServer.js';
 import { configureMetadataApiKeys } from './web/metadataFetcher.js';
@@ -458,6 +459,10 @@ function getThumbnailsDir() {
   return path.join(path.dirname(getCastUiConfigPath()), 'thumbnails');
 }
 
+function getComicsCacheDir() {
+  return path.join(path.dirname(getCastUiConfigPath()), 'comics');
+}
+
 function getMetadataCachePath() {
   return path.join(path.dirname(getCastUiConfigPath()), 'metadata-cache.json');
 }
@@ -694,8 +699,10 @@ program
   .option('--video-maxrate <bitrate>', 'FFmpeg video maxrate (e.g., 20M, 10M)', '20M')
   .option('--video-bufsize <size>', 'FFmpeg video bufsize (e.g., 40M, 20M)', '40M')
   .option('--video-gop <frames>', 'FFmpeg keyframe interval (GOP, e.g., 60 for 2s at 30fps)')
+  .option('--video-encoder <name>', 'GPU encoder to use: auto, cpu, nvenc, qsv, amf, videotoolbox', 'auto')
   .action(async (options) => {
     try {
+      const videoEncoder = await detectVideoEncoder(options.videoEncoder);
       const mediaServer = new MediaServer({
         rootDir: options.dir,
         port: Number(options.port),
@@ -708,6 +715,7 @@ program
           videoMaxrate: options.videoMaxrate,
           videoBufsize: options.videoBufsize,
           videoGop: options.videoGop,
+          videoEncoder,
         },
         subtitles: {
           delayMs: Number(options.subtitleDelayMs),
@@ -716,6 +724,7 @@ program
 
       const info = await mediaServer.start();
       console.log(`Media server started: http://${info.host}:${info.port}`);
+      console.log(`Video encoder: ${videoEncoder.label}${videoEncoder.hardware ? ' (GPU accelerated)' : ''}`);
       console.log(`Library files: ${info.librarySize}`);
       console.log(`Transcoding: ${options.transcode ? 'auto-detect' : 'disabled'}`);
       console.log('Press Ctrl+C to stop.');
@@ -747,8 +756,10 @@ program
   .option('--video-maxrate <bitrate>', 'FFmpeg video maxrate (e.g., 20M, 10M)', '20M')
   .option('--video-bufsize <size>', 'FFmpeg video bufsize (e.g., 40M, 20M)', '40M')
   .option('--video-gop <frames>', 'FFmpeg keyframe interval (GOP, e.g., 60 for 2s at 30fps)')
+  .option('--video-encoder <name>', 'GPU encoder to use: auto, cpu, nvenc, qsv, amf, videotoolbox', 'auto')
   .action(async (options) => {
     try {
+      const videoEncoder = await detectVideoEncoder(options.videoEncoder);
       const filePath = path.resolve(options.file);
       const rootDir = path.dirname(filePath);
 
@@ -764,6 +775,7 @@ program
           videoMaxrate: options.videoMaxrate,
           videoBufsize: options.videoBufsize,
           videoGop: options.videoGop,
+          videoEncoder,
         },
         subtitles: {
           delayMs: Number(options.subtitleDelayMs),
@@ -841,6 +853,7 @@ program
       console.log(`✓ URL: ${mediaUrl}`);
       console.log(`✓ Server: http://${info.host}:${info.port}`);
       console.log(`✓ Transcoding: ${options.transcode ? 'auto-detect' : 'disabled'}`);
+      console.log(`✓ Video encoder: ${videoEncoder.label}${videoEncoder.hardware ? ' (GPU accelerated)' : ''}`);
       console.log(`\nPress Ctrl+C to stop local server.\n`);
 
       process.on('SIGINT', async () => {
@@ -896,6 +909,7 @@ program
   .option('--video-maxrate <bitrate>', 'FFmpeg video maxrate (e.g., 20M, 10M)', '20M')
   .option('--video-bufsize <size>', 'FFmpeg video bufsize (e.g., 40M, 20M)', '40M')
   .option('--video-gop <frames>', 'FFmpeg keyframe interval (GOP, e.g., 60 for 2s at 30fps)')
+  .option('--video-encoder <name>', 'GPU encoder to use: auto, cpu, nvenc, qsv, amf, videotoolbox', 'auto')
   .action(async (options) => {
     let mediaServer = null;
     let uiServer = null;
@@ -905,6 +919,8 @@ program
     try {
       const mediaDirs = await resolveInitialMediaDirectories(options.dir);
       const isFirstRun = mediaDirs.length === 0;
+
+      const videoEncoder = await detectVideoEncoder(options.videoEncoder);
 
       const savedConfig = readCastUiConfig();
       configureMetadataApiKeys({
@@ -955,6 +971,7 @@ program
           videoMaxrate: options.videoMaxrate,
           videoBufsize: options.videoBufsize,
           videoGop: options.videoGop,
+          videoEncoder,
         },
         subtitles: {
           delayMs: Number(options.subtitleDelayMs),
@@ -984,6 +1001,7 @@ program
         onMetadataCacheChanged: (entries) => saveMetadataCache(entries),
         coversDir: getCoversDir(),
         subtitlesDir: getSubtitlesDir(),
+        comicsDir: getComicsCacheDir(),
       });
 
       const uiInfo = await uiServer.start();
@@ -994,6 +1012,7 @@ program
       } else {
         console.log(`Media folders: ${mediaDirs.join(' | ')}`);
       }
+      console.log(`Video encoder: ${videoEncoder.label}${videoEncoder.hardware ? ' (GPU accelerated)' : ''}${videoEncoder.hardware ? '' : ' - ' + videoEncoder.reason}`);
       console.log(`Renderer: ${renderer && renderer.friendlyName ? renderer.friendlyName : 'No renderer selected'}`);
       if (Number(options.subtitleDelayMs) !== 0) {
         console.log(`Subtitle delay: ${Number(options.subtitleDelayMs)}ms`);

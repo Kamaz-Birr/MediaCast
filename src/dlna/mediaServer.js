@@ -105,6 +105,7 @@ class MediaServer {
       videoCrf: transcoding.videoCrf || 23,
       audioCodec: transcoding.audioCodec || 'aac',
       audioBitrate: transcoding.audioBitrate || '128k',
+      videoEncoder: transcoding.videoEncoder || null,
     }
     this.activeTranscoders = new Map();
     this.backgroundRefreshPromise = null;
@@ -599,6 +600,7 @@ class MediaServer {
           videoMaxrate: this.transcoding.videoMaxrate,
           videoBufsize: this.transcoding.videoBufsize,
           videoGop: this.transcoding.videoGop,
+          videoEncoder: this.transcoding.videoEncoder,
           subtitlesPath,
           audioStreamIndex,
         });

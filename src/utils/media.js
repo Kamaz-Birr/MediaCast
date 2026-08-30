@@ -4,11 +4,13 @@ import mime from 'mime-types';
 const VIDEO_EXTENSIONS = ['.mp4', '.mkv', '.avi', '.mov', '.m4v', '.ts'];
 const AUDIO_EXTENSIONS = ['.mp3', '.aac', '.m4a', '.wav', '.flac'];
 const IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'];
+const COMIC_EXTENSIONS = ['.cbz', '.cbr'];
 
 const SUPPORTED_EXTENSIONS = [
   ...VIDEO_EXTENSIONS,
   ...AUDIO_EXTENSIONS,
   ...IMAGE_EXTENSIONS,
+  ...COMIC_EXTENSIONS,
 ];
 
 // Artwork that sits beside a video is not a library item in its own right.
@@ -38,6 +40,10 @@ export function isImageFile(filePath) {
 
 export function isVideoFile(filePath) {
   return VIDEO_EXTENSIONS.includes(path.extname(filePath).toLowerCase());
+}
+
+export function isComicFile(filePath) {
+  return COMIC_EXTENSIONS.includes(path.extname(filePath).toLowerCase());
 }
 
 export function isSupportedMediaFile(filePath) {
@@ -103,6 +109,11 @@ export function getDlnaProtocolInfo(filePath) {
 }
 
 export function mediaKind(filePath) {
+  // Comic archives read as generic zip/rar by mime type, so classify by extension.
+  if (isComicFile(filePath)) {
+    return 'comic';
+  }
+
   const mimeType = getMimeType(filePath);
   if (mimeType.startsWith('audio/')) {
     return 'audio';
@@ -120,6 +131,7 @@ export function printSupportedFormats() {
   return {
     containers: ['MP4', 'MKV', 'AVI', 'MOV', 'M4V', 'TS'],
     images: ['JPEG', 'PNG', 'GIF', 'WEBP', 'BMP'],
+    comics: ['CBZ', 'CBR (read on this device only)'],
     audio: ['MP3', 'AAC', 'M4A', 'WAV', 'FLAC', 'AC3 (renderer dependent passthrough)'],
     videoCodecs: [
       'H.264/AVC (widely supported)',

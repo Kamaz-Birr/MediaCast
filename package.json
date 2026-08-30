@@ -24,6 +24,9 @@
   "pkg": {
     "scripts": [
       "src/**/*.js"
+    ],
+    "assets": [
+      "node_modules/node-unrar-js/esm/js/unrar.wasm"
     ]
   },
   "dependencies": {
@@ -31,7 +34,8 @@
     "commander": "^12.1.0",
     "fast-xml-parser": "^4.5.0",
     "mime-types": "^2.1.35",
-    "node-ssdp": "^4.0.1"
+    "node-ssdp": "^4.0.1",
+    "node-unrar-js": "^2.0.2"
   },
   "engines": {
     "node": ">=18"

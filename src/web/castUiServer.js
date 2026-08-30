@@ -15,7 +15,8 @@ import {
   getMediaInfo,
 } from '../upnp/soap.js';
 import { discoverRenderers } from '../upnp/discovery.js';
-import { isImageFile } from '../utils/media.js';
+import { isImageFile, isComicFile } from '../utils/media.js';
+import { listComicPages, readComicPage, comicArchiveKind } from '../comics/archive.js';
 import {
   fetchMovieMetadata,
   fetchSeriesMetadata,
@@ -53,7 +54,7 @@ function isLibraryItem(media) {
   if (!media || !media.filePath) {
     return false;
   }
-  return isLikelyMovie(media) || isImageFile(media.filePath);
+  return isLikelyMovie(media) || isImageFile(media.filePath) || isComicFile(media.filePath);
 }
 
 const CATEGORY_MOVIES = 'movies';
@@ -61,6 +62,7 @@ const CATEGORY_TV_SHOWS = 'tv-shows';
 const CATEGORY_ANIME_MOVIES = 'anime-movies';
 const CATEGORY_ANIME_SHOWS = 'anime-shows';
 const CATEGORY_PHOTOS = 'photos';
+const CATEGORY_COMICS = 'comics';
 const CATEGORY_KIND_MOVIES = 'movies';
 const CATEGORY_KIND_SHOWS = 'shows';
 const CATEGORY_AUTO = 'auto';
@@ -72,6 +74,7 @@ const BUILT_IN_CATEGORIES = [
   { id: CATEGORY_ANIME_MOVIES, label: 'Anime Movies', kind: CATEGORY_KIND_MOVIES, builtIn: true },
   { id: CATEGORY_ANIME_SHOWS, label: 'Anime Shows', kind: CATEGORY_KIND_SHOWS, builtIn: true },
   { id: CATEGORY_PHOTOS, label: 'Photos', kind: CATEGORY_KIND_MOVIES, builtIn: true },
+  { id: CATEGORY_COMICS, label: 'Comics', kind: CATEGORY_KIND_MOVIES, builtIn: true },
 ];
 
 const COVER_MIME_EXTENSIONS = {
@@ -1190,6 +1193,14 @@ function buildPageHtml(rendererName) {
       background: #000;
     }
 
+    /* An element selector setting display:block outranks the hidden attribute's
+       user-agent rule, which left an empty video player showing over the comic
+       reader and the photo viewer. */
+    .player-frame video[hidden],
+    .player-frame img[hidden] {
+      display: none;
+    }
+
     .player-bar {
       display: flex;
       align-items: center;
@@ -1279,6 +1290,54 @@ function buildPageHtml(rendererName) {
         rgba(4, 8, 16, 0.25) 70%,
         transparent 100%
       );
+    }
+
+    /* ---------- Comic reader ---------- */
+
+    /* Comic covers are portrait like a book, not like a film poster. */
+    .movie-card.is-comic { aspect-ratio: 2 / 3; }
+
+    .movie-card.is-comic .movie-plot { display: none; }
+
+    .reader-page {
+      width: 100%;
+      max-height: 78vh;
+      object-fit: contain;
+      display: block;
+      background: #05080f;
+    }
+
+    .reader-bar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 12px 18px;
+      flex-wrap: wrap;
+    }
+
+    .reader-progress {
+      flex: 1 1 160px;
+      height: 4px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.12);
+      overflow: hidden;
+      min-width: 120px;
+    }
+
+    .reader-progress span {
+      display: block;
+      height: 100%;
+      width: 0;
+      background: linear-gradient(90deg, var(--accent), #fdba74);
+      transition: width 260ms var(--ease);
+    }
+
+    .reader-count {
+      color: var(--muted);
+      font-size: 0.76rem;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      white-space: nowrap;
     }
 
     /* ---------- Status bar ---------- */
@@ -1858,12 +1917,15 @@ function buildPageHtml(rendererName) {
       <div class="player-frame">
         <video id="playerVideo" controls playsinline preload="metadata"></video>
         <img id="playerImage" class="viewer-image" alt="" hidden />
+        <img id="readerPage" class="reader-page" alt="" hidden />
         <button type="button" class="viewer-nav prev" id="viewerPrev" aria-label="Previous photo" hidden>&#8249;</button>
         <button type="button" class="viewer-nav next" id="viewerNext" aria-label="Next photo" hidden>&#8250;</button>
       </div>
       <div class="player-bar">
         <span class="player-title" id="playerTitle"></span>
         <button class="neu-btn secondary" id="playerTranscode">Force Transcode</button>
+        <span class="reader-count" id="readerCount" hidden></span>
+        <div class="reader-progress" id="readerProgress" hidden><span id="readerProgressFill"></span></div>
         <span class="player-note" id="playerNote"></span>
       </div>
     </div>
@@ -2029,6 +2091,13 @@ function buildPageHtml(rendererName) {
     const playerImage = document.getElementById('playerImage');
     const viewerPrev = document.getElementById('viewerPrev');
     const viewerNext = document.getElementById('viewerNext');
+    const readerPage = document.getElementById('readerPage');
+    const readerCount = document.getElementById('readerCount');
+    const readerProgress = document.getElementById('readerProgress');
+    const readerProgressFill = document.getElementById('readerProgressFill');
+    let readerComic = null;
+    let readerIndex = 0;
+    let readerPageCount = 0;
     let viewerList = [];
     let viewerIndex = -1;
     let playerItem = null;
@@ -2648,6 +2717,8 @@ function buildPageHtml(rendererName) {
         card.className = 'movie-card';
         if (item.mediaType === 'image') {
           card.classList.add('is-photo');
+        } else if (item.mediaType === 'comic') {
+          card.classList.add('is-comic');
         } else if (item.seasonNumber !== null && item.seasonNumber !== undefined) {
           card.classList.add('is-episode');
         }
@@ -3519,6 +3590,7 @@ function buildPageHtml(rendererName) {
       detailItem = item;
       detailCard = card || null;
       const itemIsImage = isImageItem(item);
+      const itemIsComic = isComicItem(item);
       pendingCoverDataUrl = '';
       detailEditForm.hidden = true;
       detailEdit.textContent = 'Edit Info';
@@ -3547,8 +3619,9 @@ function buildPageHtml(rendererName) {
       }
 
       detailPosterWrap.classList.toggle('is-photo', itemIsImage);
-      // A photo has no synopsis to be missing.
-      detailPlot.hidden = itemIsImage && !item.plot;
+      detailPlot.hidden = false;
+      // A photo or comic has no synopsis to be missing.
+      detailPlot.hidden = (itemIsImage || itemIsComic) && !item.plot;
       detailPlot.textContent = item.plot || 'No synopsis available for this title.';
       detailFile.textContent = item.filePath || item.name;
 
@@ -3557,7 +3630,9 @@ function buildPageHtml(rendererName) {
         ? 'Cast To TV'
         : (resumeInfo ? 'Resume ' + formatResumeClock(resumeInfo.positionSec) : 'Play');
       detailPlay.classList.toggle('resume', Boolean(resumeInfo));
-      detailPlayHere.textContent = itemIsImage ? 'View' : 'Play Here';
+      // A renderer has no way to display a comic archive.
+      detailPlay.hidden = itemIsComic;
+      detailPlayHere.textContent = itemIsComic ? 'Read' : (itemIsImage ? 'View' : 'Play Here');
 
       const watchedKey = item.watchedKey || item.filePath || item.id;
       const isWatched = watchedItemIds.has(watchedKey);
@@ -3572,7 +3647,7 @@ function buildPageHtml(rendererName) {
       trackSection.hidden = true;
       trackNote.textContent = '';
       detailModal.hidden = false;
-      if (!itemIsImage) {
+      if (!itemIsImage && !itemIsComic) {
         loadDetailTracks(item);
       }
     }
@@ -4157,6 +4232,89 @@ function buildPageHtml(rendererName) {
       return Boolean(item && item.mediaType === 'image');
     }
 
+    function isComicItem(item) {
+      return Boolean(item && item.mediaType === 'comic');
+    }
+
+    function showComicPage(index) {
+      if (!readerComic || readerPageCount === 0) {
+        return;
+      }
+
+      readerIndex = Math.max(0, Math.min(readerPageCount - 1, index));
+      readerPage.src = '/comic/' + encodeURIComponent(readerComic.id)
+        + '/page/' + readerIndex;
+      readerCount.textContent = 'Page ' + (readerIndex + 1) + ' of ' + readerPageCount;
+      readerProgressFill.style.width =
+        (((readerIndex + 1) / readerPageCount) * 100) + '%';
+
+      // Warm the next page so forward paging feels instant, which matters most
+      // for RAR where extraction is slow.
+      if (readerIndex + 1 < readerPageCount) {
+        const preload = new Image();
+        preload.src = '/comic/' + encodeURIComponent(readerComic.id)
+          + '/page/' + (readerIndex + 1);
+      }
+    }
+
+    function stepComicPage(delta) {
+      showComicPage(readerIndex + delta);
+    }
+
+    async function openComicReader(item) {
+      playerVideo.hidden = true;
+      playerVideo.removeAttribute('src');
+      playerImage.hidden = true;
+      playerImage.removeAttribute('src');
+      playerTranscode.hidden = true;
+      readerPage.hidden = false;
+      readerCount.hidden = false;
+      readerProgress.hidden = false;
+      viewerPrev.hidden = false;
+      viewerNext.hidden = false;
+
+      readerComic = item;
+      readerIndex = 0;
+      readerPageCount = 0;
+      playerTitle.textContent = item.movieTitle || item.name;
+      playerNote.classList.remove('warn');
+      playerNote.textContent = 'Opening comic...';
+      readerCount.textContent = '';
+      playerModal.hidden = false;
+
+      try {
+        const response = await fetch('/api/comic/pages?id=' + encodeURIComponent(item.id));
+        const result = await response.json();
+        if (!response.ok || !result.ok) {
+          throw new Error(result.error || ('HTTP ' + response.status));
+        }
+
+        readerPageCount = Number(result.pageCount) || 0;
+        if (readerPageCount === 0) {
+          throw new Error('No pages found inside this archive.');
+        }
+
+        playerNote.textContent = 'Arrow keys or the side buttons turn pages ('
+          + String(result.archive).toUpperCase() + ' archive).';
+        showComicPage(0);
+      } catch (error) {
+        playerNote.textContent = 'Could not open this comic: ' + error.message;
+        playerNote.classList.add('warn');
+        readerCount.hidden = true;
+        readerProgress.hidden = true;
+      }
+    }
+
+    function closeComicReader() {
+      readerPage.hidden = true;
+      readerPage.removeAttribute('src');
+      readerCount.hidden = true;
+      readerProgress.hidden = true;
+      playerModal.hidden = true;
+      readerComic = null;
+      readerPageCount = 0;
+    }
+
     // Photos step through whatever is currently on screen, in display order.
     function collectViewerList(item) {
       const cards = [...document.querySelectorAll('.movie-card')];
@@ -4202,7 +4360,20 @@ function buildPageHtml(rendererName) {
       showViewerImage(viewerList[viewerIndex]);
     }
 
+    function jumpViewer(index) {
+      if (viewerList.length === 0) {
+        return;
+      }
+      viewerIndex = Math.max(0, Math.min(viewerList.length - 1, index));
+      showViewerImage(viewerList[viewerIndex]);
+    }
+
     function openImageViewer(item) {
+      readerComic = null;
+      readerPage.hidden = true;
+      readerPage.removeAttribute('src');
+      readerCount.hidden = true;
+      readerProgress.hidden = true;
       playerVideo.hidden = true;
       playerVideo.removeAttribute('src');
       playerImage.hidden = false;
@@ -4213,23 +4384,77 @@ function buildPageHtml(rendererName) {
       showViewerImage(item);
     }
 
-    viewerPrev.addEventListener('click', () => stepViewer(-1));
-    viewerNext.addEventListener('click', () => stepViewer(1));
-
-    document.addEventListener('keydown', (event) => {
-      if (playerModal.hidden || playerImage.hidden) {
-        return;
-      }
-      if (event.key === 'ArrowLeft') {
-        event.preventDefault();
+    viewerPrev.addEventListener('click', () => {
+      if (readerComic) {
+        stepComicPage(-1);
+      } else {
         stepViewer(-1);
-      } else if (event.key === 'ArrowRight') {
-        event.preventDefault();
+      }
+    });
+
+    viewerNext.addEventListener('click', () => {
+      if (readerComic) {
+        stepComicPage(1);
+      } else {
         stepViewer(1);
       }
     });
 
+    document.addEventListener('keydown', (event) => {
+      if (playerModal.hidden) {
+        return;
+      }
+
+      // Left/right turn a page, up/down jump to the start or end of the book.
+      // Home/End do the same, since that is what those keys mean everywhere else.
+      const isReader = Boolean(readerComic);
+      const isViewer = !isReader && !playerImage.hidden;
+      if (!isReader && !isViewer) {
+        return;
+      }
+
+      const key = event.key;
+      let handled = true;
+
+      if (key === 'ArrowLeft' || key === 'PageUp') {
+        if (isReader) {
+          stepComicPage(-1);
+        } else {
+          stepViewer(-1);
+        }
+      } else if (key === 'ArrowRight' || key === 'PageDown') {
+        if (isReader) {
+          stepComicPage(1);
+        } else {
+          stepViewer(1);
+        }
+      } else if (key === 'ArrowUp' || key === 'Home') {
+        if (isReader) {
+          showComicPage(0);
+        } else {
+          jumpViewer(0);
+        }
+      } else if (key === 'ArrowDown' || key === 'End') {
+        if (isReader) {
+          showComicPage(readerPageCount - 1);
+        } else {
+          jumpViewer(viewerList.length - 1);
+        }
+      } else {
+        handled = false;
+      }
+
+      if (handled) {
+        event.preventDefault();
+      }
+    });
+
     async function openLocalPlayer(item) {
+      readerComic = null;
+      readerPage.hidden = true;
+      readerPage.removeAttribute('src');
+      readerCount.hidden = true;
+      readerProgress.hidden = true;
       playerVideo.hidden = false;
       playerImage.hidden = true;
       playerImage.removeAttribute('src');
@@ -4266,6 +4491,11 @@ function buildPageHtml(rendererName) {
     }
 
     function closeLocalPlayer() {
+      if (readerComic) {
+        closeComicReader();
+        return;
+      }
+
       if (!playerImage.hidden) {
         playerImage.hidden = true;
         playerImage.removeAttribute('src');
@@ -4324,7 +4554,9 @@ function buildPageHtml(rendererName) {
         return;
       }
       closeDetailModal();
-      if (isImageItem(item)) {
+      if (isComicItem(item)) {
+        openComicReader(item);
+      } else if (isImageItem(item)) {
         openImageViewer(item);
       } else {
         openLocalPlayer(item);
@@ -4804,6 +5036,7 @@ function createCastUiServer({
   onMetadataCacheChanged,
   coversDir,
   subtitlesDir,
+  comicsDir,
   allowLanAccess = false,
 }) {
   let server = null;
@@ -4893,6 +5126,104 @@ function createCastUiServer({
   const TEXT_SUBTITLE_CODECS = new Set(['subrip', 'srt', 'ass', 'ssa', 'mov_text', 'webvtt', 'text']);
 
   const probeCache = new Map();
+  const comicPageCache = new Map();
+
+  const resolvedComicsDir = comicsDir
+    ? path.resolve(comicsDir)
+    : (coversDir ? path.join(path.dirname(path.resolve(coversDir)), 'comics') : null);
+
+  const comicCacheKey = (media) => crypto.createHash('sha1')
+    .update(normalizeFolderKey(media.filePath))
+    .digest('hex')
+    .slice(0, 16);
+
+  // Page names are read once per archive: for RAR this means decoding the whole
+  // archive, which is far too slow to repeat for every page request.
+  const getComicPageNames = async (media) => {
+    const key = comicCacheKey(media);
+    if (comicPageCache.has(key)) {
+      return comicPageCache.get(key);
+    }
+
+    const pages = await listComicPages(media.filePath);
+    comicPageCache.set(key, pages);
+    return pages;
+  };
+
+  // Extracted pages are cached on disk so re-reading a comic costs nothing,
+  // which matters most for RAR where extraction is expensive.
+  const getComicPageFile = async (media, pageIndex) => {
+    const pages = await getComicPageNames(media);
+    if (pageIndex < 0 || pageIndex >= pages.length) {
+      const error = new Error('That page does not exist.');
+      error.code = 'COMIC_PAGE_NOT_FOUND';
+      throw error;
+    }
+
+    const entryName = pages[pageIndex];
+    const extension = (path.extname(entryName) || '.jpg').toLowerCase();
+
+    if (!resolvedComicsDir) {
+      return { buffer: await readComicPage(media.filePath, entryName), extension };
+    }
+
+    const dir = path.join(resolvedComicsDir, comicCacheKey(media));
+    const cached = path.join(dir, String(pageIndex) + extension);
+    if (fs.existsSync(cached) && fs.statSync(cached).size > 0) {
+      return { filePath: cached, extension };
+    }
+
+    const buffer = await readComicPage(media.filePath, entryName);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(cached, buffer);
+    return { filePath: cached, extension };
+  };
+
+  const comicCoverPath = (media) => (resolvedComicsDir
+    ? path.join(resolvedComicsDir, comicCacheKey(media) + '-cover.jpg')
+    : null);
+
+  const buildComicCover = async (media) => {
+    const outPath = comicCoverPath(media);
+    if (!outPath) {
+      return null;
+    }
+    if (fs.existsSync(outPath) && fs.statSync(outPath).size > 0) {
+      return outPath;
+    }
+
+    const page = await getComicPageFile(media, 0);
+    fs.mkdirSync(path.dirname(outPath), { recursive: true });
+
+    const sourcePath = page.filePath
+      || path.join(path.dirname(outPath), comicCacheKey(media) + '-src' + page.extension);
+    if (!page.filePath) {
+      fs.writeFileSync(sourcePath, page.buffer);
+    }
+
+    await new Promise((resolve, reject) => {
+      const proc = spawn('ffmpeg', [
+        '-y', '-hide_banner', '-loglevel', 'error',
+        '-i', sourcePath,
+        '-vf', "scale='min(480,iw)':-2",
+        '-frames:v', '1', '-q:v', '4',
+        outPath,
+      ], { windowsHide: true });
+      proc.on('error', reject);
+      proc.on('close', (code) => (code === 0 ? resolve() : reject(new Error('cover scaling failed'))));
+    });
+
+    return fs.existsSync(outPath) ? outPath : null;
+  };
+
+  const comicMimeFor = (extension) => {
+    const clean = String(extension || '').toLowerCase();
+    if (clean === '.png') return 'image/png';
+    if (clean === '.gif') return 'image/gif';
+    if (clean === '.webp') return 'image/webp';
+    if (clean === '.bmp') return 'image/bmp';
+    return 'image/jpeg';
+  };
 
   const probeMediaTracks = async (media) => {
     const cacheKey = media.filePath;
@@ -5148,9 +5479,12 @@ function createCastUiServer({
     if (assigned && findCategory(assigned.categoryId)) {
       return assigned.categoryId;
     }
-    // Without an explicit pin, photos would otherwise all fall through to Movies.
+    // Without an explicit pin, photos and comics would fall through to Movies.
     if (isImageFile(filePath)) {
       return CATEGORY_PHOTOS;
+    }
+    if (isComicFile(filePath)) {
+      return CATEGORY_COMICS;
     }
     return categoryFromPath(filePath);
   };
@@ -5937,6 +6271,44 @@ function createCastUiServer({
   };
 
   const buildLocalMetadata = (item) => {
+    if (isComicFile(item.filePath)) {
+      const displayName = safeBasename(
+        path.basename(item.name, path.extname(item.name)).replace(/[._]+/g, ' ').trim(),
+      );
+
+      return {
+        category: resolveCategory(item.filePath),
+        showName: null,
+        seasonInfo: null,
+        fallbackSeriesTitle: '',
+        searchTitle: displayName,
+        isShowCategory: false,
+        isImage: true,
+        displayTitle: displayName,
+        enriched: {
+          movieTitle: displayName,
+          mediaType: 'comic',
+          showName: null,
+          showDisplayTitle: null,
+          showPosterUrl: null,
+          showPlot: null,
+          showImdbRating: null,
+          showRatingSource: null,
+          showYear: null,
+          seasonLabel: null,
+          seasonNumber: null,
+          episodeNumber: null,
+          seasonSort: null,
+          episodeSort: null,
+          posterUrl: '/comic/' + encodeURIComponent(item.id) + '/cover',
+          year: null,
+          plot: null,
+          imdbRating: null,
+          ratingSource: null,
+        },
+      };
+    }
+
     if (isImageFile(item.filePath)) {
       const displayName = safeBasename(
         path.basename(item.name, path.extname(item.name)).replace(/[._]+/g, ' ').trim(),
@@ -6687,6 +7059,85 @@ function createCastUiServer({
       return;
     }
 
+    if (req.method === 'GET' && parsed.pathname === '/api/comic/pages') {
+      try {
+        const media = mediaServer.getMediaById(String(parsed.searchParams.get('id') || ''));
+        if (!media || !isComicFile(media.filePath)) {
+          sendJson(res, 404, { ok: false, error: 'Comic not found.' });
+          return;
+        }
+
+        const pages = await getComicPageNames(media);
+        sendJson(res, 200, {
+          ok: true,
+          id: media.id,
+          title: safeBasename(path.basename(media.name, path.extname(media.name))),
+          archive: comicArchiveKind(media.filePath),
+          pageCount: pages.length,
+        });
+      } catch (error) {
+        sendJson(res, 500, { ok: false, error: error.message });
+      }
+      return;
+    }
+
+    if (req.method === 'GET' && parsed.pathname.startsWith('/comic/')) {
+      try {
+        const rest = parsed.pathname.slice('/comic/'.length).split('/');
+        const media = mediaServer.getMediaById(decodeURIComponent(rest[0] || ''));
+        if (!media || !isComicFile(media.filePath)) {
+          res.statusCode = 404;
+          res.end('Not found');
+          return;
+        }
+
+        if (rest[1] === 'cover') {
+          const coverPath = await buildComicCover(media);
+          if (!coverPath) {
+            res.statusCode = 404;
+            res.end('Not found');
+            return;
+          }
+          res.statusCode = 200;
+          res.setHeader('Content-Type', 'image/jpeg');
+          res.setHeader('Cache-Control', 'public, max-age=86400');
+          fs.createReadStream(coverPath).pipe(res);
+          return;
+        }
+
+        if (rest[1] === 'page') {
+          const pageIndex = Number(rest[2]);
+          if (!Number.isInteger(pageIndex)) {
+            res.statusCode = 400;
+            res.end('Bad page');
+            return;
+          }
+
+          const page = await getComicPageFile(media, pageIndex);
+          res.statusCode = 200;
+          res.setHeader('Content-Type', comicMimeFor(page.extension));
+          res.setHeader('Cache-Control', 'public, max-age=86400');
+          if (page.filePath) {
+            fs.createReadStream(page.filePath).pipe(res);
+          } else {
+            res.end(page.buffer);
+          }
+          return;
+        }
+
+        res.statusCode = 404;
+        res.end('Not found');
+      } catch (error) {
+        console.warn('[Comic] ' + error.message);
+        if (!res.headersSent) {
+          const missing = error.code === 'COMIC_PAGE_NOT_FOUND';
+          res.statusCode = missing ? 404 : 500;
+          res.end(missing ? 'Not found' : 'Comic read failed');
+        }
+      }
+      return;
+    }
+
     if (req.method === 'GET' && parsed.pathname === '/api/media/tracks') {
       try {
         const media = mediaServer.getMediaById(String(parsed.searchParams.get('id') || ''));
@@ -6704,6 +7155,23 @@ function createCastUiServer({
         let audio = [];
         let subtitles = [];
         let probeError = null;
+
+        if (isComicFile(media.filePath)) {
+          sendJson(res, 200, {
+            ok: true,
+            id: media.id,
+            mediaType: 'comic',
+            mediaUrl: null,
+            subtitleUrl: null,
+            audio: [],
+            subtitles: [],
+            hasSidecar: false,
+            hasUserSubtitle: false,
+            canSelectAudio: false,
+            probeError: null,
+          });
+          return;
+        }
 
         if (isImageFile(media.filePath)) {
           let imageUrl = null;
