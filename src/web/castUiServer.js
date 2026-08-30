@@ -1912,6 +1912,66 @@ function buildPageHtml(rendererName) {
       }
     }
 
+    // Repaint a card's artwork only when the URL actually changed.
+    function syncCardPoster(card, posterUrl, altText) {
+      const existing = card.querySelector('img');
+
+      if (posterUrl) {
+        if (existing) {
+          if (existing.getAttribute('src') === posterUrl) {
+            return;
+          }
+          existing.alt = altText || '';
+          attachPosterLoader(card, existing);
+          existing.src = posterUrl;
+          return;
+        }
+
+        const placeholder = card.querySelector('.placeholder');
+        if (placeholder) {
+          placeholder.remove();
+        }
+
+        const img = document.createElement('img');
+        // A card already on the page gets its poster eagerly: lazy loading only
+        // helps the initial bulk render, and deferring here can leave the
+        // loading shimmer up on a card the user is already looking at.
+        img.loading = card.isConnected ? 'eager' : 'lazy';
+        img.alt = altText || '';
+        attachPosterLoader(card, img);
+        img.onerror = () => {
+          img.remove();
+          addCardPlaceholder(card);
+        };
+        img.src = posterUrl;
+        card.insertBefore(img, card.firstChild);
+        return;
+      }
+
+      if (existing) {
+        existing.remove();
+      }
+      if (!card.querySelector('.placeholder')) {
+        addCardPlaceholder(card);
+      }
+    }
+
+    function addCardPlaceholder(card) {
+      const fallback = document.createElement('div');
+      fallback.className = 'placeholder';
+      fallback.textContent = '▶';
+      card.insertBefore(fallback, card.firstChild);
+      return fallback;
+    }
+
+    function movieMetaText(item) {
+      const parts = [];
+      if (item.year) parts.push(item.year);
+      if (item.imdbRating) parts.push((item.ratingSource || 'IMDb') + ' ' + item.imdbRating + '/10');
+      if (Number.isFinite(item.size)) parts.push(formatSize(item.size));
+      return parts.join(' • ');
+    }
+
     // Poster swaps in only once it has loaded, so the shimmer covers the gap.
     function attachPosterLoader(card, img) {
       card.classList.add('img-pending');
@@ -2430,26 +2490,7 @@ function buildPageHtml(rendererName) {
         card.__item = item;
         card.__watchedKey = item.watchedKey || item.filePath || item.id;
 
-        if (item.posterUrl) {
-          const img = document.createElement('img');
-          img.loading = 'lazy';
-          img.src = item.posterUrl;
-          img.alt = item.movieTitle || item.name;
-          attachPosterLoader(card, img);
-          img.onerror = () => {
-            img.remove();
-            const fallback = document.createElement('div');
-            fallback.className = 'placeholder';
-            fallback.textContent = '▶';
-            card.insertBefore(fallback, card.firstChild);
-          };
-          card.appendChild(img);
-        } else {
-          const fallback = document.createElement('div');
-          fallback.className = 'placeholder';
-          fallback.textContent = '▶';
-          card.appendChild(fallback);
-        }
+        syncCardPoster(card, item.posterUrl, item.movieTitle || item.name);
 
         const overlay = document.createElement('div');
         overlay.className = 'movie-overlay';
@@ -2460,11 +2501,7 @@ function buildPageHtml(rendererName) {
 
         const meta = document.createElement('div');
         meta.className = 'movie-meta';
-        const parts = [];
-        if (item.year) parts.push(item.year);
-        if (item.imdbRating) parts.push((item.ratingSource || 'IMDb') + ' ' + item.imdbRating + '/10');
-        if (Number.isFinite(item.size)) parts.push(formatSize(item.size));
-        meta.textContent = parts.join(' • ');
+        meta.textContent = movieMetaText(item);
 
         const plot = document.createElement('p');
         plot.className = 'movie-plot';
@@ -2473,7 +2510,7 @@ function buildPageHtml(rendererName) {
         const playButton = document.createElement('button');
         playButton.className = 'neu-btn';
         playButton.dataset.role = 'play';
-        const initialResumeInfo = getResumeInfo(item);
+        let initialResumeInfo = getResumeInfo(item);
         function updatePlayButtonText() {
             const activeSession = findActiveSessionByMediaId(item.id);
             const isCasting = Boolean(activeSession && activeSession.rendererName);
@@ -2607,6 +2644,28 @@ function buildPageHtml(rendererName) {
             openDetailModal(item, card);
           }
         });
+
+        // Refresh this card's contents without recreating it, so background
+        // metadata updates do not restart entrance animations or reload posters.
+        card.__patch = (nextItem) => {
+          item = nextItem;
+          card.__item = nextItem;
+          card.__watchedKey = nextItem.watchedKey || nextItem.filePath || nextItem.id;
+
+          title.textContent = nextItem.movieTitle || nextItem.name;
+          meta.textContent = movieMetaText(nextItem);
+          plot.textContent = nextItem.plot || 'No synopsis available for this title.';
+          syncCardPoster(card, nextItem.posterUrl, nextItem.movieTitle || nextItem.name);
+
+          initialResumeInfo = getResumeInfo(nextItem);
+          updatePlayButtonText();
+          setWatchedCardState(card, watchedButton, watchedItemIds.has(card.__watchedKey));
+          setResumeCardState(
+            card,
+            Boolean(initialResumeInfo) || Boolean(findActiveSessionByMediaId(nextItem.id)),
+          );
+        };
+
         card.appendChild(overlay);
         return card;
     }
@@ -2646,26 +2705,7 @@ function buildPageHtml(rendererName) {
       card.className = 'movie-card';
 
       const posterUrl = group.posterUrl || (representative && representative.posterUrl);
-      if (posterUrl) {
-        const img = document.createElement('img');
-        img.loading = 'lazy';
-        img.src = posterUrl;
-        img.alt = group.displayTitle || group.name;
-        attachPosterLoader(card, img);
-        img.onerror = () => {
-          img.remove();
-          const fallback = document.createElement('div');
-          fallback.className = 'placeholder';
-          fallback.textContent = '▶';
-          card.insertBefore(fallback, card.firstChild);
-        };
-        card.appendChild(img);
-      } else {
-        const fallback = document.createElement('div');
-        fallback.className = 'placeholder';
-        fallback.textContent = '▶';
-        card.appendChild(fallback);
-      }
+      syncCardPoster(card, posterUrl, group.displayTitle || group.name);
 
       const overlay = document.createElement('div');
       overlay.className = 'movie-overlay';
@@ -2711,6 +2751,33 @@ function buildPageHtml(rendererName) {
         expandedSeasonName = null;
         renderSelectedShowPage();
       });
+
+      card.__patch = (nextGroup) => {
+        group = nextGroup;
+        const nextRep = getGroupRepresentative(nextGroup);
+        title.textContent = nextGroup.displayTitle || nextGroup.name;
+
+        const nextParts = [];
+        if (nextGroup.year || (nextRep && nextRep.year)) {
+          nextParts.push(nextGroup.year || nextRep.year);
+        }
+        if (nextGroup.imdbRating || (nextRep && nextRep.imdbRating)) {
+          const label = nextGroup.ratingSource || (nextRep && nextRep.ratingSource) || 'IMDb';
+          nextParts.push(label + ' ' + (nextGroup.imdbRating || nextRep.imdbRating) + '/10');
+        }
+        nextParts.push(getGroupEpisodeCount(nextGroup) + ' episodes');
+        meta.textContent = nextParts.join(' • ');
+
+        plot.textContent = nextGroup.plot
+          || (nextRep && nextRep.plot)
+          || 'No synopsis available for this show.';
+        syncCardPoster(
+          card,
+          nextGroup.posterUrl || (nextRep && nextRep.posterUrl),
+          nextGroup.displayTitle || nextGroup.name,
+        );
+      };
+
       card.appendChild(overlay);
       return card;
     }
@@ -2720,26 +2787,7 @@ function buildPageHtml(rendererName) {
       const card = document.createElement('article');
       card.className = 'movie-card';
 
-      if (representative && representative.posterUrl) {
-        const img = document.createElement('img');
-        img.loading = 'lazy';
-        img.src = representative.posterUrl;
-        img.alt = season.name;
-        attachPosterLoader(card, img);
-        img.onerror = () => {
-          img.remove();
-          const fallback = document.createElement('div');
-          fallback.className = 'placeholder';
-          fallback.textContent = '▶';
-          card.insertBefore(fallback, card.firstChild);
-        };
-        card.appendChild(img);
-      } else {
-        const fallback = document.createElement('div');
-        fallback.className = 'placeholder';
-        fallback.textContent = '▶';
-        card.appendChild(fallback);
-      }
+      syncCardPoster(card, representative && representative.posterUrl, season.name);
 
       const overlay = document.createElement('div');
       overlay.className = 'movie-overlay';
@@ -2776,39 +2824,83 @@ function buildPageHtml(rendererName) {
         expandedSeasonName = expandedSeasonName === season.name ? null : season.name;
         renderSelectedShowPage();
       });
+
+      card.__patch = (nextSeason) => {
+        season = nextSeason;
+        const nextRep = getSeasonRepresentative(nextSeason);
+        title.textContent = nextSeason.name;
+        meta.textContent = ((nextSeason.items || []).length) + ' episodes';
+        syncCardPoster(card, nextRep && nextRep.posterUrl, nextSeason.name);
+      };
+
       card.appendChild(overlay);
       return card;
     }
 
+    function patchCards(target, list, selector) {
+      const cards = target.querySelectorAll(selector);
+      if (cards.length !== list.length) {
+        return false;
+      }
+      for (let index = 0; index < list.length; index += 1) {
+        if (typeof cards[index].__patch !== 'function') {
+          return false;
+        }
+      }
+      for (let index = 0; index < list.length; index += 1) {
+        cards[index].__patch(list[index]);
+      }
+      return true;
+    }
+
     function renderItems(items, noFolders, category, container) {
       const target = container || grid;
-      target.innerHTML = '';
 
       if (!items.length) {
+        target.__signature = '';
+        target.innerHTML = '';
         target.appendChild(createEmptyState(noFolders, category));
         return;
       }
 
+      // Same items as last time means an in-place refresh, which avoids the
+      // teardown that made the grid flicker while metadata streamed in.
+      const signature = 'items:' + items.map((item) => item.id).join('|');
+      if (target.__signature === signature
+        && patchCards(target, items, ':scope > .movie-card')) {
+        return;
+      }
+
+      target.innerHTML = '';
       for (const item of items) {
         target.appendChild(createMovieCard(item));
       }
 
       applyStagger(target);
+      target.__signature = signature;
     }
 
     function renderGroupedItems(groups, noFolders, category) {
-      grid.innerHTML = '';
-
       if (!groups.length) {
+        grid.__signature = '';
+        grid.innerHTML = '';
         grid.appendChild(createEmptyState(noFolders, category));
         return;
       }
 
+      const signature = 'groups:' + category + ':' + groups.map((group) => group.name).join('|');
+      if (grid.__signature === signature
+        && patchCards(grid, groups, ':scope > .movie-card')) {
+        return;
+      }
+
+      grid.innerHTML = '';
       for (const group of groups) {
         grid.appendChild(createShowCard(group));
       }
 
       applyStagger(grid);
+      grid.__signature = signature;
     }
 
     function renderSelectedShowPage() {
@@ -2827,6 +2919,36 @@ function buildPageHtml(rendererName) {
       }
 
       setBackButton(true, 'Back to ' + (CATEGORY_LABELS[currentCategory] || 'Shows'));
+
+      const seasons = Array.isArray(selected.seasons) ? selected.seasons : [];
+      const expandedSeason = expandedSeasonName
+        ? seasons.find((season) => season.name === expandedSeasonName)
+        : null;
+      const episodes = expandedSeason ? (expandedSeason.items || []) : [];
+
+      // Refresh the existing season and episode cards when the page is showing
+      // the same content, so streaming metadata does not rebuild the view.
+      const signature = 'show:' + selectedShowName
+        + ':' + (expandedSeasonName || '')
+        + ':' + seasons.map((season) => season.name).join('|')
+        + ':' + episodes.map((item) => item.id).join('|');
+
+      if (grid.__signature === signature) {
+        const showTitleEl = grid.querySelector('.group-title');
+        if (showTitleEl) {
+          showTitleEl.textContent = selected.displayTitle || selected.name;
+        }
+        const seasonsOk = patchCards(grid, seasons, '[data-role="seasons"] > .movie-card');
+        const episodesOk = episodes.length === 0
+          || patchCards(grid, episodes, '[data-role="episodes"] > .movie-card');
+        if (seasonsOk && episodesOk) {
+          const patchedCount = getGroupEpisodeCount(selected);
+          setStatus('Viewing ' + selected.name + ' • ' + seasons.length
+            + ' season(s) • ' + patchedCount + ' episode(s).');
+          return;
+        }
+      }
+
       grid.innerHTML = '';
 
       const section = document.createElement('section');
@@ -2839,36 +2961,35 @@ function buildPageHtml(rendererName) {
 
       const seasonGrid = document.createElement('div');
       seasonGrid.className = 'group-grid';
-      const seasons = Array.isArray(selected.seasons) ? selected.seasons : [];
+      seasonGrid.dataset.role = 'seasons';
       for (const season of seasons) {
         seasonGrid.appendChild(createSeasonCard(selected.name, season));
       }
       section.appendChild(seasonGrid);
 
-      if (expandedSeasonName) {
-        const expandedSeason = seasons.find((season) => season.name === expandedSeasonName);
-        if (expandedSeason) {
-          const episodesBlock = document.createElement('div');
-          episodesBlock.className = 'episodes-block';
+      if (expandedSeason) {
+        const episodesBlock = document.createElement('div');
+        episodesBlock.className = 'episodes-block';
 
-          const episodesTitle = document.createElement('h3');
-          episodesTitle.className = 'episodes-title';
-          episodesTitle.textContent = expandedSeason.name + ' Episodes';
+        const episodesTitle = document.createElement('h3');
+        episodesTitle.className = 'episodes-title';
+        episodesTitle.textContent = expandedSeason.name + ' Episodes';
 
-          const episodesGrid = document.createElement('div');
-          episodesGrid.className = 'group-grid';
-          for (const item of (expandedSeason.items || [])) {
-            episodesGrid.appendChild(createMovieCard(item));
-          }
-
-          episodesBlock.appendChild(episodesTitle);
-          episodesBlock.appendChild(episodesGrid);
-          section.appendChild(episodesBlock);
+        const episodesGrid = document.createElement('div');
+        episodesGrid.className = 'group-grid';
+        episodesGrid.dataset.role = 'episodes';
+        for (const item of episodes) {
+          episodesGrid.appendChild(createMovieCard(item));
         }
+
+        episodesBlock.appendChild(episodesTitle);
+        episodesBlock.appendChild(episodesGrid);
+        section.appendChild(episodesBlock);
       }
 
       grid.appendChild(section);
       applyStagger(section);
+      grid.__signature = signature;
       const seasonCount = seasons.length;
       const episodeCount = getGroupEpisodeCount(selected);
       setStatus('Viewing ' + selected.name + ' • ' + seasonCount + ' season(s) • ' + episodeCount + ' episode(s).');
