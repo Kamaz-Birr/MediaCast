@@ -2435,6 +2435,7 @@ function buildPageHtml(rendererName) {
         <select id="sortSelect" class="sort-select" aria-label="Sort media">
           <option value="alpha" selected>Sort: Alphabetical</option>
           <option value="recent">Sort: Recently Added</option>
+          <option value="played" id="sortPlayedOption">Sort: Recently Played</option>
         </select>
         <button class="neu-btn" id="addFolderBtn">Add Media Folder</button>
         <button class="neu-btn secondary" id="backBtn" style="display:none">Back</button>
@@ -2893,6 +2894,34 @@ function buildPageHtml(rendererName) {
         return { group: 'comic', groupPlural: 'comics', item: 'book', section: 'Books', volume: 'volume' };
       }
       return { group: 'show', groupPlural: 'shows', item: 'episode', section: 'Episodes', volume: 'season' };
+    }
+
+    // "Played" reads wrong for a book and "read" reads wrong for a film, so the
+    // option says whichever fits the category on screen.
+    function playedWord(category) {
+      if (category === 'comics' || category === 'books') {
+        return 'Read';
+      }
+      if (category === 'photos') {
+        return 'Viewed';
+      }
+      return 'Played';
+    }
+
+    function syncSortWording() {
+      const option = document.getElementById('sortPlayedOption');
+      if (option) {
+        option.textContent = 'Sort: Recently ' + playedWord(currentCategory);
+      }
+    }
+
+    // Playing or reading something changes the order under "recently played",
+    // so the grid is refreshed once the viewer closes. Other sorts are unaffected
+    // by what was just watched, and are left alone.
+    function refreshForPlayOrder() {
+      if (currentSort === 'played') {
+        loadLibrary(false, { silent: true });
+      }
     }
 
     function isShowCategory(category) {
@@ -4133,7 +4162,11 @@ function buildPageHtml(rendererName) {
               ? countGroupedItems(result.groups)
               : (result.items || []).length;
             const categoryName = CATEGORY_LABELS[currentCategory] || 'Titles';
-            const sortLabel = currentSort === 'recent' ? 'Recently Added' : 'Alphabetical';
+            const sortLabel = currentSort === 'recent'
+              ? 'Recently Added'
+              : (currentSort === 'played'
+                ? 'Recently ' + playedWord(currentCategory)
+                : 'Alphabetical');
             if (isShowCategory(currentCategory)) {
               setStatus('Showing ' + plural((result.groups || []).length, categoryNouns(currentCategory).group)
                 + ' in ' + categoryName + ' (' + sortLabel + ').');
@@ -4360,7 +4393,7 @@ function buildPageHtml(rendererName) {
     refreshBtn.addEventListener('click', () => loadLibrary(true));
 
     sortSelect.addEventListener('change', () => {
-      currentSort = sortSelect.value === 'recent' ? 'recent' : 'alpha';
+      currentSort = ['recent', 'played'].includes(sortSelect.value) ? sortSelect.value : 'alpha';
       selectedShowName = null;
       expandedSeasonName = null;
       setBackButton(false);
@@ -4415,6 +4448,7 @@ function buildPageHtml(rendererName) {
       expandedSeasonName = null;
       setBackButton(false);
       syncActiveCategoryButton();
+      syncSortWording();
       loadLibrary(false);
     });
 
@@ -6025,6 +6059,7 @@ function buildPageHtml(rendererName) {
 
     function closeBookReader() {
       stopSpeech();
+      refreshForPlayOrder();
       if (bookItem && bookData) {
         window.clearTimeout(bookProgressTimer);
         reportBookProgress(true);
@@ -6231,6 +6266,7 @@ function buildPageHtml(rendererName) {
     document.addEventListener('fullscreenchange', syncBookFullscreenLabel);
 
     loadBookPrefs();
+    syncSortWording();
 
     // ---------------- Read aloud ----------------
 
@@ -6823,6 +6859,7 @@ function buildPageHtml(rendererName) {
     }
 
     function closeComicReader() {
+      refreshForPlayOrder();
       if (readerComic && readerPageCount > 0) {
         window.clearTimeout(comicProgressTimer);
         reportComicProgress(readerComic, readerIndex + 1, readerPageCount);
@@ -7026,6 +7063,7 @@ function buildPageHtml(rendererName) {
 
     function closeLocalPlayer() {
       exitFullscreenIfNeeded();
+      refreshForPlayOrder();
       if (readerComic) {
         closeComicReader();
         return;
@@ -7574,6 +7612,8 @@ function createCastUiServer({
   onMediaOverridesChanged,
   initialGroupOverrides = {},
   onGroupOverridesChanged,
+  initialLastPlayed = {},
+  onLastPlayedChanged,
   initialMetadataCache = {},
   onMetadataCacheChanged,
   coversDir,
@@ -8284,6 +8324,10 @@ function createCastUiServer({
       .filter((item) => item.length > 0),
   );
   const resumePositions = new Map();
+  // When each item was last played or read. Deliberately separate from the
+  // resume stores: those are cleared the moment something is finished, and a
+  // finished item is exactly what "recently played" should rank highest.
+  const lastPlayed = new Map();
   // Where the reader left off, per book: { page (1-based), pageCount }.
   const comicProgress = new Map();
   // Where the e-reader left off: { chapterIndex, offset, percent, label }.
@@ -8519,6 +8563,60 @@ let speechInstallResult = null;
       }
     }
     onBookAnnotationsChanged(payload);
+  };
+
+  for (const [key, value] of Object.entries(initialLastPlayed && typeof initialLastPlayed === 'object'
+    ? initialLastPlayed
+    : {})) {
+    const playedKey = String(key || '').trim();
+    const at = Date.parse(String(value || ''));
+    if (playedKey && Number.isFinite(at)) {
+      lastPlayed.set(playedKey, new Date(at).toISOString());
+    }
+  }
+
+  let lastPlayedSaveTimer = null;
+
+  const persistLastPlayed = () => {
+    if (typeof onLastPlayedChanged !== 'function') {
+      return;
+    }
+    onLastPlayedChanged(Object.fromEntries(lastPlayed.entries()));
+  };
+
+  // Paging through a comic touches this on every page, so writes are batched.
+  const schedulePersistLastPlayed = () => {
+    if (typeof onLastPlayedChanged !== 'function' || lastPlayedSaveTimer) {
+      return;
+    }
+    lastPlayedSaveTimer = setTimeout(() => {
+      lastPlayedSaveTimer = null;
+      persistLastPlayed();
+    }, 2000);
+    if (typeof lastPlayedSaveTimer.unref === 'function') {
+      lastPlayedSaveTimer.unref();
+    }
+  };
+
+  // Moves whenever anything is played, so memoised payloads that depend on the
+  // play order know to rebuild.
+  let lastPlayedStamp = 0;
+
+  /** Records that something was just played or read. */
+  const markPlayed = (key) => {
+    const playedKey = String(key || '').trim();
+    if (!playedKey) {
+      return;
+    }
+    lastPlayed.set(playedKey, new Date().toISOString());
+    lastPlayedStamp += 1;
+    schedulePersistLastPlayed();
+  };
+
+  const lastPlayedAt = (key) => {
+    const stamp = lastPlayed.get(String(key || '').trim());
+    const at = stamp ? Date.parse(stamp) : NaN;
+    return Number.isFinite(at) ? at : 0;
   };
 
   const persistComicProgress = () => {
@@ -9531,7 +9629,9 @@ let speechInstallResult = null;
     const index = getComicIndex();
     // metadataVersion moves whenever a user edit lands, which is the only other
     // thing the payload depends on.
-    const cacheKey = comicIndexSignature + ':' + metadataVersion + ':' + sortMode;
+    // Reading a comic changes this order, so the history is part of the key.
+    const cacheKey = comicIndexSignature + ':' + metadataVersion + ':' + sortMode
+      + (sortMode === 'played' ? ':' + lastPlayed.size + ':' + lastPlayedStamp : '');
     if (comicPayloadCache.has(cacheKey)) {
       return comicPayloadCache.get(cacheKey);
     }
@@ -9551,6 +9651,15 @@ let speechInstallResult = null;
         ), 0),
       ), 0);
 
+      // A comic is as recent as the last volume of it that was read.
+      const latestPlayedAt = seasons.reduce((latest, season) => Math.max(
+        latest,
+        season.items.reduce((seasonMax, item) => Math.max(
+          seasonMax,
+          lastPlayedAt(item.watchedKey || item.filePath || item.id),
+        ), 0),
+      ), 0);
+
       return withGroupOverride(CATEGORY_COMICS, {
         name: group.name,
         displayTitle: group.name,
@@ -9560,6 +9669,7 @@ let speechInstallResult = null;
         imdbRating: null,
         ratingSource: null,
         latestAddedAtMs,
+        latestPlayedAt,
         seasons,
         items: [],
       });
@@ -9568,6 +9678,9 @@ let speechInstallResult = null;
     if (sortMode === 'recent') {
       groups.sort((a, b) => (b.latestAddedAtMs || 0) - (a.latestAddedAtMs || 0)
         || String(a.name).localeCompare(String(b.name)));
+    } else if (sortMode === 'played') {
+      groups.sort((a, b) => (b.latestPlayedAt || 0) - (a.latestPlayedAt || 0)
+        || String(a.displayTitle || a.name).localeCompare(String(b.displayTitle || b.name)));
     }
 
     const payload = { items: [], groups };
@@ -9578,8 +9691,10 @@ let speechInstallResult = null;
     return payload;
   };
 
+  const SORT_MODES = new Set(['alpha', 'recent', 'played']);
+
   const getCategoryPayload = async (category, sortMode = 'alpha') => {
-    const normalizedSort = sortMode === 'recent' ? 'recent' : 'alpha';
+    const normalizedSort = SORT_MODES.has(sortMode) ? sortMode : 'alpha';
 
     if (category === CATEGORY_COMICS) {
       return getComicsPayload(normalizedSort);
@@ -9603,6 +9718,17 @@ let speechInstallResult = null;
     const sortByRecent = (a, b) => {
       const aTs = Number.isFinite(Number(a.addedAtMs)) ? Number(a.addedAtMs) : 0;
       const bTs = Number.isFinite(Number(b.addedAtMs)) ? Number(b.addedAtMs) : 0;
+      if (bTs !== aTs) {
+        return bTs - aTs;
+      }
+      return sortByTitle(a, b);
+    };
+
+    // Anything never played sorts after everything that has been, in
+    // alphabetical order, rather than being jumbled at the end.
+    const sortByPlayed = (a, b) => {
+      const aTs = lastPlayedAt(a.watchedKey || a.filePath || a.id);
+      const bTs = lastPlayedAt(b.watchedKey || b.filePath || b.id);
       if (bTs !== aTs) {
         return bTs - aTs;
       }
@@ -9670,8 +9796,17 @@ let speechInstallResult = null;
             return Math.max(latest, seasonLatest);
           }, 0);
 
+          // A show is as recent as its most recently played episode.
+          const latestPlayedAt = seasons.reduce((latest, season) => (
+            (season.items || []).reduce((seasonMax, episode) => Math.max(
+              seasonMax,
+              lastPlayedAt(episode.watchedKey || episode.filePath || episode.id),
+            ), latest)
+          ), 0);
+
           return withGroupOverride(category, {
             name,
+            latestPlayedAt,
             displayTitle: (firstWithPoster.showDisplayTitle || firstWithPoster.showName || name),
             posterUrl: firstWithPoster.showPosterUrl || firstWithPoster.posterUrl || null,
             year: firstWithPoster.showYear || firstWithPoster.year || null,
@@ -9691,13 +9826,23 @@ let speechInstallResult = null;
               return bTs - aTs;
             }
           }
+          if (normalizedSort === 'played') {
+            const aTs = Number(a.latestPlayedAt) || 0;
+            const bTs = Number(b.latestPlayedAt) || 0;
+            if (bTs !== aTs) {
+              return bTs - aTs;
+            }
+          }
           return String(a.displayTitle || a.name || '').localeCompare(String(b.displayTitle || b.name || ''));
         });
 
       return { items: [], groups };
     }
 
-    const sortedItems = [...enrichedItems].sort(normalizedSort === 'recent' ? sortByRecent : sortByTitle);
+    const comparator = normalizedSort === 'recent'
+      ? sortByRecent
+      : (normalizedSort === 'played' ? sortByPlayed : sortByTitle);
+    const sortedItems = [...enrichedItems].sort(comparator);
     return { items: sortedItems, groups: [] };
   };
 
@@ -9822,6 +9967,7 @@ let speechInstallResult = null;
           resumePositions: Object.fromEntries(resumePositions.entries()),
           comicProgress: Object.fromEntries(comicProgress.entries()),
           bookProgress: Object.fromEntries(bookProgress.entries()),
+          lastPlayed: Object.fromEntries(lastPlayed.entries()),
         });
       } catch (error) {
         sendJson(res, 500, {
@@ -9920,6 +10066,7 @@ let speechInstallResult = null;
         }
 
         const resumeKey = trackingKeyFromMedia(media);
+        markPlayed(resumeKey);
         const savedResume = resumePositions.get(resumeKey);
         const requestedResume = payload.resume !== false;
         const startSeconds = requestedResume && savedResume
@@ -10358,6 +10505,8 @@ let speechInstallResult = null;
           return;
         }
 
+        markPlayed(key);
+
         // Finishing the book marks it read and drops the bookmark.
         if (percent >= BOOK_COMPLETION_PERCENT) {
           bookProgress.delete(key);
@@ -10454,6 +10603,10 @@ let speechInstallResult = null;
           sendJson(res, 400, { ok: false, error: 'Missing comic progress key or page.' });
           return;
         }
+
+        // Recorded before the finished/at-the-start branches below, both of
+        // which drop the bookmark: reading it is still reading it.
+        markPlayed(progressKey);
 
         // Finishing the last page marks the book done and drops the bookmark,
         // so it reopens from the start next time.
@@ -10786,6 +10939,7 @@ let speechInstallResult = null;
         const positionSec = Math.max(0, Math.floor(Number(payload.positionSec) || 0));
         const durationSec = Number(payload.durationSec);
         const resumeKey = trackingKeyFromMedia(media);
+        markPlayed(resumeKey);
 
         if (payload.finished === true) {
           markMediaWatched(media);
@@ -11161,6 +11315,13 @@ let speechInstallResult = null;
     stop: () => {
       stopPlaybackProgressPolling();
       activePlaybacks.clear();
+      // Play history is written on a short debounce, so a pending record would
+      // otherwise be lost when the app is closed right after playing something.
+      if (lastPlayedSaveTimer) {
+        clearTimeout(lastPlayedSaveTimer);
+        lastPlayedSaveTimer = null;
+        persistLastPlayed();
+      }
       if (!server) {
         return Promise.resolve();
       }

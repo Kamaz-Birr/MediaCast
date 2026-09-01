@@ -325,6 +325,46 @@ function saveWatchedMediaKeys(watchedMediaKeys) {
   updateCastUiConfig({ watchedMediaKeys: normalized });
 }
 
+// When each item was last played or read, for the "recently played" sort.
+function loadLastPlayed() {
+  const parsed = readCastUiConfig();
+  const source = parsed.lastPlayed;
+  if (!source || typeof source !== 'object' || Array.isArray(source)) {
+    return {};
+  }
+
+  const normalized = {};
+  for (const [key, value] of Object.entries(source)) {
+    const itemKey = String(key || '').trim();
+    const at = Date.parse(String(value || ''));
+    if (itemKey && Number.isFinite(at)) {
+      normalized[itemKey] = new Date(at).toISOString();
+    }
+  }
+  return normalized;
+}
+
+function saveLastPlayed(lastPlayed) {
+  const source = lastPlayed && typeof lastPlayed === 'object' ? lastPlayed : {};
+  const entries = [];
+  for (const [key, value] of Object.entries(source)) {
+    const itemKey = String(key || '').trim();
+    const at = Date.parse(String(value || ''));
+    if (itemKey && Number.isFinite(at)) {
+      entries.push([itemKey, at]);
+    }
+  }
+
+  // Only the most recent few hundred matter for sorting, and this file is
+  // rewritten often enough that it should not grow without bound.
+  entries.sort((a, b) => b[1] - a[1]);
+  const normalized = {};
+  for (const [key, at] of entries.slice(0, 500)) {
+    normalized[key] = new Date(at).toISOString();
+  }
+  updateCastUiConfig({ lastPlayed: normalized });
+}
+
 function loadBookProgress() {
   const parsed = readCastUiConfig();
   const source = parsed.bookProgress;
@@ -1160,6 +1200,8 @@ program
         onResumePositionsChanged: (positions) => saveResumePositions(positions),
         initialComicProgress: loadComicProgress(),
         onComicProgressChanged: (progress) => saveComicProgress(progress),
+        initialLastPlayed: loadLastPlayed(),
+        onLastPlayedChanged: (played) => saveLastPlayed(played),
         initialBookProgress: loadBookProgress(),
         onBookProgressChanged: (progress) => saveBookProgress(progress),
         initialBookAnnotations: loadBookAnnotations(),
