@@ -20,3 +20,7 @@ npm-debug.log*
 # OS noise
 .DS_Store
 Thumbs.db
+
+# Speech engine bundled into the exe at build time. Large binaries, fetched by
+# `npm run fetch-speech-engine` rather than committed.
+vendor/

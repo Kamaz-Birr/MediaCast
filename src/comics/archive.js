@@ -1,5 +1,7 @@
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
+import crypto from 'crypto';
 import { createRequire } from 'module';
 import { fileURLToPath } from 'url';
 import { readZipEntries, readZipEntryData, looksLikeZip } from './zipReader.js';
@@ -15,6 +17,17 @@ const moduleDir = typeof __dirname === 'string'
 // files are frequently zips and vice versa, so dispatch on the magic bytes.
 
 const PAGE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp']);
+const NESTED_ARCHIVE_EXTENSIONS = new Set(['.zip', '.rar', '.cbz', '.cbr']);
+// Separates the inner archive from the page inside it in a synthetic page name.
+const NESTED_SEPARATOR = String.fromCharCode(0);
+
+function isNestedArchiveName(name) {
+  const clean = String(name || '');
+  if (clean.endsWith('/') || clean.includes('__MACOSX')) {
+    return false;
+  }
+  return NESTED_ARCHIVE_EXTENSIONS.has(path.extname(clean).toLowerCase());
+}
 
 let cachedWasm = null;
 let cachedRarModule = null;
@@ -133,26 +146,24 @@ async function readRarPage(filePath, entryName) {
   throw new Error(`Page "${entryName}" could not be extracted.`);
 }
 
-/**
- * Page names in reading order. Dispatches on content, not on the extension,
- * because mislabelled comic archives are common.
- */
-export async function listComicPages(filePath) {
+async function listAllEntryNames(filePath) {
   if (looksLikeZip(filePath)) {
-    return readZipEntries(filePath)
-      .filter((entry) => isPageName(entry.name))
-      .map((entry) => entry.name)
-      .sort(comparePageNames);
+    return readZipEntries(filePath).map((entry) => entry.name);
   }
-
   if (looksLikeRar(filePath)) {
-    return listRarPages(filePath);
+    const extractor = await readRarArchive(filePath);
+    const names = [];
+    for (const header of extractor.getFileList().fileHeaders) {
+      if (!header.flags.directory) {
+        names.push(header.name);
+      }
+    }
+    return names;
   }
-
   throw new Error('Unrecognised comic archive: it is neither a zip nor a rar.');
 }
 
-export async function readComicPage(filePath, entryName) {
+async function readRawEntry(filePath, entryName) {
   if (looksLikeZip(filePath)) {
     const entry = readZipEntries(filePath).find((item) => item.name === entryName);
     if (!entry) {
@@ -160,12 +171,72 @@ export async function readComicPage(filePath, entryName) {
     }
     return readZipEntryData(filePath, entry);
   }
+  return readRarPage(filePath, entryName);
+}
 
-  if (looksLikeRar(filePath)) {
-    return readRarPage(filePath, entryName);
+// Some volumes are archives of per-chapter archives. Unpacking the inner archive
+// to a cached temp file lets the whole volume read as one continuous book.
+async function materialiseNested(filePath, nestedName) {
+  const stem = crypto.createHash('sha1')
+    .update(path.resolve(filePath) + '::' + nestedName)
+    .digest('hex')
+    .slice(0, 20);
+  const outPath = path.join(os.tmpdir(), 'mediacast-nested', stem + path.extname(nestedName));
+
+  if (fs.existsSync(outPath) && fs.statSync(outPath).size > 0) {
+    return outPath;
   }
 
-  throw new Error('Unrecognised comic archive: it is neither a zip nor a rar.');
+  const data = await readRawEntry(filePath, nestedName);
+  fs.mkdirSync(path.dirname(outPath), { recursive: true });
+  fs.writeFileSync(outPath, data);
+  return outPath;
+}
+
+/**
+ * Page names in reading order. Dispatches on content, not on the extension,
+ * because mislabelled comic archives are common. An archive holding only other
+ * archives is expanded so the volume reads straight through.
+ */
+export async function listComicPages(filePath) {
+  const names = await listAllEntryNames(filePath);
+
+  const pages = names.filter(isPageName).sort(comparePageNames);
+  if (pages.length > 0) {
+    return pages;
+  }
+
+  const nested = names.filter(isNestedArchiveName).sort(comparePageNames);
+  if (nested.length === 0) {
+    return [];
+  }
+
+  const expanded = [];
+  for (const nestedName of nested) {
+    try {
+      const nestedPath = await materialiseNested(filePath, nestedName);
+      const innerPages = await listComicPages(nestedPath);
+      for (const innerName of innerPages) {
+        expanded.push(nestedName + NESTED_SEPARATOR + innerName);
+      }
+    } catch (error) {
+      console.warn(`[Comic] Skipping "${nestedName}": ${error.message}`);
+    }
+  }
+
+  return expanded;
+}
+
+export async function readComicPage(filePath, entryName) {
+  const separatorAt = String(entryName).indexOf(NESTED_SEPARATOR);
+  if (separatorAt !== -1) {
+    const nestedName = entryName.slice(0, separatorAt);
+    const innerName = entryName.slice(separatorAt + 1);
+    const nestedPath = await materialiseNested(filePath, nestedName);
+    return readComicPage(nestedPath, innerName);
+  }
+
+  return readRawEntry(filePath, entryName);
 }
 
 export function comicArchiveKind(filePath) {

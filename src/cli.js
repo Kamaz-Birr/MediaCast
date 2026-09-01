@@ -325,6 +325,156 @@ function saveWatchedMediaKeys(watchedMediaKeys) {
   updateCastUiConfig({ watchedMediaKeys: normalized });
 }
 
+function loadBookProgress() {
+  const parsed = readCastUiConfig();
+  const source = parsed.bookProgress;
+  if (!source || typeof source !== 'object' || Array.isArray(source)) {
+    return {};
+  }
+
+  const normalized = {};
+  for (const [key, value] of Object.entries(source)) {
+    const itemKey = String(key || '').trim();
+    if (!itemKey || !value || typeof value !== 'object') {
+      continue;
+    }
+
+    const chapterIndex = Number(value.chapterIndex);
+    if (!Number.isFinite(chapterIndex) || chapterIndex < 0) {
+      continue;
+    }
+
+    normalized[itemKey] = {
+      chapterIndex: Math.floor(chapterIndex),
+      offset: Math.max(0, Math.floor(Number(value.offset) || 0)),
+      percent: Math.max(0, Math.min(1, Number(value.percent) || 0)),
+      label: typeof value.label === 'string' ? value.label : '',
+      updatedAt: typeof value.updatedAt === 'string' ? value.updatedAt : new Date().toISOString(),
+    };
+  }
+
+  return normalized;
+}
+
+function saveBookProgress(bookProgress) {
+  updateCastUiConfig({ bookProgress: loadBookProgressShape(bookProgress) });
+}
+
+// Shared by load and save so the file only ever holds the shape above.
+function loadBookProgressShape(source) {
+  const input = source && typeof source === 'object' ? source : {};
+  const normalized = {};
+  for (const [key, value] of Object.entries(input)) {
+    const itemKey = String(key || '').trim();
+    if (!itemKey || !value || typeof value !== 'object') {
+      continue;
+    }
+    const chapterIndex = Number(value.chapterIndex);
+    if (!Number.isFinite(chapterIndex) || chapterIndex < 0) {
+      continue;
+    }
+    normalized[itemKey] = {
+      chapterIndex: Math.floor(chapterIndex),
+      offset: Math.max(0, Math.floor(Number(value.offset) || 0)),
+      percent: Math.max(0, Math.min(1, Number(value.percent) || 0)),
+      label: typeof value.label === 'string' ? value.label : '',
+      updatedAt: typeof value.updatedAt === 'string' ? value.updatedAt : new Date().toISOString(),
+    };
+  }
+  return normalized;
+}
+
+function loadBookAnnotations() {
+  const parsed = readCastUiConfig();
+  const source = parsed.bookAnnotations;
+  if (!source || typeof source !== 'object' || Array.isArray(source)) {
+    return {};
+  }
+
+  const normalized = {};
+  for (const [key, value] of Object.entries(source)) {
+    const itemKey = String(key || '').trim();
+    if (!itemKey || !Array.isArray(value)) {
+      continue;
+    }
+    const entries = value.filter((entry) => entry && typeof entry === 'object' && entry.id);
+    if (entries.length > 0) {
+      normalized[itemKey] = entries;
+    }
+  }
+
+  return normalized;
+}
+
+function saveBookAnnotations(bookAnnotations) {
+  const source = bookAnnotations && typeof bookAnnotations === 'object' ? bookAnnotations : {};
+  const normalized = {};
+  for (const [key, value] of Object.entries(source)) {
+    const itemKey = String(key || '').trim();
+    if (!itemKey || !Array.isArray(value) || value.length === 0) {
+      continue;
+    }
+    normalized[itemKey] = value;
+  }
+  updateCastUiConfig({ bookAnnotations: normalized });
+}
+
+function loadComicProgress() {
+  const parsed = readCastUiConfig();
+  const source = parsed.comicProgress;
+  if (!source || typeof source !== 'object' || Array.isArray(source)) {
+    return {};
+  }
+
+  const normalized = {};
+  for (const [key, value] of Object.entries(source)) {
+    const itemKey = String(key || '').trim();
+    if (!itemKey || !value || typeof value !== 'object') {
+      continue;
+    }
+
+    const page = Number(value.page);
+    if (!Number.isFinite(page) || page <= 1) {
+      continue;
+    }
+
+    const pageCount = Number(value.pageCount);
+    normalized[itemKey] = {
+      page: Math.floor(page),
+      pageCount: Number.isFinite(pageCount) && pageCount > 0 ? Math.floor(pageCount) : null,
+      updatedAt: typeof value.updatedAt === 'string' ? value.updatedAt : new Date().toISOString(),
+    };
+  }
+
+  return normalized;
+}
+
+function saveComicProgress(comicProgress) {
+  const source = comicProgress && typeof comicProgress === 'object' ? comicProgress : {};
+  const normalized = {};
+
+  for (const [key, value] of Object.entries(source)) {
+    const itemKey = String(key || '').trim();
+    if (!itemKey || !value || typeof value !== 'object') {
+      continue;
+    }
+
+    const page = Number(value.page);
+    if (!Number.isFinite(page) || page <= 1) {
+      continue;
+    }
+
+    const pageCount = Number(value.pageCount);
+    normalized[itemKey] = {
+      page: Math.floor(page),
+      pageCount: Number.isFinite(pageCount) && pageCount > 0 ? Math.floor(pageCount) : null,
+      updatedAt: typeof value.updatedAt === 'string' ? value.updatedAt : new Date().toISOString(),
+    };
+  }
+
+  updateCastUiConfig({ comicProgress: normalized });
+}
+
 function loadResumePositions() {
   const parsed = readCastUiConfig();
   const source = parsed.resumePositions;
@@ -459,6 +609,12 @@ function getThumbnailsDir() {
   return path.join(path.dirname(getCastUiConfigPath()), 'thumbnails');
 }
 
+// Where the Piper engine and its voices live. Kept beside the other caches so
+// a user can drop a voice in without touching the executable.
+function getSpeechDir() {
+  return path.join(path.dirname(getCastUiConfigPath()), 'speech');
+}
+
 function getComicsCacheDir() {
   return path.join(path.dirname(getCastUiConfigPath()), 'comics');
 }
@@ -537,6 +693,16 @@ function loadMediaOverrides() {
 
 function saveMediaOverrides(overrides) {
   updateCastUiConfig({ mediaOverrides: normalizeMediaOverrides(overrides) });
+}
+
+// Show and comic tiles are edited by group name, not by file path, so their
+// overrides live in their own map.
+function loadGroupOverrides() {
+  return normalizeMediaOverrides(readCastUiConfig().groupOverrides);
+}
+
+function saveGroupOverrides(overrides) {
+  updateCastUiConfig({ groupOverrides: normalizeMediaOverrides(overrides) });
 }
 
 function loadMediaLibraryCache() {
@@ -992,16 +1158,25 @@ program
         onWatchedKeysChanged: (keys) => saveWatchedMediaKeys(keys),
         initialResumePositions: loadResumePositions(),
         onResumePositionsChanged: (positions) => saveResumePositions(positions),
+        initialComicProgress: loadComicProgress(),
+        onComicProgressChanged: (progress) => saveComicProgress(progress),
+        initialBookProgress: loadBookProgress(),
+        onBookProgressChanged: (progress) => saveBookProgress(progress),
+        initialBookAnnotations: loadBookAnnotations(),
+        onBookAnnotationsChanged: (annotations) => saveBookAnnotations(annotations),
         initialCustomCategories: loadCustomCategories(),
         initialFolderCategories: loadFolderCategories(),
         onCategoriesChanged: (payload) => saveCategoryConfig(payload),
         initialMediaOverrides: loadMediaOverrides(),
         onMediaOverridesChanged: (overrides) => saveMediaOverrides(overrides),
+        initialGroupOverrides: loadGroupOverrides(),
+        onGroupOverridesChanged: (overrides) => saveGroupOverrides(overrides),
         initialMetadataCache: loadMetadataCache(),
         onMetadataCacheChanged: (entries) => saveMetadataCache(entries),
         coversDir: getCoversDir(),
         subtitlesDir: getSubtitlesDir(),
         comicsDir: getComicsCacheDir(),
+        speechDir: getSpeechDir(),
       });
 
       const uiInfo = await uiServer.start();

@@ -15,7 +15,22 @@ import {
   getMediaInfo,
 } from '../upnp/soap.js';
 import { discoverRenderers } from '../upnp/discovery.js';
-import { isImageFile, isComicFile, isComicArchiveFile } from '../utils/media.js';
+import { isImageFile, isComicFile, isComicArchiveFile, isBookFile } from '../utils/media.js';
+import {
+  openEpub,
+  readEpubResource,
+  prepareChapterHtml,
+  prepareStylesheet,
+  chapterPlainText,
+} from '../books/epub.js';
+import {
+  speechSentences,
+  chapterSpeechText,
+  findPiper,
+  synthesiseWithPiper,
+  speechCacheKey,
+} from '../books/speech.js';
+import { ensureBundledEngine } from '../books/engineInstall.js';
 import { listComicPages, readComicPage, comicArchiveKind } from '../comics/archive.js';
 import { collectComicBooks, buildComicGroups } from '../comics/library.js';
 import {
@@ -55,9 +70,13 @@ function isLibraryItem(media) {
   if (!media || !media.filePath) {
     return false;
   }
-  return isLikelyMovie(media) || isImageFile(media.filePath) || isComicFile(media.filePath);
+  return isLikelyMovie(media)
+    || isImageFile(media.filePath)
+    || isComicFile(media.filePath)
+    || isBookFile(media.filePath);
 }
 
+const CATEGORY_BOOKS = 'books';
 const CATEGORY_MOVIES = 'movies';
 const CATEGORY_TV_SHOWS = 'tv-shows';
 const CATEGORY_ANIME_MOVIES = 'anime-movies';
@@ -76,6 +95,7 @@ const BUILT_IN_CATEGORIES = [
   { id: CATEGORY_ANIME_SHOWS, label: 'Anime Shows', kind: CATEGORY_KIND_SHOWS, builtIn: true },
   { id: CATEGORY_PHOTOS, label: 'Photos', kind: CATEGORY_KIND_MOVIES, builtIn: true },
   { id: CATEGORY_COMICS, label: 'Comics', kind: CATEGORY_KIND_SHOWS, builtIn: true },
+  { id: CATEGORY_BOOKS, label: 'Books', kind: CATEGORY_KIND_MOVIES, builtIn: true },
 ];
 
 const COVER_MIME_EXTENSIONS = {
@@ -104,6 +124,52 @@ function normalizeFolderKey(value) {
 
 const AUTO_NEXT_MIN_CREDITS_WATCH_SEC = 5;
 const WATCHED_COMPLETION_PROGRESS = 0.99;
+// Reaching the end of the last chapter counts as finishing the book.
+const BOOK_COMPLETION_PERCENT = 0.995;
+const ANNOTATION_KINDS = new Set(['highlight', 'note', 'bookmark']);
+const ANNOTATION_COLORS = new Set(['yellow', 'green', 'blue', 'pink', 'purple']);
+
+// Annotations arrive from the browser, so every field is bounded here before it
+// is stored or handed back to another session.
+function normalizeAnnotation(input) {
+  if (!input || typeof input !== 'object') {
+    return null;
+  }
+
+  const kind = String(input.kind || '').trim();
+  if (!ANNOTATION_KINDS.has(kind)) {
+    return null;
+  }
+
+  const chapterIndex = Math.floor(Number(input.chapterIndex));
+  if (!Number.isFinite(chapterIndex) || chapterIndex < 0) {
+    return null;
+  }
+
+  const start = Math.max(0, Math.floor(Number(input.start) || 0));
+  const end = Math.max(start, Math.floor(Number(input.end) || 0));
+  if (kind !== 'bookmark' && end <= start) {
+    return null;
+  }
+
+  const color = ANNOTATION_COLORS.has(String(input.color)) ? String(input.color) : 'yellow';
+  const id = String(input.id || '').trim().slice(0, 64)
+    || crypto.randomBytes(8).toString('hex');
+
+  return {
+    id,
+    kind,
+    chapterIndex,
+    start,
+    end,
+    color,
+    text: String(input.text || '').slice(0, 4000),
+    note: String(input.note || '').slice(0, 4000),
+    chapterLabel: String(input.chapterLabel || '').slice(0, 200),
+    createdAt: typeof input.createdAt === 'string' ? input.createdAt : new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+}
 
 function splitPathParts(filePath) {
   return path.resolve(filePath).split(/[\\/]+/).filter(Boolean);
@@ -543,6 +609,7 @@ function buildPageHtml(rendererName) {
 
     .button-row {
       display: flex;
+      flex: none;
       gap: 8px;
       margin-top: 12px;
     }
@@ -1179,17 +1246,28 @@ function buildPageHtml(rendererName) {
       padding: 0;
       overflow: hidden;
       background: #05080f;
+      display: flex;
+      flex-direction: column;
     }
+
+    /* Keep in step with .modal's max-height and the bar's own height. */
+    :root { --player-media-max: calc(min(86vh, 760px) - 104px); }
 
     .player-frame {
       position: relative;
       background: #000;
       line-height: 0;
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
     }
 
     .player-frame video {
       width: 100%;
-      max-height: 74vh;
+      max-height: var(--player-media-max);
       display: block;
       background: #000;
     }
@@ -1203,6 +1281,7 @@ function buildPageHtml(rendererName) {
     }
 
     .player-bar {
+      flex: 0 0 auto;
       display: flex;
       align-items: center;
       gap: 12px;
@@ -1235,7 +1314,7 @@ function buildPageHtml(rendererName) {
 
     .viewer-image {
       width: 100%;
-      max-height: 74vh;
+      max-height: var(--player-media-max);
       object-fit: contain;
       display: block;
       background: #000;
@@ -1302,7 +1381,7 @@ function buildPageHtml(rendererName) {
 
     .reader-page {
       width: 100%;
-      max-height: 78vh;
+      max-height: var(--player-media-max);
       object-fit: contain;
       display: block;
       background: #05080f;
@@ -1339,6 +1418,483 @@ function buildPageHtml(rendererName) {
       font-weight: 800;
       letter-spacing: 0.04em;
       white-space: nowrap;
+    }
+
+    /* ---------- Book reader ---------- */
+
+    .book-modal {
+      width: min(1180px, 100%);
+      max-width: 100%;
+      /* An iframe has no intrinsic height, so the reader is sized explicitly
+         rather than left to collapse around its content. */
+      height: min(92vh, 900px);
+      max-height: min(92vh, 900px);
+      padding: 0;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      background: var(--panel);
+    }
+
+    .book-head {
+      flex: 0 0 auto;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 14px 56px 14px 18px;
+      border-bottom: 1px solid var(--stroke);
+    }
+
+    .book-heading {
+      flex: 1 1 auto;
+      min-width: 0;
+    }
+
+    .book-heading strong {
+      display: block;
+      font-size: 0.95rem;
+      font-weight: 800;
+      color: var(--text);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .book-heading span {
+      display: block;
+      font-size: 0.72rem;
+      font-weight: 600;
+      color: var(--faint);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .book-head .neu-btn {
+      flex: 0 0 auto;
+      padding: 8px 12px;
+      font-size: 0.72rem;
+    }
+
+    .book-body {
+      flex: 1 1 auto;
+      min-height: 0;
+      display: flex;
+    }
+
+    /* Contents and notes share the side rail; only one is open at a time. */
+    .book-side {
+      flex: 0 0 288px;
+      min-width: 0;
+      border-right: 1px solid var(--stroke);
+      display: flex;
+      flex-direction: column;
+      background: rgba(6, 10, 18, 0.35);
+      animation: side-in 220ms var(--ease);
+    }
+
+    .book-side[hidden] { display: none; }
+
+    @keyframes side-in {
+      from { opacity: 0; transform: translateX(-10px); }
+      to   { opacity: 1; transform: translateX(0); }
+    }
+
+    .book-side-tabs {
+      flex: 0 0 auto;
+      display: flex;
+      gap: 6px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--stroke);
+    }
+
+    .book-side-tab {
+      flex: 1 1 0;
+      min-width: 0;
+      padding: 7px 8px;
+      border-radius: 9px;
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--faint);
+      font: inherit;
+      font-size: 0.72rem;
+      font-weight: 700;
+      cursor: pointer;
+      transition: background 160ms var(--ease), color 160ms var(--ease);
+    }
+
+    .book-side-tab:hover { color: var(--text); background: rgba(255, 255, 255, 0.05); }
+
+    .book-side-tab.active {
+      color: var(--text);
+      background: rgba(255, 255, 255, 0.08);
+      border-color: var(--stroke-hi);
+    }
+
+    .book-side-list {
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow-y: auto;
+      padding: 8px;
+    }
+
+    .book-side-list[hidden] { display: none; }
+
+    .book-toc-item {
+      display: block;
+      width: 100%;
+      text-align: left;
+      padding: 8px 10px;
+      border: 0;
+      border-radius: 9px;
+      background: transparent;
+      color: var(--muted);
+      font: inherit;
+      font-size: 0.78rem;
+      line-height: 1.35;
+      cursor: pointer;
+      transition: background 150ms var(--ease), color 150ms var(--ease);
+    }
+
+    .book-toc-item:hover { background: rgba(255, 255, 255, 0.06); color: var(--text); }
+
+    .book-toc-item.current {
+      background: rgba(96, 165, 250, 0.16);
+      color: var(--text);
+      font-weight: 700;
+    }
+
+    .book-toc-item.depth-1 { padding-left: 24px; font-size: 0.74rem; }
+    .book-toc-item.depth-2 { padding-left: 38px; font-size: 0.72rem; }
+
+    .book-note-card {
+      position: relative;
+      padding: 10px 30px 10px 12px;
+      margin-bottom: 8px;
+      border-radius: 11px;
+      border: 1px solid var(--stroke);
+      border-left: 3px solid var(--note-accent, #facc15);
+      background: rgba(255, 255, 255, 0.035);
+      cursor: pointer;
+      transition: background 150ms var(--ease), transform 150ms var(--ease);
+    }
+
+    .book-note-card:hover { background: rgba(255, 255, 255, 0.07); transform: translateX(2px); }
+
+    .book-note-kind {
+      display: block;
+      font-size: 0.62rem;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--faint);
+      margin-bottom: 3px;
+    }
+
+    .book-note-text {
+      display: block;
+      font-size: 0.76rem;
+      line-height: 1.4;
+      color: var(--text);
+    }
+
+    .book-note-body {
+      display: block;
+      margin-top: 6px;
+      padding-top: 6px;
+      border-top: 1px dashed var(--stroke);
+      font-size: 0.73rem;
+      line-height: 1.4;
+      color: var(--muted);
+      font-style: italic;
+    }
+
+    .book-note-remove {
+      position: absolute;
+      top: 6px;
+      right: 6px;
+      width: 20px;
+      height: 20px;
+      display: grid;
+      place-items: center;
+      border: 0;
+      border-radius: 6px;
+      background: transparent;
+      color: var(--faint);
+      font-size: 0.9rem;
+      line-height: 1;
+      cursor: pointer;
+    }
+
+    .book-note-remove:hover { background: rgba(248, 113, 113, 0.18); color: #fca5a5; }
+
+    .book-side-empty {
+      padding: 18px 12px;
+      font-size: 0.76rem;
+      color: var(--faint);
+      text-align: center;
+      line-height: 1.5;
+    }
+
+    .book-stage {
+      position: relative;
+      flex: 1 1 auto;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+    }
+
+    #bookFrame {
+      flex: 1 1 auto;
+      width: 100%;
+      min-height: 0;
+      border: 0;
+      background: var(--book-bg, #f6f1e6);
+    }
+
+    .book-foot {
+      flex: 0 0 auto;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 18px;
+      border-top: 1px solid var(--stroke);
+    }
+
+    .book-foot .neu-btn { padding: 8px 14px; font-size: 0.72rem; }
+
+    .book-position {
+      flex: 1 1 auto;
+      min-width: 0;
+      font-size: 0.72rem;
+      font-weight: 600;
+      color: var(--faint);
+      text-align: center;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .book-rail {
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      height: 3px;
+      background: rgba(255, 255, 255, 0.07);
+    }
+
+    .book-rail span {
+      display: block;
+      height: 100%;
+      width: 0;
+      background: linear-gradient(90deg, var(--accent), var(--accent-2));
+      transition: width 240ms var(--ease);
+    }
+
+    /* Selection toolbar, positioned over the text being marked. */
+    .book-tools {
+      position: absolute;
+      z-index: 5;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 7px 8px;
+      border-radius: 12px;
+      border: 1px solid var(--stroke-hi);
+      background: rgba(16, 22, 36, 0.97);
+      box-shadow: var(--shadow-lg);
+      animation: tools-in 160ms var(--ease);
+    }
+
+    .book-tools[hidden] { display: none; }
+
+    @keyframes tools-in {
+      from { opacity: 0; transform: translateY(6px) scale(0.96); }
+      to   { opacity: 1; transform: translateY(0) scale(1); }
+    }
+
+    .book-swatch {
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      border: 2px solid rgba(255, 255, 255, 0.28);
+      cursor: pointer;
+      padding: 0;
+      transition: transform 150ms var(--ease), border-color 150ms var(--ease);
+    }
+
+    .book-swatch:hover { transform: scale(1.16); border-color: #fff; }
+
+    .book-swatch.yellow { background: #facc15; }
+    .book-swatch.green  { background: #4ade80; }
+    .book-swatch.blue   { background: #60a5fa; }
+    .book-swatch.pink   { background: #f472b6; }
+    .book-swatch.purple { background: #c084fc; }
+
+    .book-tools .neu-btn { padding: 6px 10px; font-size: 0.68rem; }
+
+    .book-tools-divider {
+      width: 1px;
+      height: 20px;
+      background: var(--stroke-hi);
+    }
+
+    /* Type controls, shown from the Aa button. */
+    .book-type {
+      position: absolute;
+      top: 8px;
+      right: 14px;
+      z-index: 6;
+      width: 248px;
+      padding: 14px;
+      border-radius: 14px;
+      border: 1px solid var(--stroke-hi);
+      background: rgba(16, 22, 36, 0.98);
+      box-shadow: var(--shadow-lg);
+      animation: tools-in 180ms var(--ease);
+    }
+
+    .book-type[hidden] { display: none; }
+
+    .book-type-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+
+    .book-type-row:last-child { margin-bottom: 0; }
+
+    .book-type-row label {
+      font-size: 0.72rem;
+      font-weight: 700;
+      color: var(--muted);
+    }
+
+    .book-type-row input[type="range"] { flex: 1 1 auto; min-width: 0; }
+
+    .book-theme-group { display: flex; gap: 6px; }
+
+    .book-theme {
+      width: 30px;
+      height: 26px;
+      border-radius: 8px;
+      border: 2px solid var(--stroke-hi);
+      cursor: pointer;
+      padding: 0;
+      transition: transform 150ms var(--ease), border-color 150ms var(--ease);
+    }
+
+    .book-theme:hover { transform: translateY(-1px); }
+    .book-theme.active { border-color: var(--accent); }
+
+    .book-theme.light { background: #ffffff; }
+    .book-theme.sepia { background: #f6ecd8; }
+    .book-theme.night { background: #14181f; }
+
+    /* Read-aloud bar, shown under the book while speech is running. */
+    .book-speech {
+      flex: 0 0 auto;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 18px;
+      border-top: 1px solid var(--stroke);
+      background: rgba(96, 165, 250, 0.07);
+      animation: side-in 200ms var(--ease);
+    }
+
+    .book-speech[hidden] { display: none; }
+
+    .book-speech .neu-btn { padding: 8px 12px; font-size: 0.7rem; }
+
+    .book-speech-status {
+      flex: 1 1 auto;
+      min-width: 0;
+      font-size: 0.72rem;
+      font-weight: 600;
+      color: var(--muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .book-speech-status.warn { color: #fcd34d; }
+
+    .book-speech select {
+      max-width: 190px;
+      padding: 7px 10px;
+      font-size: 0.7rem;
+    }
+
+    .book-speech-rate {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.7rem;
+      font-weight: 700;
+      color: var(--faint);
+    }
+
+    .book-speech-rate input { width: 96px; }
+
+    /* The sentence being spoken, marked inside the book's own frame. */
+    .book-modal.is-fullscreen,
+    .book-modal.is-fullscreen,
+    .book-modal:fullscreen {
+      width: 100vw;
+      max-width: 100vw;
+      max-height: 100vh;
+      border: 0;
+      border-radius: 0;
+    }
+
+    @media (max-width: 780px) {
+      .book-side { position: absolute; inset: 0 auto 0 0; z-index: 4; flex-basis: 82%; }
+      .book-body { position: relative; }
+    }
+
+    /* ---------- Fullscreen ---------- */
+
+    /* The panel itself goes fullscreen so the page controls stay reachable. */
+    .player-modal.is-fullscreen,
+    .player-modal:fullscreen {
+      width: 100vw;
+      max-width: 100vw;
+      max-height: 100vh;
+      border: 0;
+      border-radius: 0;
+      display: flex;
+      flex-direction: column;
+      background: #05080f;
+    }
+
+    .player-modal.is-fullscreen .player-frame,
+    .player-modal:fullscreen .player-frame {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 0;
+    }
+
+    .player-modal.is-fullscreen .reader-page,
+    .player-modal.is-fullscreen .viewer-image,
+    .player-modal.is-fullscreen video,
+    .player-modal:fullscreen .reader-page,
+    .player-modal:fullscreen .viewer-image,
+    .player-modal:fullscreen video {
+      max-height: calc(100vh - 64px);
+      width: auto;
+      max-width: 100vw;
+      margin: 0 auto;
+    }
+
+    .player-modal.is-fullscreen .player-bar,
+    .player-modal:fullscreen .player-bar {
+      flex: none;
     }
 
     /* ---------- Status bar ---------- */
@@ -1419,6 +1975,21 @@ function buildPageHtml(rendererName) {
 
     /* Episode stills are 16:9, so give those cards a matching frame. */
     .movie-card.is-episode { aspect-ratio: 16 / 10; }
+
+    /* That frame is short: hiding the synopsis and holding the title to one
+       line leaves room for Play and Watched at their full height. */
+    .movie-card.is-episode .movie-plot { display: none; }
+
+    .movie-card.is-episode .movie-title {
+      display: -webkit-box;
+      -webkit-line-clamp: 1;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+
+    .movie-card.is-episode .movie-overlay { gap: 4px; }
+
+    .movie-card.is-episode:hover .movie-overlay .button-row { margin-top: 8px; }
 
     @keyframes card-in {
       from { opacity: 0; transform: translateY(18px) scale(0.97); }
@@ -1925,9 +2496,98 @@ function buildPageHtml(rendererName) {
       <div class="player-bar">
         <span class="player-title" id="playerTitle"></span>
         <button class="neu-btn secondary" id="playerTranscode">Force Transcode</button>
+        <button class="neu-btn secondary" id="playerFullscreen">Fullscreen</button>
         <span class="reader-count" id="readerCount" hidden></span>
         <div class="reader-progress" id="readerProgress" hidden><span id="readerProgressFill"></span></div>
         <span class="player-note" id="playerNote"></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="bookModal" hidden>
+    <div class="modal book-modal" role="dialog" aria-modal="true" aria-labelledby="bookTitle">
+      <button class="modal-close" id="bookClose" aria-label="Close book">&times;</button>
+
+      <div class="book-head">
+        <button class="neu-btn secondary" id="bookSideToggle" aria-expanded="false">Contents</button>
+        <div class="book-heading">
+          <strong id="bookTitle"></strong>
+          <span id="bookAuthor"></span>
+        </div>
+        <button class="neu-btn secondary" id="bookListen">Read Aloud</button>
+        <button class="neu-btn secondary" id="bookType" aria-expanded="false">Aa</button>
+        <button class="neu-btn secondary" id="bookMark">Bookmark</button>
+        <button class="neu-btn secondary" id="bookFullscreen">Fullscreen</button>
+      </div>
+
+      <div class="book-body">
+        <aside class="book-side" id="bookSide" hidden>
+          <div class="book-side-tabs">
+            <button class="book-side-tab active" id="bookTabToc">Contents</button>
+            <button class="book-side-tab" id="bookTabNotes">Notes</button>
+          </div>
+          <div class="book-side-list" id="bookTocList"></div>
+          <div class="book-side-list" id="bookNotesList" hidden></div>
+        </aside>
+
+        <div class="book-stage" id="bookStage">
+          <iframe id="bookFrame" title="Book text" sandbox="allow-same-origin"></iframe>
+
+          <div class="book-tools" id="bookTools" hidden>
+            <button class="book-swatch yellow" data-color="yellow" title="Highlight yellow"></button>
+            <button class="book-swatch green" data-color="green" title="Highlight green"></button>
+            <button class="book-swatch blue" data-color="blue" title="Highlight blue"></button>
+            <button class="book-swatch pink" data-color="pink" title="Highlight pink"></button>
+            <button class="book-swatch purple" data-color="purple" title="Highlight purple"></button>
+            <span class="book-tools-divider"></span>
+            <button class="neu-btn secondary" id="bookAddNote">Note</button>
+            <button class="neu-btn secondary" id="bookCopy">Copy</button>
+          </div>
+
+          <div class="book-type" id="bookTypePanel" hidden>
+            <div class="book-type-row">
+              <label for="bookFontSize">Size</label>
+              <input type="range" id="bookFontSize" min="80" max="200" step="5" value="110" />
+            </div>
+            <div class="book-type-row">
+              <label for="bookLineHeight">Spacing</label>
+              <input type="range" id="bookLineHeight" min="120" max="240" step="10" value="170" />
+            </div>
+            <div class="book-type-row">
+              <label for="bookWidth">Margins</label>
+              <input type="range" id="bookWidth" min="480" max="1000" step="20" value="720" />
+            </div>
+            <div class="book-type-row">
+              <label>Theme</label>
+              <div class="book-theme-group">
+                <button class="book-theme light" data-theme="light" title="Light"></button>
+                <button class="book-theme sepia active" data-theme="sepia" title="Sepia"></button>
+                <button class="book-theme night" data-theme="night" title="Night"></button>
+              </div>
+            </div>
+          </div>
+
+          <div class="book-rail"><span id="bookRailFill"></span></div>
+        </div>
+      </div>
+
+      <div class="book-speech" id="bookSpeechBar" hidden>
+        <button class="neu-btn" id="speechToggle">Pause</button>
+        <button class="neu-btn secondary" id="speechPrev" aria-label="Previous sentence">&#8249;</button>
+        <button class="neu-btn secondary" id="speechNext" aria-label="Next sentence">&#8250;</button>
+        <span class="book-speech-status" id="speechStatus"></span>
+        <label class="book-speech-rate" for="speechRate">Speed
+          <input type="range" id="speechRate" min="0.6" max="1.6" step="0.05" value="1" />
+          <span id="speechRateLabel">1.0&times;</span>
+        </label>
+        <select class="sort-select" id="speechVoice" aria-label="Voice"></select>
+        <button class="neu-btn secondary" id="speechStop">Stop</button>
+      </div>
+
+      <div class="book-foot">
+        <button class="neu-btn secondary" id="bookPrev">&#8249; Previous</button>
+        <span class="book-position" id="bookPosition"></span>
+        <button class="neu-btn secondary" id="bookNext">Next &#8250;</button>
       </div>
     </div>
   </div>
@@ -2089,6 +2749,7 @@ function buildPageHtml(rendererName) {
     const playerNote = document.getElementById('playerNote');
     const playerClose = document.getElementById('playerClose');
     const playerTranscode = document.getElementById('playerTranscode');
+    const playerFullscreen = document.getElementById('playerFullscreen');
     const playerImage = document.getElementById('playerImage');
     const viewerPrev = document.getElementById('viewerPrev');
     const viewerNext = document.getElementById('viewerNext');
@@ -2099,6 +2760,13 @@ function buildPageHtml(rendererName) {
     let readerComic = null;
     let readerIndex = 0;
     let readerPageCount = 0;
+    // Bookmarks, by the same key the watched list uses: key -> { page, pageCount }.
+    const comicProgressByKey = new Map();
+    // Only offer Resume once there is a meaningful amount to come back to.
+    const COMIC_RESUME_MIN_PAGE = 5;
+    let comicProgressTimer = null;
+    // Sentences of the chapter on screen, offset into its own text.
+    let bookChapterSentences = [];
     let viewerList = [];
     let viewerIndex = -1;
     let playerItem = null;
@@ -2125,6 +2793,8 @@ function buildPageHtml(rendererName) {
     const subtitleFindBtn = document.getElementById('subtitleFindBtn');
     const trackNote = document.getElementById('trackNote');
     let detailItem = null;
+    // Set when the dialog is showing a show or comic tile rather than one file.
+    let detailGroup = null;
     let detailCard = null;
     let detailTracks = null;
     let pendingCoverDataUrl = '';
@@ -2650,7 +3320,36 @@ function buildPageHtml(rendererName) {
       return empty;
     }
 
+    function playOnThisDevice(item) {
+      if (isBookItem(item)) {
+        openBookReader(item);
+      } else if (isComicItem(item)) {
+        openComicReader(item);
+      } else if (isImageItem(item)) {
+        openImageViewer(item);
+      } else {
+        openLocalPlayer(item);
+      }
+    }
+
     async function castItem(item, button, options) {
+      if (isBookItem(item)) {
+        setStatus('Books are read on this device and cannot be cast.', true);
+        return;
+      }
+
+      if (isComicItem(item)) {
+        setStatus('Comics are read on this device and cannot be cast.', true);
+        return;
+      }
+
+      // With nothing on the network to cast to, play here rather than failing.
+      if (rendererCount === 0) {
+        setStatus('No renderer found - playing on this device.');
+        playOnThisDevice(item);
+        return;
+      }
+
       const choices = options && typeof options === 'object' ? options : {};
       const resumeInfo = getResumeInfo(item);
       let resumeSeconds = resumeInfo ? resumeInfo.positionSec : 0;
@@ -2672,6 +3371,11 @@ function buildPageHtml(rendererName) {
         }),
         });
         const result = await response.json();
+        if (response.status === 503 && /no renderer/i.test(String(result.error || ''))) {
+          setStatus('No renderer found - playing on this device.');
+          playOnThisDevice(item);
+          return;
+        }
         if (!response.ok || !result.ok) {
           throw new Error(result.error || ('HTTP ' + response.status));
         }
@@ -2710,7 +3414,14 @@ function buildPageHtml(rendererName) {
     function setWatchedCardState(card, watchedButton, isWatched) {
       card.classList.toggle('watched-media', isWatched);
       watchedButton.classList.toggle('watched', isWatched);
-      watchedButton.textContent = isWatched ? 'Unmark' : 'Watched';
+
+      const isRead = Boolean(card.__item
+        && (card.__item.mediaType === 'comic' || card.__item.mediaType === 'book'));
+      if (isRead) {
+        watchedButton.textContent = isWatched ? 'Not Done' : 'Done';
+      } else {
+        watchedButton.textContent = isWatched ? 'Unmark' : 'Watched';
+      }
 
       const existingBadge = card.querySelector('.watched-check');
       if (isWatched && !existingBadge) {
@@ -2761,6 +3472,17 @@ function buildPageHtml(rendererName) {
         playButton.dataset.role = 'play';
         let initialResumeInfo = getResumeInfo(item);
         function updatePlayButtonText() {
+            // Books and comics are read here; no renderer state applies.
+            if (isBookItem(item)) {
+              applyBookPlayLabel(playButton, item);
+              return;
+            }
+
+            if (isComicItem(item)) {
+              applyComicPlayLabel(playButton, item);
+              return;
+            }
+
             const activeSession = findActiveSessionByMediaId(item.id);
             const isCasting = Boolean(activeSession && activeSession.rendererName);
           if (isCasting) {
@@ -2788,6 +3510,14 @@ function buildPageHtml(rendererName) {
         updatePlayButtonText();
         playButton.addEventListener('click', (event) => {
           event.stopPropagation();
+          if (isBookItem(item)) {
+            openBookReader(item);
+            return;
+          }
+          if (isComicItem(item)) {
+            openComicReader(item);
+            return;
+          }
           castItem(item, playButton);
         });
 
@@ -2858,8 +3588,16 @@ function buildPageHtml(rendererName) {
               }
             }
             setResumeCardState(card, false);
-            playButton.textContent = 'Play';
-            playButton.classList.remove('resume');
+            if (isBookItem(item)) {
+              bookProgressByKey.delete(bookKeyOf(item));
+              applyBookPlayLabel(playButton, item);
+            } else if (isComicItem(item)) {
+              comicProgressByKey.delete(comicProgressKey(item));
+              applyComicPlayLabel(playButton, item);
+            } else {
+              playButton.textContent = 'Play';
+              playButton.classList.remove('resume');
+            }
           } catch (error) {
             setStatus('Watched update failed: ' + error.message, true);
           } finally {
@@ -2982,6 +3720,7 @@ function buildPageHtml(rendererName) {
 
       const viewButton = document.createElement('button');
       viewButton.className = 'neu-btn';
+      viewButton.dataset.role = 'view';
       viewButton.textContent = 'View';
       viewButton.addEventListener('click', (event) => {
         event.stopPropagation();
@@ -2990,10 +3729,26 @@ function buildPageHtml(rendererName) {
         renderSelectedShowPage();
       });
 
+      // Fetched details are often wrong for a folder name, so the tile itself
+      // can be corrected without opening the show.
+      const editButton = document.createElement('button');
+      editButton.className = 'neu-btn secondary';
+      editButton.dataset.role = 'edit-group';
+      editButton.textContent = 'Edit';
+      editButton.addEventListener('click', (event) => {
+        event.stopPropagation();
+        openGroupDetail(group);
+      });
+
+      const buttonRow = document.createElement('div');
+      buttonRow.className = 'button-row';
+      buttonRow.appendChild(viewButton);
+      buttonRow.appendChild(editButton);
+
       overlay.appendChild(title);
       overlay.appendChild(meta);
       overlay.appendChild(plot);
-      overlay.appendChild(viewButton);
+      overlay.appendChild(buttonRow);
 
       card.addEventListener('click', () => {
         selectedShowName = group.name;
@@ -3296,6 +4051,41 @@ function buildPageHtml(rendererName) {
           }
         }
 
+        bookProgressByKey.clear();
+        const bookProgressPayload = result.bookProgress && typeof result.bookProgress === 'object'
+          ? result.bookProgress
+          : {};
+        for (const [progressKey, entry] of Object.entries(bookProgressPayload)) {
+          const key = String(progressKey || '').trim();
+          const chapterIndex = Number(entry && entry.chapterIndex);
+          if (!key || !Number.isFinite(chapterIndex) || chapterIndex < 0) {
+            continue;
+          }
+          bookProgressByKey.set(key, {
+            chapterIndex: Math.floor(chapterIndex),
+            offset: Math.max(0, Math.floor(Number(entry && entry.offset) || 0)),
+            percent: Math.max(0, Math.min(1, Number(entry && entry.percent) || 0)),
+            label: typeof (entry && entry.label) === 'string' ? entry.label : '',
+          });
+        }
+
+        comicProgressByKey.clear();
+        const comicProgress = result.comicProgress && typeof result.comicProgress === 'object'
+          ? result.comicProgress
+          : {};
+        for (const [progressKey, entry] of Object.entries(comicProgress)) {
+          const key = String(progressKey || '').trim();
+          const page = Number(entry && entry.page);
+          if (!key || !Number.isFinite(page) || page <= 1) {
+            continue;
+          }
+          const pageCount = Number(entry && entry.pageCount);
+          comicProgressByKey.set(key, {
+            page: Math.floor(page),
+            pageCount: Number.isFinite(pageCount) && pageCount > 0 ? Math.floor(pageCount) : null,
+          });
+        }
+
         resumeByKey.clear();
         const resumePositions = result.resumePositions && typeof result.resumePositions === 'object'
           ? result.resumePositions
@@ -3405,6 +4195,41 @@ function buildPageHtml(rendererName) {
           }
         });
 
+        bookProgressByKey.clear();
+        const bookProgressPayload = result.bookProgress && typeof result.bookProgress === 'object'
+          ? result.bookProgress
+          : {};
+        for (const [progressKey, entry] of Object.entries(bookProgressPayload)) {
+          const key = String(progressKey || '').trim();
+          const chapterIndex = Number(entry && entry.chapterIndex);
+          if (!key || !Number.isFinite(chapterIndex) || chapterIndex < 0) {
+            continue;
+          }
+          bookProgressByKey.set(key, {
+            chapterIndex: Math.floor(chapterIndex),
+            offset: Math.max(0, Math.floor(Number(entry && entry.offset) || 0)),
+            percent: Math.max(0, Math.min(1, Number(entry && entry.percent) || 0)),
+            label: typeof (entry && entry.label) === 'string' ? entry.label : '',
+          });
+        }
+
+        comicProgressByKey.clear();
+        const comicProgress = result.comicProgress && typeof result.comicProgress === 'object'
+          ? result.comicProgress
+          : {};
+        for (const [progressKey, entry] of Object.entries(comicProgress)) {
+          const key = String(progressKey || '').trim();
+          const page = Number(entry && entry.page);
+          if (!key || !Number.isFinite(page) || page <= 1) {
+            continue;
+          }
+          const pageCount = Number(entry && entry.pageCount);
+          comicProgressByKey.set(key, {
+            page: Math.floor(page),
+            pageCount: Number.isFinite(pageCount) && pageCount > 0 ? Math.floor(pageCount) : null,
+          });
+        }
+
         const resumePositions = result.resumePositions && typeof result.resumePositions === 'object'
           ? result.resumePositions
           : {};
@@ -3486,7 +4311,13 @@ function buildPageHtml(rendererName) {
             setWatchedCardState(card, watchedButton, isWatched);
           }
 
-          if (playButton) {
+          if (playButton && card.__item && card.__item.mediaType === 'book') {
+            // A book has no playback state to reflect, only a reading position.
+            applyBookPlayLabel(playButton, card.__item);
+          } else if (playButton && card.__item && card.__item.mediaType === 'comic') {
+            // A comic has no playback state to reflect, only a bookmark.
+            applyComicPlayLabel(playButton, card.__item);
+          } else if (playButton) {
             if (isWatched) {
               playButton.textContent = 'Play';
               playButton.classList.remove('resume');
@@ -3605,11 +4436,71 @@ function buildPageHtml(rendererName) {
       openFolderModal();
     });
 
+    // A group is not a file, so the dialog is filled from the group payload and
+    // its edits are saved against the category and group name instead.
+    function openGroupDetail(group) {
+      detailGroup = { category: currentCategory, name: group.name };
+
+      // A generated placeholder is shown but never offered as an editable URL,
+      // otherwise Save would store the whole data: blob as the cover.
+      const shownPoster = group.posterUrl || '';
+      const editablePoster = /^data:/i.test(shownPoster) ? '' : shownPoster;
+
+      detailItem = {
+        id: 'group:' + currentCategory + ':' + group.name,
+        name: group.name,
+        movieTitle: group.displayTitle || group.name,
+        year: group.year || '',
+        plot: group.plot || '',
+        posterUrl: editablePoster,
+        mediaType: 'group',
+      };
+      detailCard = null;
+      pendingCoverDataUrl = '';
+
+      const nouns = categoryNouns(currentCategory);
+      detailTitle.textContent = detailItem.movieTitle;
+
+      const metaParts = [];
+      if (detailItem.year) {
+        metaParts.push(detailItem.year);
+      }
+      metaParts.push(plural(getGroupEpisodeCount(group), nouns.item));
+      if (group.edited) {
+        metaParts.push('edited');
+      }
+      detailMeta.textContent = metaParts.join('  \u00b7  ');
+
+      detailPlot.textContent = detailItem.plot || 'No synopsis yet.';
+      detailPlot.hidden = false;
+      detailFile.textContent = 'Folder name: ' + group.name;
+
+      renderDetailPoster(shownPoster, detailItem.movieTitle);
+
+      // Nothing here plays; the dialog is purely for correcting the tile.
+      detailPlay.hidden = true;
+      detailPlayHere.hidden = true;
+      detailWatched.hidden = true;
+      detailEdit.hidden = false;
+      trackSection.hidden = true;
+      trackNote.textContent = '';
+
+      detailModal.hidden = false;
+      openEditForm();
+      editTitle.focus();
+    }
+
     function openDetailModal(item, card) {
+      detailGroup = null;
       detailItem = item;
+      detailPlayHere.hidden = false;
+      detailWatched.hidden = false;
       detailCard = card || null;
       const itemIsImage = isImageItem(item);
       const itemIsComic = isComicItem(item);
+      const itemIsBook = isBookItem(item);
+      // Reading material shares one set of words and one set of actions.
+      const itemIsRead = itemIsComic || itemIsBook;
       pendingCoverDataUrl = '';
       detailEditForm.hidden = true;
       detailEdit.textContent = 'Edit Info';
@@ -3640,7 +4531,7 @@ function buildPageHtml(rendererName) {
       detailPosterWrap.classList.toggle('is-photo', itemIsImage);
       detailPlot.hidden = false;
       // A photo or comic has no synopsis to be missing.
-      detailPlot.hidden = (itemIsImage || itemIsComic) && !item.plot;
+      detailPlot.hidden = (itemIsImage || itemIsRead) && !item.plot;
       detailPlot.textContent = item.plot || 'No synopsis available for this title.';
       detailFile.textContent = item.filePath || item.name;
 
@@ -3650,12 +4541,16 @@ function buildPageHtml(rendererName) {
         : (resumeInfo ? 'Resume ' + formatResumeClock(resumeInfo.positionSec) : 'Play');
       detailPlay.classList.toggle('resume', Boolean(resumeInfo));
       // A renderer has no way to display a comic archive.
-      detailPlay.hidden = itemIsComic;
-      detailPlayHere.textContent = itemIsComic ? 'Read' : (itemIsImage ? 'View' : 'Play Here');
+      detailPlay.hidden = itemIsRead;
+      detailPlayHere.textContent = itemIsRead
+        ? (itemIsBook ? bookPlayLabel(item) : 'Read')
+        : (itemIsImage ? 'View' : 'Play Here');
 
       const watchedKey = item.watchedKey || item.filePath || item.id;
       const isWatched = watchedItemIds.has(watchedKey);
-      detailWatched.textContent = isWatched ? 'Unmark' : 'Watched';
+      detailWatched.textContent = itemIsRead
+        ? (isWatched ? 'Not Done' : 'Done')
+        : (isWatched ? 'Unmark' : 'Watched');
       detailWatched.classList.toggle('watched', isWatched);
 
       const hasRenderer = rendererCount > 0;
@@ -3666,7 +4561,7 @@ function buildPageHtml(rendererName) {
       trackSection.hidden = true;
       trackNote.textContent = '';
       detailModal.hidden = false;
-      if (!itemIsImage && !itemIsComic) {
+      if (!itemIsImage && !itemIsRead) {
         loadDetailTracks(item);
       }
     }
@@ -3919,6 +4814,7 @@ function buildPageHtml(rendererName) {
     function closeDetailModal() {
       detailModal.hidden = true;
       detailItem = null;
+      detailGroup = null;
       detailCard = null;
       pendingCoverDataUrl = '';
       detailEditForm.hidden = true;
@@ -3980,6 +4876,11 @@ function buildPageHtml(rendererName) {
         return;
       }
 
+      if (detailGroup) {
+        await saveGroupEdits();
+        return;
+      }
+
       editSave.disabled = true;
       try {
         const body = {
@@ -4018,8 +4919,73 @@ function buildPageHtml(rendererName) {
       }
     }
 
+    // Saving and resetting a group tile, which has no media id to key on.
+    async function postGroupOverride(body) {
+      const response = await fetch('/api/group/override', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          category: detailGroup.category,
+          group: detailGroup.name,
+          ...body,
+        }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.ok) {
+        throw new Error(result.error || ('HTTP ' + response.status));
+      }
+      return result;
+    }
+
+    async function saveGroupEdits() {
+      const groupName = detailGroup.name;
+      editSave.disabled = true;
+      try {
+        const body = {
+          title: editTitle.value,
+          year: editYear.value,
+          plot: editPlot.value,
+          posterUrl: editPoster.value,
+        };
+        if (pendingCoverDataUrl) {
+          body.coverDataUrl = pendingCoverDataUrl;
+        }
+
+        const result = await postGroupOverride(body);
+        closeDetailModal();
+        await loadLibrary(false, { silent: true });
+        setStatus(result.cleared
+          ? 'Restored original details for ' + groupName + '.'
+          : 'Saved details for ' + groupName + '.');
+      } catch (error) {
+        setStatus('Save failed: ' + error.message, true);
+      } finally {
+        editSave.disabled = false;
+      }
+    }
+
+    async function resetGroupEdits() {
+      const groupName = detailGroup.name;
+      editReset.disabled = true;
+      try {
+        await postGroupOverride({ clear: true });
+        closeDetailModal();
+        await loadLibrary(false, { silent: true });
+        setStatus('Restored original details for ' + groupName + '.');
+      } catch (error) {
+        setStatus('Reset failed: ' + error.message, true);
+      } finally {
+        editReset.disabled = false;
+      }
+    }
+
     async function resetDetailEdits() {
       if (!detailItem) {
+        return;
+      }
+
+      if (detailGroup) {
+        await resetGroupEdits();
         return;
       }
 
@@ -4173,6 +5139,1450 @@ function buildPageHtml(rendererName) {
       }
     });
 
+    function isFullscreen() {
+      return Boolean(document.fullscreenElement);
+    }
+
+    function syncFullscreenLabel() {
+      const on = isFullscreen();
+      playerFullscreen.textContent = on ? 'Exit Fullscreen' : 'Fullscreen';
+      const panel = playerModal.querySelector('.player-modal');
+      if (panel) {
+        panel.classList.toggle('is-fullscreen', on);
+      }
+    }
+
+    async function toggleFullscreen() {
+      const panel = playerModal.querySelector('.player-modal');
+      if (!panel) {
+        return;
+      }
+
+      try {
+        if (isFullscreen()) {
+          await document.exitFullscreen();
+        } else {
+          await panel.requestFullscreen();
+        }
+      } catch (error) {
+        // Fullscreen can be blocked by policy; the dialog still works windowed.
+        playerNote.textContent = 'Fullscreen is unavailable: ' + error.message;
+        playerNote.classList.add('warn');
+      }
+      syncFullscreenLabel();
+    }
+
+    playerFullscreen.addEventListener('click', toggleFullscreen);
+    document.addEventListener('fullscreenchange', syncFullscreenLabel);
+
+    // ---------------- Book reader ----------------
+
+    const bookModal = document.getElementById('bookModal');
+    const bookClose = document.getElementById('bookClose');
+    const bookTitle = document.getElementById('bookTitle');
+    const bookAuthor = document.getElementById('bookAuthor');
+    const bookSide = document.getElementById('bookSide');
+    const bookSideToggle = document.getElementById('bookSideToggle');
+    const bookTabToc = document.getElementById('bookTabToc');
+    const bookTabNotes = document.getElementById('bookTabNotes');
+    const bookTocList = document.getElementById('bookTocList');
+    const bookNotesList = document.getElementById('bookNotesList');
+    const bookStage = document.getElementById('bookStage');
+    const bookFrame = document.getElementById('bookFrame');
+    const bookTools = document.getElementById('bookTools');
+    const bookAddNote = document.getElementById('bookAddNote');
+    const bookCopy = document.getElementById('bookCopy');
+    const bookTypeButton = document.getElementById('bookType');
+    const bookTypePanel = document.getElementById('bookTypePanel');
+    const bookFontSize = document.getElementById('bookFontSize');
+    const bookLineHeight = document.getElementById('bookLineHeight');
+    const bookWidth = document.getElementById('bookWidth');
+    const bookMark = document.getElementById('bookMark');
+    const bookFullscreen = document.getElementById('bookFullscreen');
+    const bookPrev = document.getElementById('bookPrev');
+    const bookNext = document.getElementById('bookNext');
+    const bookPosition = document.getElementById('bookPosition');
+    const bookRailFill = document.getElementById('bookRailFill');
+
+    // Only offer Resume once there is a meaningful amount to come back to.
+    const BOOK_RESUME_MIN_PERCENT = 0.01;
+    const BOOK_THEMES = {
+      light: { bg: '#ffffff', fg: '#16181d', faint: '#6b7280' },
+      sepia: { bg: '#f6ecd8', fg: '#3b3227', faint: '#8a7c68' },
+      night: { bg: '#14181f', fg: '#d7dae0', faint: '#8b93a1' },
+    };
+    const HIGHLIGHT_TINTS = {
+      yellow: 'rgba(250, 204, 21, 0.42)',
+      green: 'rgba(74, 222, 128, 0.40)',
+      blue: 'rgba(96, 165, 250, 0.40)',
+      pink: 'rgba(244, 114, 182, 0.40)',
+      purple: 'rgba(192, 132, 252, 0.40)',
+    };
+
+    let bookItem = null;
+    let bookData = null;
+    let bookChapterIndex = 0;
+    let bookAnnotations = [];
+    let bookProgressByKey = new Map();
+    let bookPendingSelection = null;
+    let bookProgressTimer = null;
+    let bookRestoreOffset = 0;
+    const bookPrefs = {
+      fontScale: 110,
+      lineHeight: 170,
+      width: 720,
+      theme: 'sepia',
+    };
+
+    function isBookItem(item) {
+      return Boolean(item && item.mediaType === 'book');
+    }
+
+    function bookKeyOf(item) {
+      return item ? (item.watchedKey || item.filePath || item.id || '') : '';
+    }
+
+    function bookBookmark(item) {
+      const key = bookKeyOf(item);
+      return key ? (bookProgressByKey.get(key) || null) : null;
+    }
+
+    function bookPlayLabel(item) {
+      const mark = bookBookmark(item);
+      return mark && Number(mark.percent) > BOOK_RESUME_MIN_PERCENT ? 'Resume' : 'Read';
+    }
+
+    function applyBookPlayLabel(button, item) {
+      const label = bookPlayLabel(item);
+      button.textContent = label;
+      button.classList.toggle('resume', label === 'Resume');
+    }
+
+    function bookDoc() {
+      return bookFrame.contentDocument || null;
+    }
+
+    function bookRoot() {
+      const doc = bookDoc();
+      return doc ? doc.body : null;
+    }
+
+    // ---- character offsets ------------------------------------------------
+    // Positions are stored as character offsets into the chapter's text, which
+    // survive font changes and stay valid once highlights wrap parts of it.
+
+    function offsetsForRange(doc, root, range) {
+      const pre = doc.createRange();
+      pre.selectNodeContents(root);
+      pre.setEnd(range.startContainer, range.startOffset);
+      const start = pre.toString().length;
+      return { start, end: start + range.toString().length };
+    }
+
+    function textNodesIn(root) {
+      const doc = root.ownerDocument;
+      const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+      const out = [];
+      let node = walker.nextNode();
+      while (node) {
+        out.push(node);
+        node = walker.nextNode();
+      }
+      return out;
+    }
+
+    // Wraps every text run inside [start, end) so a mark can cross elements.
+    function wrapOffsets(doc, root, start, end, annotation) {
+      const segments = [];
+      let pos = 0;
+
+      for (const node of textNodesIn(root)) {
+        const length = node.nodeValue.length;
+        const nodeStart = pos;
+        const nodeEnd = pos + length;
+        pos = nodeEnd;
+
+        if (nodeEnd <= start || nodeStart >= end) {
+          continue;
+        }
+        segments.push({
+          node,
+          from: Math.max(0, start - nodeStart),
+          to: Math.min(length, end - nodeStart),
+        });
+      }
+
+      // Later segments first, so earlier offsets are untouched while wrapping.
+      for (let i = segments.length - 1; i >= 0; i -= 1) {
+        const segment = segments[i];
+        if (segment.to <= segment.from) {
+          continue;
+        }
+        const range = doc.createRange();
+        range.setStart(segment.node, segment.from);
+        range.setEnd(segment.node, segment.to);
+        const mark = doc.createElement('mark');
+        mark.className = 'mc-highlight';
+        mark.setAttribute('data-mc-id', annotation.id);
+        mark.style.background = HIGHLIGHT_TINTS[annotation.color] || HIGHLIGHT_TINTS.yellow;
+        mark.style.color = 'inherit';
+        mark.style.borderRadius = '2px';
+        mark.style.cursor = 'pointer';
+        if (annotation.note) {
+          mark.style.borderBottom = '2px dotted currentColor';
+          mark.title = annotation.note;
+        }
+        // Ranges inside a single text node always surround cleanly.
+        range.surroundContents(mark);
+      }
+    }
+
+    function paintAnnotations() {
+      const doc = bookDoc();
+      const root = bookRoot();
+      if (!doc || !root) {
+        return;
+      }
+
+      for (const stale of root.querySelectorAll('mark.mc-highlight')) {
+        const parent = stale.parentNode;
+        while (stale.firstChild) {
+          parent.insertBefore(stale.firstChild, stale);
+        }
+        parent.removeChild(stale);
+        parent.normalize();
+      }
+
+      const forChapter = bookAnnotations
+        .filter((entry) => entry.chapterIndex === bookChapterIndex && entry.kind !== 'bookmark')
+        .sort((a, b) => a.start - b.start);
+
+      for (const annotation of forChapter) {
+        try {
+          wrapOffsets(doc, root, annotation.start, annotation.end, annotation);
+        } catch {
+          // A highlight whose text has shifted is skipped rather than fatal.
+        }
+      }
+    }
+
+    // ---- rendering ---------------------------------------------------------
+
+    function bookReaderStyles() {
+      const theme = BOOK_THEMES[bookPrefs.theme] || BOOK_THEMES.sepia;
+      return [
+        'html { background: ' + theme.bg + '; }',
+        'body {',
+        '  background: ' + theme.bg + ';',
+        '  color: ' + theme.fg + ';',
+        '  font-size: ' + bookPrefs.fontScale + '%;',
+        '  line-height: ' + (bookPrefs.lineHeight / 100) + ';',
+        '  max-width: ' + bookPrefs.width + 'px;',
+        '  margin: 0 auto;',
+        '  padding: 48px 28px 96px;',
+        '  font-family: Georgia, "Iowan Old Style", "Times New Roman", serif;',
+        '  text-rendering: optimizeLegibility;',
+        '  -webkit-font-smoothing: antialiased;',
+        '}',
+        'img, svg, video { max-width: 100%; height: auto; }',
+        'a { color: inherit; }',
+        'p { orphans: 2; widows: 2; }',
+        '::selection { background: rgba(96, 165, 250, 0.35); }',
+        'mark.mc-highlight { padding: 0 1px; }',
+        '.mc-bookmark-flag {',
+        '  position: absolute; left: 0; width: 3px; height: 1.6em;',
+        '  background: ' + theme.faint + '; border-radius: 2px;',
+        '}',
+      ].join('\\n');
+    }
+
+    function applyReaderStyles() {
+      const doc = bookDoc();
+      if (!doc) {
+        return;
+      }
+      let style = doc.getElementById('mc-reader-style');
+      if (!style) {
+        style = doc.createElement('style');
+        style.id = 'mc-reader-style';
+        (doc.head || doc.documentElement).appendChild(style);
+      }
+      style.textContent = bookReaderStyles();
+      bookFrame.style.background = (BOOK_THEMES[bookPrefs.theme] || BOOK_THEMES.sepia).bg;
+    }
+
+    // The offset of the text currently at the top of the view, so the place is
+    // kept even if type size changes between sessions.
+    function currentTopOffset() {
+      const doc = bookDoc();
+      const root = bookRoot();
+      if (!doc || !root) {
+        return 0;
+      }
+
+      const nodes = textNodesIn(root);
+      let pos = 0;
+      for (const node of nodes) {
+        const length = node.nodeValue.length;
+        if (node.nodeValue.trim()) {
+          const range = doc.createRange();
+          range.selectNodeContents(node);
+          const rect = range.getBoundingClientRect();
+          if (rect.height > 0 && rect.bottom > 0) {
+            return pos;
+          }
+        }
+        pos += length;
+      }
+      return pos;
+    }
+
+    function scrollToOffset(offset) {
+      const doc = bookDoc();
+      const root = bookRoot();
+      const win = bookFrame.contentWindow;
+      if (!doc || !root || !win || offset <= 0) {
+        return;
+      }
+
+      let pos = 0;
+      for (const node of textNodesIn(root)) {
+        const length = node.nodeValue.length;
+        // Strictly inside this node, so the position never lands on a boundary
+        // where there is no character to measure.
+        if (pos + length > offset) {
+          const local = Math.max(0, Math.min(length - 1, offset - pos));
+          const range = doc.createRange();
+          range.setStart(node, local);
+          range.setEnd(node, Math.min(length, local + 1));
+
+          // A collapsed or whitespace-only range can report an empty rect, so
+          // fall back to the element that holds the text.
+          let rect = range.getBoundingClientRect();
+          if (!rect || (rect.height === 0 && rect.top === 0)) {
+            const holder = node.parentElement;
+            rect = holder ? holder.getBoundingClientRect() : null;
+          }
+
+          if (rect) {
+            win.scrollTo({ top: Math.max(0, win.scrollY + rect.top - 40), behavior: 'auto' });
+          }
+          return;
+        }
+        pos += length;
+      }
+
+      // Past the last character: the end of the section is the right place.
+      win.scrollTo({ top: doc.documentElement.scrollHeight, behavior: 'auto' });
+    }
+
+    function chapterLabelFor(index) {
+      if (!bookData) {
+        return '';
+      }
+      let label = '';
+      for (const entry of bookData.toc) {
+        if (entry.spineIndex <= index) {
+          label = entry.label;
+        }
+      }
+      return label;
+    }
+
+    function bookPercent() {
+      if (!bookData || bookData.chapterCount === 0) {
+        return 0;
+      }
+
+      const win = bookFrame.contentWindow;
+      const doc = bookDoc();
+      let within = 0;
+      if (win && doc && doc.documentElement) {
+        const scrollable = doc.documentElement.scrollHeight - win.innerHeight;
+        within = scrollable > 0 ? Math.min(1, Math.max(0, win.scrollY / scrollable)) : 1;
+      }
+
+      return Math.min(1, (bookChapterIndex + within) / bookData.chapterCount);
+    }
+
+    function updateBookPosition() {
+      if (!bookData) {
+        return;
+      }
+      const percent = bookPercent();
+      const label = chapterLabelFor(bookChapterIndex);
+      bookPosition.textContent = (label ? label + '  \u00b7  ' : '')
+        + 'Section ' + (bookChapterIndex + 1) + ' of ' + bookData.chapterCount
+        + '  \u00b7  ' + Math.round(percent * 100) + '%';
+      bookRailFill.style.width = (percent * 100) + '%';
+
+      for (const button of bookTocList.querySelectorAll('.book-toc-item')) {
+        button.classList.toggle('current', Number(button.dataset.spineIndex) === bookChapterIndex);
+      }
+
+      bookPrev.disabled = bookChapterIndex <= 0;
+      bookNext.disabled = bookChapterIndex >= bookData.chapterCount - 1;
+    }
+
+    async function reportBookProgress(force) {
+      if (!bookItem || !bookData) {
+        return;
+      }
+
+      const key = bookKeyOf(bookItem);
+      const percent = bookPercent();
+      const offset = currentTopOffset();
+      const label = chapterLabelFor(bookChapterIndex);
+      const finished = percent >= 0.995;
+
+      if (finished) {
+        bookProgressByKey.delete(key);
+        watchedItemIds.add(key);
+      } else if (bookChapterIndex > 0 || offset > 0) {
+        bookProgressByKey.set(key, { chapterIndex: bookChapterIndex, offset, percent, label });
+      } else {
+        bookProgressByKey.delete(key);
+      }
+
+      refreshBookCardState(key);
+
+      try {
+        await fetch('/api/book/progress', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            id: bookItem.id,
+            key,
+            chapterIndex: bookChapterIndex,
+            offset,
+            percent,
+            label,
+          }),
+        });
+      } catch {
+        // Position is best effort; reading carries on regardless.
+      }
+    }
+
+    function queueBookProgress() {
+      window.clearTimeout(bookProgressTimer);
+      bookProgressTimer = window.setTimeout(() => reportBookProgress(false), 700);
+    }
+
+    function refreshBookCardState(key) {
+      for (const card of document.querySelectorAll('.movie-card')) {
+        if (!card.__item || bookKeyOf(card.__item) !== key) {
+          continue;
+        }
+        const playButton = card.querySelector('[data-role="play"]');
+        if (playButton) {
+          applyBookPlayLabel(playButton, card.__item);
+        }
+        const watchedButton = card.querySelector('[data-role="watched"]');
+        if (watchedButton) {
+          setWatchedCardState(card, watchedButton, watchedItemIds.has(key));
+        }
+      }
+    }
+
+    async function loadChapter(index, restoreOffset) {
+      if (!bookItem || !bookData) {
+        return;
+      }
+
+      const target = Math.max(0, Math.min(bookData.chapterCount - 1, index));
+      bookChapterIndex = target;
+      bookRestoreOffset = Number(restoreOffset) || 0;
+      hideBookTools();
+
+      try {
+        const response = await fetch('/api/book/chapter?id=' + encodeURIComponent(bookItem.id)
+          + '&chapter=' + target);
+        const result = await response.json();
+        if (!response.ok || !result.ok) {
+          throw new Error(result.error || ('HTTP ' + response.status));
+        }
+
+        // srcdoc keeps the frame same-origin, so selections stay reachable.
+        await new Promise((resolve) => {
+          const onLoad = () => {
+            bookFrame.removeEventListener('load', onLoad);
+            resolve();
+          };
+          bookFrame.addEventListener('load', onLoad);
+          bookFrame.srcdoc = result.html;
+        });
+
+        bookChapterSentences = Array.isArray(result.sentences) ? result.sentences : [];
+        speechSentences = bookChapterSentences;
+
+        applyReaderStyles();
+        paintAnnotations();
+        wireFrameEvents();
+        scrollToOffset(bookRestoreOffset);
+        updateBookPosition();
+        renderBookNotes();
+
+        if (bookRestoreOffset > 0) {
+          const settleFor = bookRestoreOffset;
+          const settleChapter = bookChapterIndex;
+          window.setTimeout(() => {
+            // Only if the reader is still on the section that asked for it.
+            if (bookChapterIndex === settleChapter) {
+              scrollToOffset(settleFor);
+              updateBookPosition();
+            }
+          }, 220);
+        }
+      } catch (error) {
+        bookPosition.textContent = 'Could not open this section: ' + error.message;
+      }
+    }
+
+    function wireFrameEvents() {
+      const doc = bookDoc();
+      const win = bookFrame.contentWindow;
+      if (!doc || !win) {
+        return;
+      }
+
+      doc.addEventListener('mouseup', () => window.setTimeout(handleBookSelection, 10));
+      doc.addEventListener('keyup', () => window.setTimeout(handleBookSelection, 10));
+
+      doc.addEventListener('click', (event) => {
+        const mark = event.target && event.target.closest
+          ? event.target.closest('mark.mc-highlight')
+          : null;
+        if (mark) {
+          const found = bookAnnotations.find((entry) => entry.id === mark.getAttribute('data-mc-id'));
+          if (found) {
+            openBookSide('notes');
+            highlightNoteCard(found.id);
+          }
+          return;
+        }
+        hideBookTools();
+        hideTypePanel();
+      });
+
+      win.addEventListener('scroll', () => {
+        updateBookPosition();
+        queueBookProgress();
+        hideBookTools();
+      }, { passive: true });
+
+      // Arrow keys must work whether focus sits in the frame or the page.
+      doc.addEventListener('keydown', handleBookKey);
+    }
+
+    function handleBookSelection() {
+      const doc = bookDoc();
+      const root = bookRoot();
+      if (!doc || !root) {
+        return;
+      }
+
+      const selection = doc.getSelection();
+      if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
+        hideBookTools();
+        return;
+      }
+
+      const range = selection.getRangeAt(0);
+      const text = range.toString().trim();
+      if (!text) {
+        hideBookTools();
+        return;
+      }
+
+      const offsets = offsetsForRange(doc, root, range);
+      bookPendingSelection = { ...offsets, text };
+
+      const rect = range.getBoundingClientRect();
+      const frameRect = bookFrame.getBoundingClientRect();
+      const stageRect = bookStage.getBoundingClientRect();
+
+      bookTools.hidden = false;
+      const toolsWidth = bookTools.offsetWidth || 280;
+      const left = (frameRect.left - stageRect.left) + rect.left + (rect.width / 2) - (toolsWidth / 2);
+      const top = (frameRect.top - stageRect.top) + rect.top - bookTools.offsetHeight - 10;
+
+      bookTools.style.left = Math.max(8,
+        Math.min(left, bookStage.clientWidth - toolsWidth - 8)) + 'px';
+      bookTools.style.top = Math.max(8, top) + 'px';
+    }
+
+    function hideBookTools() {
+      bookTools.hidden = true;
+      bookPendingSelection = null;
+    }
+
+    function hideTypePanel() {
+      bookTypePanel.hidden = true;
+      bookTypeButton.setAttribute('aria-expanded', 'false');
+    }
+
+    async function saveAnnotation(annotation) {
+      if (!bookItem) {
+        return null;
+      }
+
+      try {
+        const response = await fetch('/api/book/annotations', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            id: bookItem.id,
+            key: bookKeyOf(bookItem),
+            action: 'save',
+            annotation,
+          }),
+        });
+        const result = await response.json();
+        if (!response.ok || !result.ok) {
+          throw new Error(result.error || ('HTTP ' + response.status));
+        }
+        bookAnnotations = Array.isArray(result.annotations) ? result.annotations : bookAnnotations;
+        paintAnnotations();
+        renderBookNotes();
+        return result.annotation;
+      } catch (error) {
+        setStatus('Could not save that note: ' + error.message, true);
+        return null;
+      }
+    }
+
+    async function removeAnnotation(annotationId) {
+      if (!bookItem) {
+        return;
+      }
+
+      try {
+        const response = await fetch('/api/book/annotations', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            id: bookItem.id,
+            key: bookKeyOf(bookItem),
+            action: 'delete',
+            annotationId,
+          }),
+        });
+        const result = await response.json();
+        if (!response.ok || !result.ok) {
+          throw new Error(result.error || ('HTTP ' + response.status));
+        }
+        bookAnnotations = Array.isArray(result.annotations) ? result.annotations : [];
+        paintAnnotations();
+        renderBookNotes();
+      } catch (error) {
+        setStatus('Could not remove that note: ' + error.message, true);
+      }
+    }
+
+    function newAnnotationId() {
+      return 'an-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+    }
+
+    async function addHighlight(color, note) {
+      if (!bookPendingSelection) {
+        return;
+      }
+
+      const annotation = {
+        id: newAnnotationId(),
+        kind: note ? 'note' : 'highlight',
+        chapterIndex: bookChapterIndex,
+        start: bookPendingSelection.start,
+        end: bookPendingSelection.end,
+        color,
+        text: bookPendingSelection.text,
+        note: note || '',
+        chapterLabel: chapterLabelFor(bookChapterIndex),
+      };
+
+      hideBookTools();
+      const doc = bookDoc();
+      if (doc && doc.getSelection()) {
+        doc.getSelection().removeAllRanges();
+      }
+      await saveAnnotation(annotation);
+    }
+
+    async function addBookmarkHere() {
+      if (!bookItem) {
+        return;
+      }
+
+      const offset = currentTopOffset();
+      const root = bookRoot();
+      let preview = '';
+      if (root) {
+        preview = String(root.textContent || '').slice(offset, offset + 140).trim();
+      }
+
+      const annotation = {
+        id: newAnnotationId(),
+        kind: 'bookmark',
+        chapterIndex: bookChapterIndex,
+        start: offset,
+        end: offset,
+        color: 'blue',
+        text: preview,
+        note: '',
+        chapterLabel: chapterLabelFor(bookChapterIndex),
+      };
+
+      const saved = await saveAnnotation(annotation);
+      if (saved) {
+        setStatus('Bookmarked ' + (annotation.chapterLabel || 'this page') + '.');
+        openBookSide('notes');
+      }
+    }
+
+    function renderBookToc() {
+      bookTocList.innerHTML = '';
+      if (!bookData || bookData.toc.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'book-side-empty';
+        empty.textContent = 'This book has no contents list.';
+        bookTocList.appendChild(empty);
+        return;
+      }
+
+      for (const entry of bookData.toc) {
+        const button = document.createElement('button');
+        button.className = 'book-toc-item depth-' + Math.min(2, Number(entry.depth) || 0);
+        button.textContent = entry.label;
+        button.dataset.spineIndex = String(entry.spineIndex);
+        button.addEventListener('click', () => {
+          loadChapter(entry.spineIndex, 0);
+        });
+        bookTocList.appendChild(button);
+      }
+    }
+
+    function renderBookNotes() {
+      bookNotesList.innerHTML = '';
+
+      if (bookAnnotations.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'book-side-empty';
+        empty.textContent = 'Select any text to highlight it or attach a note. '
+          + 'The Bookmark button saves your spot.';
+        bookNotesList.appendChild(empty);
+        return;
+      }
+
+      const sorted = [...bookAnnotations].sort((a, b) => (a.chapterIndex - b.chapterIndex)
+        || (a.start - b.start));
+
+      for (const annotation of sorted) {
+        const card = document.createElement('div');
+        card.className = 'book-note-card';
+        card.dataset.annotationId = annotation.id;
+        card.style.setProperty('--note-accent', ({
+          yellow: '#facc15', green: '#4ade80', blue: '#60a5fa',
+          pink: '#f472b6', purple: '#c084fc',
+        })[annotation.color] || '#facc15');
+
+        const kind = document.createElement('span');
+        kind.className = 'book-note-kind';
+        kind.textContent = (annotation.kind === 'bookmark' ? 'Bookmark' : (annotation.kind === 'note' ? 'Note' : 'Highlight'))
+          + (annotation.chapterLabel ? '  \u00b7  ' + annotation.chapterLabel : '');
+        card.appendChild(kind);
+
+        const text = document.createElement('span');
+        text.className = 'book-note-text';
+        text.textContent = annotation.text || '(no text)';
+        card.appendChild(text);
+
+        if (annotation.note) {
+          const note = document.createElement('span');
+          note.className = 'book-note-body';
+          note.textContent = annotation.note;
+          card.appendChild(note);
+        }
+
+        const remove = document.createElement('button');
+        remove.className = 'book-note-remove';
+        remove.textContent = '\u00d7';
+        remove.title = 'Remove';
+        remove.addEventListener('click', (event) => {
+          event.stopPropagation();
+          removeAnnotation(annotation.id);
+        });
+        card.appendChild(remove);
+
+        card.addEventListener('click', () => {
+          if (annotation.chapterIndex === bookChapterIndex) {
+            scrollToOffset(annotation.start);
+          } else {
+            loadChapter(annotation.chapterIndex, annotation.start);
+          }
+        });
+
+        bookNotesList.appendChild(card);
+      }
+    }
+
+    function highlightNoteCard(annotationId) {
+      const card = bookNotesList.querySelector('[data-annotation-id="' + annotationId + '"]');
+      if (card) {
+        card.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+        card.style.transition = 'background 200ms ease';
+        card.style.background = 'rgba(96, 165, 250, 0.22)';
+        window.setTimeout(() => { card.style.background = ''; }, 900);
+      }
+    }
+
+    function openBookSide(tab) {
+      bookSide.hidden = false;
+      bookSideToggle.setAttribute('aria-expanded', 'true');
+      const showNotes = tab === 'notes';
+      bookTabToc.classList.toggle('active', !showNotes);
+      bookTabNotes.classList.toggle('active', showNotes);
+      bookTocList.hidden = showNotes;
+      bookNotesList.hidden = !showNotes;
+    }
+
+    function applyBookPrefs() {
+      bookFontSize.value = String(bookPrefs.fontScale);
+      bookLineHeight.value = String(bookPrefs.lineHeight);
+      bookWidth.value = String(bookPrefs.width);
+      for (const button of bookTypePanel.querySelectorAll('.book-theme')) {
+        button.classList.toggle('active', button.dataset.theme === bookPrefs.theme);
+      }
+      applyReaderStyles();
+    }
+
+    function saveBookPrefs() {
+      try {
+        window.localStorage.setItem('novabox.reader', JSON.stringify(bookPrefs));
+      } catch {
+        // Reading preferences are a convenience; storage may be unavailable.
+      }
+    }
+
+    function loadBookPrefs() {
+      try {
+        const stored = JSON.parse(window.localStorage.getItem('novabox.reader') || '{}');
+        if (stored && typeof stored === 'object') {
+          if (Number.isFinite(Number(stored.fontScale))) bookPrefs.fontScale = Number(stored.fontScale);
+          if (Number.isFinite(Number(stored.lineHeight))) bookPrefs.lineHeight = Number(stored.lineHeight);
+          if (Number.isFinite(Number(stored.width))) bookPrefs.width = Number(stored.width);
+          if (BOOK_THEMES[stored.theme]) bookPrefs.theme = stored.theme;
+        }
+      } catch {
+        // Fall back to the defaults above.
+      }
+    }
+
+    async function openBookReader(item) {
+      bookItem = item;
+      bookData = null;
+      bookAnnotations = [];
+      bookChapterIndex = 0;
+      bookTitle.textContent = item.movieTitle || item.name;
+      bookAuthor.textContent = item.author || '';
+      bookPosition.textContent = 'Opening book...';
+      bookRailFill.style.width = '0%';
+      bookFrame.srcdoc = '';
+      bookSide.hidden = true;
+      bookSideToggle.setAttribute('aria-expanded', 'false');
+      hideBookTools();
+      hideTypePanel();
+      bookModal.hidden = false;
+      syncBookFullscreenLabel();
+
+      try {
+        const response = await fetch('/api/book/open?id=' + encodeURIComponent(item.id));
+        const result = await response.json();
+        if (!response.ok || !result.ok) {
+          throw new Error(result.error || ('HTTP ' + response.status));
+        }
+
+        bookData = result;
+        bookAnnotations = Array.isArray(result.annotations) ? result.annotations : [];
+        bookAuthor.textContent = result.creator || item.author || '';
+        renderBookToc();
+        renderBookNotes();
+
+        const saved = result.progress;
+        const startChapter = saved && Number.isFinite(Number(saved.chapterIndex))
+          ? Number(saved.chapterIndex)
+          : 0;
+        const startOffset = saved && Number.isFinite(Number(saved.offset)) ? Number(saved.offset) : 0;
+
+        await loadChapter(startChapter, startOffset);
+        if (saved && (startChapter > 0 || startOffset > 0)) {
+          setStatus('Resumed ' + (saved.label || ('section ' + (startChapter + 1))) + '.');
+        }
+      } catch (error) {
+        bookPosition.textContent = 'Could not open this book: ' + error.message;
+      }
+    }
+
+    function closeBookReader() {
+      stopSpeech();
+      if (bookItem && bookData) {
+        window.clearTimeout(bookProgressTimer);
+        reportBookProgress(true);
+      }
+      exitFullscreenIfNeeded();
+      bookModal.hidden = true;
+      bookFrame.srcdoc = '';
+      bookItem = null;
+      bookData = null;
+      hideBookTools();
+      hideTypePanel();
+    }
+
+    function syncBookFullscreenLabel() {
+      const on = Boolean(document.fullscreenElement);
+      bookFullscreen.textContent = on ? 'Exit Fullscreen' : 'Fullscreen';
+      const panel = bookModal.querySelector('.book-modal');
+      if (panel) {
+        panel.classList.toggle('is-fullscreen', on);
+      }
+    }
+
+    async function toggleBookFullscreen() {
+      const panel = bookModal.querySelector('.book-modal');
+      if (!panel) {
+        return;
+      }
+      try {
+        if (document.fullscreenElement) {
+          await document.exitFullscreen();
+        } else {
+          await panel.requestFullscreen();
+        }
+      } catch (error) {
+        setStatus('Fullscreen is unavailable: ' + error.message, true);
+      }
+      syncBookFullscreenLabel();
+    }
+
+    function pageBook(direction) {
+      const win = bookFrame.contentWindow;
+      if (!win || !bookData) {
+        return;
+      }
+
+      const step = Math.max(120, win.innerHeight - 80);
+      const atStart = win.scrollY <= 2;
+      const doc = bookDoc();
+      const maxScroll = doc && doc.documentElement
+        ? doc.documentElement.scrollHeight - win.innerHeight
+        : 0;
+      const atEnd = win.scrollY >= maxScroll - 2;
+
+      if (direction < 0 && atStart) {
+        if (bookChapterIndex > 0) {
+          // Landing at the end of the previous section keeps reading continuous.
+          loadChapter(bookChapterIndex - 1, Number.MAX_SAFE_INTEGER);
+        }
+        return;
+      }
+      if (direction > 0 && atEnd) {
+        if (bookChapterIndex < bookData.chapterCount - 1) {
+          loadChapter(bookChapterIndex + 1, 0);
+        }
+        return;
+      }
+
+      win.scrollBy({ top: direction * step, behavior: 'smooth' });
+    }
+
+    function handleBookKey(event) {
+      if (bookModal.hidden) {
+        return;
+      }
+
+      if (event.key === 'Escape') {
+        if (!bookTools.hidden) {
+          hideBookTools();
+          return;
+        }
+        if (!bookTypePanel.hidden) {
+          hideTypePanel();
+          return;
+        }
+        if (document.fullscreenElement) {
+          return;
+        }
+        event.preventDefault();
+        closeBookReader();
+        return;
+      }
+
+      if (event.key === 'ArrowRight' || event.key === 'PageDown' || event.key === ' ') {
+        event.preventDefault();
+        pageBook(1);
+      } else if (event.key === 'ArrowLeft' || event.key === 'PageUp') {
+        event.preventDefault();
+        pageBook(-1);
+      } else if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        if (bookData && bookChapterIndex < bookData.chapterCount - 1) {
+          loadChapter(bookChapterIndex + 1, 0);
+        }
+      } else if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        if (bookChapterIndex > 0) {
+          loadChapter(bookChapterIndex - 1, 0);
+        }
+      } else if (event.key === 'b' || event.key === 'B') {
+        event.preventDefault();
+        addBookmarkHere();
+      } else if (event.key === 'c' || event.key === 'C') {
+        event.preventDefault();
+        openBookSide(bookSide.hidden || bookTocList.hidden ? 'toc' : 'notes');
+      } else if (event.key === 'f' || event.key === 'F') {
+        event.preventDefault();
+        toggleBookFullscreen();
+      }
+    }
+
+    // ---- wiring ------------------------------------------------------------
+
+    bookClose.addEventListener('click', closeBookReader);
+    bookModal.addEventListener('click', (event) => {
+      if (event.target === bookModal) {
+        closeBookReader();
+      }
+    });
+
+    bookSideToggle.addEventListener('click', () => {
+      if (bookSide.hidden) {
+        openBookSide(bookNotesList.hidden ? 'toc' : 'notes');
+      } else {
+        bookSide.hidden = true;
+        bookSideToggle.setAttribute('aria-expanded', 'false');
+      }
+    });
+
+    bookTabToc.addEventListener('click', () => openBookSide('toc'));
+    bookTabNotes.addEventListener('click', () => openBookSide('notes'));
+
+    bookPrev.addEventListener('click', () => pageBook(-1));
+    bookNext.addEventListener('click', () => pageBook(1));
+    bookMark.addEventListener('click', addBookmarkHere);
+    bookFullscreen.addEventListener('click', toggleBookFullscreen);
+
+    for (const swatch of bookTools.querySelectorAll('.book-swatch')) {
+      swatch.addEventListener('click', () => addHighlight(swatch.dataset.color, ''));
+    }
+
+    bookAddNote.addEventListener('click', () => {
+      if (!bookPendingSelection) {
+        return;
+      }
+      const note = window.prompt('Note for "'
+        + bookPendingSelection.text.slice(0, 60)
+        + (bookPendingSelection.text.length > 60 ? '...' : '') + '"');
+      if (note && note.trim()) {
+        addHighlight('yellow', note.trim());
+      }
+    });
+
+    bookCopy.addEventListener('click', async () => {
+      if (!bookPendingSelection) {
+        return;
+      }
+      try {
+        await navigator.clipboard.writeText(bookPendingSelection.text);
+        setStatus('Passage copied.');
+      } catch {
+        setStatus('Copying is blocked in this browser.', true);
+      }
+      hideBookTools();
+    });
+
+    bookTypeButton.addEventListener('click', () => {
+      const open = bookTypePanel.hidden;
+      bookTypePanel.hidden = !open;
+      bookTypeButton.setAttribute('aria-expanded', open ? 'true' : 'false');
+    });
+
+    const onTypeChange = () => {
+      bookPrefs.fontScale = Number(bookFontSize.value);
+      bookPrefs.lineHeight = Number(bookLineHeight.value);
+      bookPrefs.width = Number(bookWidth.value);
+      applyReaderStyles();
+      saveBookPrefs();
+      updateBookPosition();
+    };
+
+    bookFontSize.addEventListener('input', onTypeChange);
+    bookLineHeight.addEventListener('input', onTypeChange);
+    bookWidth.addEventListener('input', onTypeChange);
+
+    for (const button of bookTypePanel.querySelectorAll('.book-theme')) {
+      button.addEventListener('click', () => {
+        bookPrefs.theme = button.dataset.theme;
+        applyBookPrefs();
+        saveBookPrefs();
+      });
+    }
+
+    document.addEventListener('keydown', handleBookKey);
+    document.addEventListener('fullscreenchange', syncBookFullscreenLabel);
+
+    loadBookPrefs();
+
+    // ---------------- Read aloud ----------------
+
+    const bookListen = document.getElementById('bookListen');
+    const bookSpeechBar = document.getElementById('bookSpeechBar');
+    const speechToggle = document.getElementById('speechToggle');
+    const speechPrev = document.getElementById('speechPrev');
+    const speechNext = document.getElementById('speechNext');
+    const speechStop = document.getElementById('speechStop');
+    const speechStatus = document.getElementById('speechStatus');
+    const speechRate = document.getElementById('speechRate');
+    const speechRateLabel = document.getElementById('speechRateLabel');
+    const speechVoice = document.getElementById('speechVoice');
+
+    const speechAudio = new Audio();
+    speechAudio.preload = 'auto';
+
+    let speechEngine = null;
+    let speechSentences = [];
+    let speechIndex = 0;
+    let speechPlaying = false;
+    // Sentence audio is fetched a little ahead so playback never waits.
+    const speechAhead = new Map();
+    const SPEECH_LOOKAHEAD = 2;
+    let speechMark = null;
+    let speechRequestId = 0;
+
+    function speechPrefs() {
+      return {
+        rate: Number(speechRate.value) || 1,
+        voice: speechVoice.value || '',
+      };
+    }
+
+    function setSpeechStatus(message, isWarning) {
+      speechStatus.textContent = message;
+      speechStatus.classList.toggle('warn', Boolean(isWarning));
+    }
+
+    async function loadSpeechEngine() {
+      if (speechEngine) {
+        return speechEngine;
+      }
+      try {
+        const response = await fetch('/api/book/speech/status');
+        speechEngine = await response.json();
+      } catch (error) {
+        speechEngine = { ok: false, available: false, voices: [], hint: error.message };
+      }
+
+      speechVoice.innerHTML = '';
+      for (const voice of speechEngine.voices || []) {
+        const option = document.createElement('option');
+        option.value = voice.id;
+        option.textContent = voice.label;
+        speechVoice.appendChild(option);
+      }
+      speechVoice.hidden = (speechEngine.voices || []).length < 2;
+
+      return speechEngine;
+    }
+
+    function speechAudioUrl(index) {
+      const prefs = speechPrefs();
+      return '/api/book/speech/audio?id=' + encodeURIComponent(bookItem.id)
+        + '&chapter=' + bookChapterIndex
+        + '&index=' + index
+        + '&rate=' + prefs.rate
+        + (prefs.voice ? '&voice=' + encodeURIComponent(prefs.voice) : '');
+    }
+
+    // Fetching as a blob means the next sentence is already decoded when the
+    // current one ends, so there is no gap between them.
+    function prefetchSentence(index) {
+      if (index < 0 || index >= speechSentences.length || speechAhead.has(index)) {
+        return;
+      }
+      const pending = fetch(speechAudioUrl(index))
+        .then((response) => {
+          if (!response.ok) {
+            throw new Error('HTTP ' + response.status);
+          }
+          return response.blob();
+        })
+        .then((blob) => URL.createObjectURL(blob))
+        .catch(() => null);
+      speechAhead.set(index, pending);
+    }
+
+    function releaseSpeechCache(keepFrom) {
+      for (const [index, pending] of [...speechAhead.entries()]) {
+        if (index < keepFrom || index > keepFrom + SPEECH_LOOKAHEAD + 1) {
+          speechAhead.delete(index);
+          Promise.resolve(pending).then((url) => {
+            if (url) {
+              URL.revokeObjectURL(url);
+            }
+          });
+        }
+      }
+    }
+
+    // The spoken sentence is marked with the same wrapping the highlights use,
+    // so it lands exactly on the words being read.
+    function markSpokenSentence(index) {
+      clearSpokenSentence();
+      const doc = bookDoc();
+      const root = bookRoot();
+      const sentence = speechSentences[index];
+      if (!doc || !root || !sentence) {
+        return;
+      }
+
+      try {
+        wrapOffsets(doc, root, sentence.start, sentence.end, {
+          id: 'mc-speaking',
+          color: 'blue',
+          note: '',
+        });
+      } catch {
+        return;
+      }
+
+      const marks = root.querySelectorAll('mark[data-mc-id="mc-speaking"]');
+      for (const mark of marks) {
+        mark.classList.add('mc-speaking');
+        mark.style.background = 'rgba(96, 165, 250, 0.34)';
+        mark.style.boxShadow = '0 0 0 2px rgba(96, 165, 250, 0.24)';
+      }
+      speechMark = marks.length > 0;
+
+      // Keep the spoken line on screen without yanking the page around.
+      const first = marks[0];
+      if (first) {
+        const win = bookFrame.contentWindow;
+        const rect = first.getBoundingClientRect();
+        if (win && (rect.top < 60 || rect.bottom > win.innerHeight - 60)) {
+          win.scrollTo({
+            top: Math.max(0, win.scrollY + rect.top - (win.innerHeight / 3)),
+            behavior: 'smooth',
+          });
+        }
+      }
+    }
+
+    function clearSpokenSentence() {
+      const root = bookRoot();
+      if (!root || !speechMark) {
+        return;
+      }
+      for (const mark of root.querySelectorAll('mark[data-mc-id="mc-speaking"]')) {
+        const parent = mark.parentNode;
+        while (mark.firstChild) {
+          parent.insertBefore(mark.firstChild, mark);
+        }
+        parent.removeChild(mark);
+        parent.normalize();
+      }
+      speechMark = false;
+    }
+
+    async function speakSentence(index) {
+      if (!bookItem || index < 0) {
+        return;
+      }
+
+      // Past the end of a chapter, carry on into the next one.
+      if (index >= speechSentences.length) {
+        if (bookData && bookChapterIndex < bookData.chapterCount - 1) {
+          setSpeechStatus('Moving to the next section...');
+          await loadChapter(bookChapterIndex + 1, 0);
+          speechIndex = 0;
+          if (speechPlaying) {
+            speakSentence(0);
+          }
+        } else {
+          stopSpeech();
+          setSpeechStatus('Finished the book.');
+        }
+        return;
+      }
+
+      const token = ++speechRequestId;
+      speechIndex = index;
+      markSpokenSentence(index);
+
+      for (let ahead = 1; ahead <= SPEECH_LOOKAHEAD; ahead += 1) {
+        prefetchSentence(index + ahead);
+      }
+      prefetchSentence(index);
+      releaseSpeechCache(index);
+
+      const sentence = speechSentences[index];
+      setSpeechStatus('Sentence ' + (index + 1) + ' of ' + speechSentences.length
+        + '  \u00b7  ' + sentence.text.slice(0, 60)
+        + (sentence.text.length > 60 ? '...' : ''));
+
+      let url = null;
+      try {
+        url = await speechAhead.get(index);
+      } catch {
+        url = null;
+      }
+
+      // A newer request landed while this one was fetching.
+      if (token !== speechRequestId) {
+        return;
+      }
+
+      if (!url) {
+        setSpeechStatus('Could not speak that sentence - skipping.', true);
+        window.setTimeout(() => {
+          if (speechPlaying && token === speechRequestId) {
+            speakSentence(index + 1);
+          }
+        }, 400);
+        return;
+      }
+
+      speechAudio.src = url;
+      try {
+        await speechAudio.play();
+      } catch (error) {
+        if (token === speechRequestId) {
+          setSpeechStatus('Playback was blocked: ' + error.message, true);
+          speechPlaying = false;
+          speechToggle.textContent = 'Resume';
+        }
+      }
+    }
+
+    speechAudio.addEventListener('ended', () => {
+      if (speechPlaying) {
+        speakSentence(speechIndex + 1);
+      }
+    });
+
+    speechAudio.addEventListener('error', () => {
+      if (speechPlaying) {
+        speakSentence(speechIndex + 1);
+      }
+    });
+
+    // Reading starts from whatever is at the top of the view, not the chapter
+    // start, so it picks up where the eye already is.
+    function sentenceAtCurrentPosition() {
+      const offset = currentTopOffset();
+      let best = 0;
+      for (let i = 0; i < speechSentences.length; i += 1) {
+        if (speechSentences[i].end <= offset) {
+          best = i + 1;
+        } else {
+          break;
+        }
+      }
+      return Math.min(best, Math.max(0, speechSentences.length - 1));
+    }
+
+    async function startSpeech() {
+      if (!bookItem || !bookData) {
+        return;
+      }
+
+      const engine = await loadSpeechEngine();
+      if (!engine.available) {
+        bookSpeechBar.hidden = false;
+        setSpeechStatus(engine.hint || 'No speech engine is installed.', true);
+        speechToggle.disabled = true;
+        return;
+      }
+
+      speechToggle.disabled = false;
+      speechSentences = Array.isArray(bookChapterSentences) ? bookChapterSentences : [];
+      if (speechSentences.length === 0) {
+        bookSpeechBar.hidden = false;
+        setSpeechStatus('There is nothing to read in this section.', true);
+        return;
+      }
+
+      bookSpeechBar.hidden = false;
+      bookListen.textContent = 'Stop Reading';
+      speechPlaying = true;
+      speechToggle.textContent = 'Pause';
+      speakSentence(sentenceAtCurrentPosition());
+    }
+
+    function stopSpeech() {
+      speechPlaying = false;
+      speechRequestId += 1;
+      speechAudio.pause();
+      speechAudio.removeAttribute('src');
+      releaseSpeechCache(Number.MAX_SAFE_INTEGER);
+      clearSpokenSentence();
+      bookSpeechBar.hidden = true;
+      bookListen.textContent = 'Read Aloud';
+      // Reading aloud moves the place in the book, same as reading by eye.
+      queueBookProgress();
+    }
+
+    function toggleSpeechPlayback() {
+      if (!speechPlaying) {
+        speechPlaying = true;
+        speechToggle.textContent = 'Pause';
+        if (speechAudio.src && speechAudio.currentTime > 0 && !speechAudio.ended) {
+          speechAudio.play().catch(() => {});
+        } else {
+          speakSentence(speechIndex);
+        }
+        return;
+      }
+      speechPlaying = false;
+      speechToggle.textContent = 'Resume';
+      speechAudio.pause();
+    }
+
+    bookListen.addEventListener('click', () => {
+      if (bookSpeechBar.hidden) {
+        startSpeech();
+      } else {
+        stopSpeech();
+      }
+    });
+
+    speechToggle.addEventListener('click', toggleSpeechPlayback);
+    speechStop.addEventListener('click', stopSpeech);
+
+    speechPrev.addEventListener('click', () => {
+      speechAudio.pause();
+      speakSentence(Math.max(0, speechIndex - 1));
+    });
+
+    speechNext.addEventListener('click', () => {
+      speechAudio.pause();
+      speakSentence(speechIndex + 1);
+    });
+
+    const onSpeechSettingChange = () => {
+      speechRateLabel.textContent = Number(speechRate.value).toFixed(1) + '\u00d7';
+      // Rate and voice change the audio, so anything already fetched is stale.
+      releaseSpeechCache(Number.MAX_SAFE_INTEGER);
+      if (speechPlaying) {
+        speechAudio.pause();
+        speakSentence(speechIndex);
+      }
+    };
+
+    speechRate.addEventListener('change', onSpeechSettingChange);
+    speechVoice.addEventListener('change', onSpeechSettingChange);
+    speechRate.addEventListener('input', () => {
+      speechRateLabel.textContent = Number(speechRate.value).toFixed(1) + '\u00d7';
+    });
+
     function reportPlayerPosition(finished) {
       if (!playerItem) {
         return;
@@ -4255,6 +6665,84 @@ function buildPageHtml(rendererName) {
       return Boolean(item && item.mediaType === 'comic');
     }
 
+    function comicProgressKey(item) {
+      return item ? (item.watchedKey || item.filePath || item.id || '') : '';
+    }
+
+    function comicBookmark(item) {
+      const key = comicProgressKey(item);
+      return key ? (comicProgressByKey.get(key) || null) : null;
+    }
+
+    // A book only says Resume once it has been read past the opening pages.
+    function comicPlayLabel(item) {
+      const bookmark = comicBookmark(item);
+      return bookmark && bookmark.page > COMIC_RESUME_MIN_PAGE ? 'Resume' : 'Read';
+    }
+
+    function applyComicPlayLabel(button, item) {
+      const label = comicPlayLabel(item);
+      button.textContent = label;
+      button.classList.toggle('resume', label === 'Resume');
+    }
+
+    // Update the tile behind the reader without a full re-render.
+    function refreshComicCardState(key, item) {
+      for (const card of document.querySelectorAll('.movie-card')) {
+        if (!card.__item || comicProgressKey(card.__item) !== key) {
+          continue;
+        }
+        const playButton = card.querySelector('[data-role="play"]');
+        if (playButton) {
+          applyComicPlayLabel(playButton, item || card.__item);
+        }
+        const watchedButton = card.querySelector('[data-role="watched"]');
+        if (watchedButton) {
+          setWatchedCardState(card, watchedButton, watchedItemIds.has(key));
+        }
+      }
+    }
+
+    // Sent as the reader moves, and again on close, so closing the app still
+    // leaves a usable bookmark behind.
+    async function reportComicProgress(item, page, pageCount) {
+      const key = comicProgressKey(item);
+      if (!key || !page) {
+        return;
+      }
+
+      const finished = pageCount > 0 && page >= pageCount;
+      if (finished) {
+        comicProgressByKey.delete(key);
+        watchedItemIds.add(key);
+      } else if (page > 1) {
+        comicProgressByKey.set(key, { page, pageCount: pageCount || null });
+      } else {
+        comicProgressByKey.delete(key);
+      }
+
+      refreshComicCardState(key, item);
+
+      try {
+        await fetch('/api/comic/progress', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: item.id, key, page, pageCount }),
+        });
+      } catch {
+        // The bookmark is best effort; reading continues either way.
+      }
+    }
+
+    function queueComicProgress(item, page, pageCount) {
+      window.clearTimeout(comicProgressTimer);
+      const finished = pageCount > 0 && page >= pageCount;
+      // Finishing is worth recording at once; ordinary paging can settle first.
+      comicProgressTimer = window.setTimeout(() => {
+        reportComicProgress(item, page, pageCount);
+      }, finished ? 0 : 600);
+    }
+
     function showComicPage(index) {
       if (!readerComic || readerPageCount === 0) {
         return;
@@ -4264,6 +6752,7 @@ function buildPageHtml(rendererName) {
       readerPage.src = '/comic/' + encodeURIComponent(readerComic.id)
         + '/page/' + readerIndex;
       readerCount.textContent = 'Page ' + (readerIndex + 1) + ' of ' + readerPageCount;
+      queueComicProgress(readerComic, readerIndex + 1, readerPageCount);
       readerProgressFill.style.width =
         (((readerIndex + 1) / readerPageCount) * 100) + '%';
 
@@ -4295,6 +6784,7 @@ function buildPageHtml(rendererName) {
       readerComic = item;
       readerIndex = 0;
       readerPageCount = 0;
+      syncFullscreenLabel();
       playerTitle.textContent = item.movieTitle || item.name;
       playerNote.classList.remove('warn');
       playerNote.textContent = 'Opening comic...';
@@ -4313,9 +6803,17 @@ function buildPageHtml(rendererName) {
           throw new Error('No pages found inside this archive.');
         }
 
-        playerNote.textContent = 'Arrow keys or the side buttons turn pages ('
+        const bookmark = comicBookmark(item);
+        const startPage = bookmark && bookmark.page > 1
+          ? Math.min(bookmark.page, readerPageCount) - 1
+          : 0;
+
+        playerNote.textContent = (startPage > 0
+          ? 'Resumed on page ' + (startPage + 1) + '. '
+          : '')
+          + 'Arrow keys or the side buttons turn pages ('
           + String(result.archive).toUpperCase() + ' archive).';
-        showComicPage(0);
+        showComicPage(startPage);
       } catch (error) {
         playerNote.textContent = 'Could not open this comic: ' + error.message;
         playerNote.classList.add('warn');
@@ -4325,6 +6823,10 @@ function buildPageHtml(rendererName) {
     }
 
     function closeComicReader() {
+      if (readerComic && readerPageCount > 0) {
+        window.clearTimeout(comicProgressTimer);
+        reportComicProgress(readerComic, readerIndex + 1, readerPageCount);
+      }
       readerPage.hidden = true;
       readerPage.removeAttribute('src');
       readerCount.hidden = true;
@@ -4400,6 +6902,7 @@ function buildPageHtml(rendererName) {
 
       collectViewerList(item);
       playerModal.hidden = false;
+      syncFullscreenLabel();
       showViewerImage(item);
     }
 
@@ -4421,6 +6924,12 @@ function buildPageHtml(rendererName) {
 
     document.addEventListener('keydown', (event) => {
       if (playerModal.hidden) {
+        return;
+      }
+
+      if (event.key === 'f' || event.key === 'F') {
+        event.preventDefault();
+        toggleFullscreen();
         return;
       }
 
@@ -4509,7 +7018,14 @@ function buildPageHtml(rendererName) {
       }, 10000);
     }
 
+    function exitFullscreenIfNeeded() {
+      if (document.fullscreenElement) {
+        document.exitFullscreen().catch(() => {});
+      }
+    }
+
     function closeLocalPlayer() {
+      exitFullscreenIfNeeded();
       if (readerComic) {
         closeComicReader();
         return;
@@ -4573,13 +7089,7 @@ function buildPageHtml(rendererName) {
         return;
       }
       closeDetailModal();
-      if (isComicItem(item)) {
-        openComicReader(item);
-      } else if (isImageItem(item)) {
-        openImageViewer(item);
-      } else {
-        openLocalPlayer(item);
-      }
+      playOnThisDevice(item);
     });
 
     function renderCategoryChoices() {
@@ -4767,6 +7277,10 @@ function buildPageHtml(rendererName) {
 
     document.addEventListener('keydown', (event) => {
       if (event.key !== 'Escape') {
+        return;
+      }
+      // The browser uses Escape to leave fullscreen; do not also close the view.
+      if (document.fullscreenElement) {
         return;
       }
       if (!playerModal.hidden) {
@@ -5046,11 +7560,20 @@ function createCastUiServer({
   onWatchedKeysChanged,
   initialResumePositions = {},
   onResumePositionsChanged,
+  initialComicProgress = {},
+  onComicProgressChanged,
+  initialBookProgress = {},
+  onBookProgressChanged,
+  initialBookAnnotations = {},
+  onBookAnnotationsChanged,
+  speechDir,
   initialCustomCategories = [],
   initialFolderCategories = {},
   onCategoriesChanged,
   initialMediaOverrides = {},
   onMediaOverridesChanged,
+  initialGroupOverrides = {},
+  onGroupOverridesChanged,
   initialMetadataCache = {},
   onMetadataCacheChanged,
   coversDir,
@@ -5076,6 +7599,38 @@ function createCastUiServer({
   const overrideKeyFor = (filePath) => normalizeFolderKey(filePath);
 
   const overrideFor = (filePath) => mediaOverrides.get(overrideKeyFor(filePath)) || null;
+
+  // A show or comic tile is not a file, so its edits are keyed by the category
+  // and the group name the library built it from.
+  const groupOverrides = new Map();
+
+  const groupOverrideKey = (category, name) => {
+    const categoryPart = String(category || '').trim().toLowerCase();
+    const namePart = String(name || '').trim().toLowerCase();
+    return categoryPart && namePart ? categoryPart + '::' + namePart : '';
+  };
+
+  const groupOverrideFor = (category, name) => {
+    const key = groupOverrideKey(category, name);
+    return key ? (groupOverrides.get(key) || null) : null;
+  };
+
+  // Folds a group's edits over whatever the library worked out for it.
+  const withGroupOverride = (category, group) => {
+    const override = groupOverrideFor(category, group.name);
+    if (!override) {
+      return group;
+    }
+
+    return {
+      ...group,
+      displayTitle: override.title || group.displayTitle,
+      year: override.year || group.year,
+      plot: override.plot || group.plot,
+      posterUrl: override.posterUrl || group.posterUrl,
+      edited: true,
+    };
+  };
 
   const sanitizeOverride = (value) => {
     const source = value && typeof value === 'object' ? value : {};
@@ -5107,6 +7662,31 @@ function createCastUiServer({
     onMediaOverridesChanged(Object.fromEntries(mediaOverrides.entries()));
   };
 
+  const persistGroupOverrides = () => {
+    if (typeof onGroupOverridesChanged !== 'function') {
+      return;
+    }
+    onGroupOverridesChanged(Object.fromEntries(groupOverrides.entries()));
+  };
+
+  const setGroupOverride = (category, name, value) => {
+    const key = groupOverrideKey(category, name);
+    if (!key) {
+      return null;
+    }
+
+    const entry = sanitizeOverride(value);
+    if (!entry) {
+      groupOverrides.delete(key);
+      persistGroupOverrides();
+      return null;
+    }
+
+    groupOverrides.set(key, entry);
+    persistGroupOverrides();
+    return entry;
+  };
+
   const setMediaOverride = (filePath, value) => {
     const key = overrideKeyFor(filePath);
     if (!key) {
@@ -5132,6 +7712,16 @@ function createCastUiServer({
     const normalized = String(key || '').trim();
     if (entry && normalized) {
       mediaOverrides.set(normalized, entry);
+    }
+  }
+
+  for (const [key, value] of Object.entries(
+    initialGroupOverrides && typeof initialGroupOverrides === 'object' ? initialGroupOverrides : {},
+  )) {
+    const entry = sanitizeOverride(value);
+    const normalized = String(key || '').trim().toLowerCase();
+    if (entry && normalized) {
+      groupOverrides.set(normalized, entry);
     }
   }
 
@@ -5443,7 +8033,9 @@ function createCastUiServer({
     return outPath;
   };
 
-  const saveCoverImage = (filePath, dataUrl) => {
+  const saveCoverImage = (filePath, dataUrl) => saveCoverImageForKey(overrideKeyFor(filePath), dataUrl);
+
+  const saveCoverImageForKey = (coverKey, dataUrl) => {
     if (!resolvedCoversDir) {
       throw new Error('Cover storage is not available.');
     }
@@ -5468,7 +8060,7 @@ function createCastUiServer({
 
     fs.mkdirSync(resolvedCoversDir, { recursive: true });
 
-    const stem = crypto.createHash('sha1').update(overrideKeyFor(filePath)).digest('hex').slice(0, 16);
+    const stem = crypto.createHash('sha1').update(String(coverKey || '')).digest('hex').slice(0, 16);
 
     // Drop any previous cover for this item so the folder does not accumulate.
     for (const candidate of Object.values(COVER_MIME_EXTENSIONS)) {
@@ -5580,6 +8172,9 @@ function createCastUiServer({
     if (isImageFile(filePath)) {
       return CATEGORY_PHOTOS;
     }
+    if (isBookFile(filePath)) {
+      return CATEGORY_BOOKS;
+    }
     if (isComicArchiveFile(filePath)) {
       return CATEGORY_COMICS;
     }
@@ -5689,6 +8284,113 @@ function createCastUiServer({
       .filter((item) => item.length > 0),
   );
   const resumePositions = new Map();
+  // Where the reader left off, per book: { page (1-based), pageCount }.
+  const comicProgress = new Map();
+  // Where the e-reader left off: { chapterIndex, offset, percent, label }.
+  const bookProgress = new Map();
+  // Highlights, notes and bookmarks, per book: key -> [annotation].
+  const bookAnnotations = new Map();
+  // Opening an EPUB means unzipping and parsing it, so keep the result around.
+  const bookInfoCache = new Map();
+
+  const readBookInfo = (filePath) => {
+    const cacheKey = normalizeFolderKey(filePath);
+    const cached = bookInfoCache.get(cacheKey);
+    let mtimeMs = 0;
+    try {
+      mtimeMs = fs.statSync(filePath).mtimeMs;
+    } catch {
+      mtimeMs = 0;
+    }
+
+    if (cached && cached.mtimeMs === mtimeMs) {
+      return cached.info;
+    }
+
+    let info;
+    try {
+      info = openEpub(filePath);
+    } catch (error) {
+      // A book that will not parse still deserves a tile, just a plain one.
+      info = {
+        title: '',
+        creator: '',
+        description: '',
+        spine: [],
+        toc: [],
+        coverHref: '',
+        error: error.message,
+      };
+    }
+
+    if (bookInfoCache.size > 64) {
+      bookInfoCache.clear();
+    }
+    bookInfoCache.set(cacheKey, { mtimeMs, info });
+    return info;
+  };
+
+  // Piper is looked up once and re-checked when the folder changes, so dropping
+  // a voice in does not need a restart.
+  const resolvedSpeechDir = speechDir ? path.resolve(speechDir) : null;
+  let speechEngineCache = null;
+  let speechEngineStamp = '';
+
+  const speechFolderStamp = () => {
+    if (!resolvedSpeechDir) {
+      return 'none';
+    }
+    try {
+      const stat = fs.statSync(resolvedSpeechDir);
+      return String(stat.mtimeMs) + ':' + String(stat.size);
+    } catch {
+      return 'missing';
+    }
+  };
+
+let speechInstallResult = null;
+
+  const getSpeechEngine = () => {
+    const stamp = speechFolderStamp();
+    if (speechEngineCache && speechEngineStamp === stamp) {
+      return speechEngineCache;
+    }
+
+    if (!resolvedSpeechDir) {
+      speechEngineCache = { binary: null, voices: [], available: false };
+      speechEngineStamp = stamp;
+      return speechEngineCache;
+    }
+
+    let engine = findPiper(resolvedSpeechDir);
+
+    // Nothing installed yet: unpack the copy that ships with the app. This runs
+    // once, the first time a book is asked to read itself aloud.
+    if (!engine.available) {
+      speechInstallResult = ensureBundledEngine(resolvedSpeechDir);
+      if (speechInstallResult.installed) {
+        engine = findPiper(resolvedSpeechDir);
+      }
+    }
+
+    speechEngineCache = engine;
+    speechEngineStamp = speechFolderStamp();
+    return speechEngineCache;
+  };
+
+  const speechAudioCachePath = (key) => (
+    resolvedSpeechDir ? path.join(resolvedSpeechDir, 'cache', key + '.wav') : null
+  );
+
+  const resolveBookTarget = (mediaId) => {
+    const media = mediaServer.getMediaById(String(mediaId || '').trim());
+    if (!media || !isBookFile(media.filePath)) {
+      return null;
+    }
+    return media;
+  };
+
+  const bookKeyFor = (media) => String(media && media.filePath ? media.filePath : '').trim();
 
   const trackingKeyFromMedia = (media) => String((media && (media.filePath || media.id)) || '').trim();
   const normalizeResumeKey = (value) => {
@@ -5746,6 +8448,94 @@ function createCastUiServer({
       updatedAt: (value && value.updatedAt) || new Date().toISOString(),
     });
   }
+
+  for (const [key, value] of Object.entries(initialComicProgress && typeof initialComicProgress === 'object'
+    ? initialComicProgress
+    : {})) {
+    const progressKey = String(key || '').trim();
+    const page = Number(value && value.page);
+    const pageCount = Number(value && value.pageCount);
+    if (!progressKey || !Number.isFinite(page) || page <= 1) {
+      continue;
+    }
+    comicProgress.set(progressKey, {
+      page: Math.floor(page),
+      pageCount: Number.isFinite(pageCount) && pageCount > 0 ? Math.floor(pageCount) : null,
+      updatedAt: (value && value.updatedAt) || new Date().toISOString(),
+    });
+  }
+
+  for (const [key, value] of Object.entries(initialBookProgress && typeof initialBookProgress === 'object'
+    ? initialBookProgress
+    : {})) {
+    const progressKey = String(key || '').trim();
+    const chapterIndex = Number(value && value.chapterIndex);
+    if (!progressKey || !Number.isFinite(chapterIndex) || chapterIndex < 0) {
+      continue;
+    }
+    const offset = Number(value && value.offset);
+    const percent = Number(value && value.percent);
+    bookProgress.set(progressKey, {
+      chapterIndex: Math.floor(chapterIndex),
+      offset: Number.isFinite(offset) && offset > 0 ? Math.floor(offset) : 0,
+      percent: Number.isFinite(percent) ? Math.max(0, Math.min(1, percent)) : 0,
+      label: typeof (value && value.label) === 'string' ? value.label : '',
+      updatedAt: (value && value.updatedAt) || new Date().toISOString(),
+    });
+  }
+
+  for (const [key, value] of Object.entries(initialBookAnnotations && typeof initialBookAnnotations === 'object'
+    ? initialBookAnnotations
+    : {})) {
+    const annotationKey = String(key || '').trim();
+    if (!annotationKey || !Array.isArray(value)) {
+      continue;
+    }
+    const cleaned = value.map(normalizeAnnotation).filter(Boolean);
+    if (cleaned.length > 0) {
+      bookAnnotations.set(annotationKey, cleaned);
+    }
+  }
+
+  const persistBookProgress = () => {
+    if (typeof onBookProgressChanged !== 'function') {
+      return;
+    }
+    const payload = {};
+    for (const [key, value] of bookProgress.entries()) {
+      payload[key] = { ...value };
+    }
+    onBookProgressChanged(payload);
+  };
+
+  const persistBookAnnotations = () => {
+    if (typeof onBookAnnotationsChanged !== 'function') {
+      return;
+    }
+    const payload = {};
+    for (const [key, value] of bookAnnotations.entries()) {
+      if (value.length > 0) {
+        payload[key] = value.map((entry) => ({ ...entry }));
+      }
+    }
+    onBookAnnotationsChanged(payload);
+  };
+
+  const persistComicProgress = () => {
+    if (typeof onComicProgressChanged !== 'function') {
+      return;
+    }
+
+    const payload = {};
+    for (const [key, value] of comicProgress.entries()) {
+      payload[key] = {
+        page: value.page,
+        pageCount: value.pageCount,
+        updatedAt: value.updatedAt,
+      };
+    }
+    onComicProgressChanged(payload);
+  };
 
   const persistResumePositions = () => {
     if (typeof onResumePositionsChanged !== 'function') {
@@ -6428,6 +9218,47 @@ function createCastUiServer({
       };
     }
 
+    if (isBookFile(item.filePath)) {
+      // Title and author come from inside the book, so no network lookup runs.
+      const info = readBookInfo(item.filePath);
+      const displayName = info.title || safeBasename(
+        path.basename(item.name, path.extname(item.name)).replace(/[._]+/g, ' ').trim(),
+      );
+
+      return {
+        category: resolveCategory(item.filePath),
+        showName: null,
+        seasonInfo: null,
+        fallbackSeriesTitle: '',
+        searchTitle: displayName,
+        isShowCategory: false,
+        isImage: true,
+        displayTitle: displayName,
+        enriched: {
+          movieTitle: displayName,
+          mediaType: 'book',
+          author: info.creator || null,
+          showName: null,
+          showDisplayTitle: null,
+          showPosterUrl: null,
+          showPlot: null,
+          showImdbRating: null,
+          showRatingSource: null,
+          showYear: null,
+          seasonLabel: null,
+          seasonNumber: null,
+          episodeNumber: null,
+          seasonSort: null,
+          episodeSort: null,
+          posterUrl: '/book/' + encodeURIComponent(item.id) + '/cover',
+          year: null,
+          plot: info.description || null,
+          imdbRating: null,
+          ratingSource: null,
+        },
+      };
+    }
+
     if (isImageFile(item.filePath)) {
       const displayName = safeBasename(
         path.basename(item.name, path.extname(item.name)).replace(/[._]+/g, ' ').trim(),
@@ -6720,7 +9551,7 @@ function createCastUiServer({
         ), 0),
       ), 0);
 
-      return {
+      return withGroupOverride(CATEGORY_COMICS, {
         name: group.name,
         displayTitle: group.name,
         posterUrl: firstBook ? firstBook.posterUrl : null,
@@ -6731,7 +9562,7 @@ function createCastUiServer({
         latestAddedAtMs,
         seasons,
         items: [],
-      };
+      });
     });
 
     if (sortMode === 'recent') {
@@ -6839,7 +9670,7 @@ function createCastUiServer({
             return Math.max(latest, seasonLatest);
           }, 0);
 
-          return {
+          return withGroupOverride(category, {
             name,
             displayTitle: (firstWithPoster.showDisplayTitle || firstWithPoster.showName || name),
             posterUrl: firstWithPoster.showPosterUrl || firstWithPoster.posterUrl || null,
@@ -6850,7 +9681,7 @@ function createCastUiServer({
             latestAddedAtMs,
             seasons,
             items: [],
-          };
+          });
         })
         .sort((a, b) => {
           if (normalizedSort === 'recent') {
@@ -6989,6 +9820,8 @@ function createCastUiServer({
           metadataVersion,
           watchedKeys: Array.from(watchedMediaKeys),
           resumePositions: Object.fromEntries(resumePositions.entries()),
+          comicProgress: Object.fromEntries(comicProgress.entries()),
+          bookProgress: Object.fromEntries(bookProgress.entries()),
         });
       } catch (error) {
         sendJson(res, 500, {
@@ -7053,6 +9886,8 @@ function createCastUiServer({
         autoAdvance: lastAutoAdvanceEvent,
         watchedKeys: Array.from(watchedMediaKeys),
         resumePositions: Object.fromEntries(resumePositions.entries()),
+        comicProgress: Object.fromEntries(comicProgress.entries()),
+        bookProgress: Object.fromEntries(bookProgress.entries()),
       });
       return;
     }
@@ -7067,6 +9902,15 @@ function createCastUiServer({
 
         if (!media) {
           sendJson(res, 404, { ok: false, error: 'Media item not found.' });
+          return;
+        }
+
+        // Books open in the reader; a renderer has nothing to do with them.
+        if (isBookFile(media.filePath)) {
+          sendJson(res, 400, {
+            ok: false,
+            error: 'Books are read on this device and cannot be cast.',
+          });
           return;
         }
 
@@ -7217,6 +10061,28 @@ function createCastUiServer({
 
         clearResumePositionForIdentifiers(clearKeys);
 
+        let bookProgressCleared = false;
+        for (const clearKey of clearKeys) {
+          const trimmed = String(clearKey || '').trim();
+          if (trimmed && bookProgress.delete(trimmed)) {
+            bookProgressCleared = true;
+          }
+        }
+        if (bookProgressCleared) {
+          persistBookProgress();
+        }
+
+        let comicProgressCleared = false;
+        for (const clearKey of clearKeys) {
+          const trimmed = String(clearKey || '').trim();
+          if (trimmed && comicProgress.delete(trimmed)) {
+            comicProgressCleared = true;
+          }
+        }
+        if (comicProgressCleared) {
+          persistComicProgress();
+        }
+
         const normalizedClearKeys = new Set(
           clearKeys.map((item) => normalizeResumeKey(item)).filter((item) => item.length > 0),
         );
@@ -7281,6 +10147,392 @@ function createCastUiServer({
       } catch (error) {
         res.statusCode = 500;
         res.end('Cover read failed');
+      }
+      return;
+    }
+
+    if (req.method === 'GET' && parsed.pathname === '/api/book/speech/status') {
+      const engine = getSpeechEngine();
+      sendJson(res, 200, {
+        ok: true,
+        available: engine.available,
+        engine: engine.available ? 'piper' : 'none',
+        voices: engine.voices.map((voice) => ({ id: voice.id, label: voice.label })),
+        folder: resolvedSpeechDir,
+        installed: speechInstallResult ? speechInstallResult.reason : null,
+        // Shown in the reader only when there is something to fix.
+        hint: engine.available
+          ? ''
+          : (engine.binary
+            ? 'A speech engine is installed but has no voice. Add a .onnx voice and its .json file beside it.'
+            : 'No speech engine yet. Put the Piper engine and a voice in this folder to have books read aloud.'),
+      });
+      return;
+    }
+
+    if (req.method === 'GET' && parsed.pathname === '/api/book/speech/audio') {
+      try {
+        const engine = getSpeechEngine();
+        if (!engine.available) {
+          sendJson(res, 503, { ok: false, error: 'No local speech engine is installed.' });
+          return;
+        }
+
+        const media = resolveBookTarget(parsed.searchParams.get('id'));
+        if (!media) {
+          sendJson(res, 404, { ok: false, error: 'Book not found.' });
+          return;
+        }
+
+        const info = readBookInfo(media.filePath);
+        const chapterIndex = Math.floor(Number(parsed.searchParams.get('chapter')) || 0);
+        const sentenceIndex = Math.floor(Number(parsed.searchParams.get('index')) || 0);
+        const chapter = info.spine[chapterIndex];
+        if (!chapter) {
+          sendJson(res, 404, { ok: false, error: 'Chapter not found.' });
+          return;
+        }
+
+        const resource = readEpubResource(media.filePath, chapter.href);
+        const html = prepareChapterHtml(
+          resource.data.toString('utf8'),
+          chapter.href,
+          (href) => '/book/' + encodeURIComponent(media.id) + '/res?href=' + encodeURIComponent(href),
+        );
+        const sentences = speechSentences(html);
+        const sentence = sentences[sentenceIndex];
+        if (!sentence) {
+          sendJson(res, 404, { ok: false, error: 'Sentence not found.' });
+          return;
+        }
+
+        const requestedVoice = String(parsed.searchParams.get('voice') || '');
+        const voice = engine.voices.find((entry) => entry.id === requestedVoice)
+          || engine.voices[0];
+
+        // Piper's length_scale is inverse speed: 0.8 is faster, 1.2 slower.
+        const rate = Math.max(0.5, Math.min(2, Number(parsed.searchParams.get('rate')) || 1));
+        const lengthScale = Number((1 / rate).toFixed(3));
+
+        const key = speechCacheKey(voice.id, lengthScale, sentence.text);
+        const cachePath = speechAudioCachePath(key);
+
+        let wav = null;
+        if (cachePath && fs.existsSync(cachePath)) {
+          try {
+            wav = fs.readFileSync(cachePath);
+          } catch {
+            wav = null;
+          }
+        }
+
+        if (!wav) {
+          wav = await synthesiseWithPiper({
+            binary: engine.binary,
+            voicePath: voice.path,
+            text: sentence.text,
+            lengthScale,
+          });
+          if (cachePath) {
+            try {
+              fs.mkdirSync(path.dirname(cachePath), { recursive: true });
+              fs.writeFileSync(cachePath, wav);
+            } catch {
+              // A cache miss is only a speed problem, never a failure.
+            }
+          }
+        }
+
+        res.writeHead(200, {
+          'Content-Type': 'audio/wav',
+          'Content-Length': wav.length,
+          'Cache-Control': 'private, max-age=3600',
+        });
+        res.end(wav);
+      } catch (error) {
+        sendJson(res, 500, { ok: false, error: error.message });
+      }
+      return;
+    }
+
+    if (req.method === 'GET' && parsed.pathname === '/api/book/open') {
+      try {
+        const media = resolveBookTarget(parsed.searchParams.get('id'));
+        if (!media) {
+          sendJson(res, 404, { ok: false, error: 'Book not found.' });
+          return;
+        }
+
+        const info = readBookInfo(media.filePath);
+        if (info.error) {
+          sendJson(res, 500, { ok: false, error: info.error });
+          return;
+        }
+
+        const key = bookKeyFor(media);
+        sendJson(res, 200, {
+          ok: true,
+          id: media.id,
+          key,
+          title: info.title,
+          creator: info.creator,
+          publisher: info.publisher,
+          language: info.language,
+          chapterCount: info.spine.length,
+          chapters: info.spine.map((entry, index) => ({ index, href: entry.href })),
+          toc: info.toc.map((entry) => ({
+            label: entry.label,
+            spineIndex: entry.spineIndex,
+            anchor: entry.anchor,
+            depth: entry.depth,
+          })),
+          progress: bookProgress.get(key) || null,
+          annotations: bookAnnotations.get(key) || [],
+        });
+      } catch (error) {
+        sendJson(res, 500, { ok: false, error: error.message });
+      }
+      return;
+    }
+
+    if (req.method === 'GET' && parsed.pathname === '/api/book/chapter') {
+      try {
+        const media = resolveBookTarget(parsed.searchParams.get('id'));
+        if (!media) {
+          sendJson(res, 404, { ok: false, error: 'Book not found.' });
+          return;
+        }
+
+        const info = readBookInfo(media.filePath);
+        const index = Math.floor(Number(parsed.searchParams.get('chapter')) || 0);
+        const chapter = info.spine[index];
+        if (!chapter) {
+          sendJson(res, 404, { ok: false, error: 'Chapter not found.' });
+          return;
+        }
+
+        const resource = readEpubResource(media.filePath, chapter.href);
+        const rawHtml = resource.data.toString('utf8');
+        const html = prepareChapterHtml(
+          rawHtml,
+          chapter.href,
+          (href) => '/book/' + encodeURIComponent(media.id) + '/res?href=' + encodeURIComponent(href),
+        );
+
+        // Sentences are offset into the same character space the reader uses
+        // for highlights, so a spoken sentence can be marked in place.
+        const sentences = speechSentences(html);
+
+        sendJson(res, 200, {
+          ok: true,
+          index,
+          href: chapter.href,
+          html,
+          textLength: chapterPlainText(rawHtml).length,
+          speechTextLength: chapterSpeechText(html).length,
+          sentences: sentences.map((entry) => ({
+            start: entry.start,
+            end: entry.end,
+            text: entry.text,
+          })),
+        });
+      } catch (error) {
+        const status = error.code === 'EPUB_RESOURCE_NOT_FOUND' ? 404 : 500;
+        sendJson(res, status, { ok: false, error: error.message });
+      }
+      return;
+    }
+
+    if (req.method === 'POST' && parsed.pathname === '/api/book/progress') {
+      try {
+        const body = await readRequestBody(req);
+        const payload = JSON.parse(body || '{}');
+        const media = resolveBookTarget(payload.id);
+        const key = String(payload.key || '').trim() || (media ? bookKeyFor(media) : '');
+        const chapterIndex = Math.floor(Number(payload.chapterIndex) || 0);
+        const offset = Math.max(0, Math.floor(Number(payload.offset) || 0));
+        const percent = Math.max(0, Math.min(1, Number(payload.percent) || 0));
+
+        if (!key) {
+          sendJson(res, 400, { ok: false, error: 'Missing book key.' });
+          return;
+        }
+
+        // Finishing the book marks it read and drops the bookmark.
+        if (percent >= BOOK_COMPLETION_PERCENT) {
+          bookProgress.delete(key);
+          watchedMediaKeys.add(key);
+          persistBookProgress();
+          if (typeof onWatchedKeysChanged === 'function') {
+            onWatchedKeysChanged(Array.from(watchedMediaKeys));
+          }
+          sendJson(res, 200, { ok: true, done: true });
+          return;
+        }
+
+        // The very start is the same as never having opened it.
+        if (chapterIndex <= 0 && offset <= 0) {
+          if (bookProgress.delete(key)) {
+            persistBookProgress();
+          }
+          sendJson(res, 200, { ok: true, done: false });
+          return;
+        }
+
+        bookProgress.set(key, {
+          chapterIndex,
+          offset,
+          percent,
+          label: String(payload.label || '').slice(0, 200),
+          updatedAt: new Date().toISOString(),
+        });
+        persistBookProgress();
+        sendJson(res, 200, { ok: true, done: false });
+      } catch (error) {
+        sendJson(res, 500, { ok: false, error: error.message });
+      }
+      return;
+    }
+
+    if (req.method === 'POST' && parsed.pathname === '/api/book/annotations') {
+      try {
+        const body = await readRequestBody(req);
+        const payload = JSON.parse(body || '{}');
+        const media = resolveBookTarget(payload.id);
+        const key = String(payload.key || '').trim() || (media ? bookKeyFor(media) : '');
+        if (!key) {
+          sendJson(res, 400, { ok: false, error: 'Missing book key.' });
+          return;
+        }
+
+        const action = String(payload.action || 'save');
+        const existing = bookAnnotations.get(key) || [];
+
+        if (action === 'delete') {
+          const targetId = String(payload.annotationId || '');
+          const next = existing.filter((entry) => entry.id !== targetId);
+          if (next.length > 0) {
+            bookAnnotations.set(key, next);
+          } else {
+            bookAnnotations.delete(key);
+          }
+          persistBookAnnotations();
+          sendJson(res, 200, { ok: true, annotations: next });
+          return;
+        }
+
+        const annotation = normalizeAnnotation(payload.annotation);
+        if (!annotation) {
+          sendJson(res, 400, { ok: false, error: 'Invalid annotation.' });
+          return;
+        }
+
+        const next = existing.filter((entry) => entry.id !== annotation.id);
+        next.push(annotation);
+        next.sort((a, b) => (a.chapterIndex - b.chapterIndex) || (a.start - b.start));
+        bookAnnotations.set(key, next);
+        persistBookAnnotations();
+        sendJson(res, 200, { ok: true, annotation, annotations: next });
+      } catch (error) {
+        sendJson(res, 500, { ok: false, error: error.message });
+      }
+      return;
+    }
+
+    if (req.method === 'POST' && parsed.pathname === '/api/comic/progress') {
+      try {
+        const body = await readRequestBody(req);
+        const payload = JSON.parse(body || '{}');
+        const mediaId = String(payload.id || '').trim();
+        const book = mediaId ? resolveComicTarget(mediaId) : null;
+        const progressKey = String(payload.key || '').trim()
+          || (book ? String(book.path || book.id || '').trim() : '');
+        const page = Math.floor(Number(payload.page) || 0);
+        const pageCount = Math.floor(Number(payload.pageCount) || 0);
+
+        if (!progressKey || page <= 0) {
+          sendJson(res, 400, { ok: false, error: 'Missing comic progress key or page.' });
+          return;
+        }
+
+        // Finishing the last page marks the book done and drops the bookmark,
+        // so it reopens from the start next time.
+        const finished = pageCount > 0 && page >= pageCount;
+        if (finished) {
+          comicProgress.delete(progressKey);
+          watchedMediaKeys.add(progressKey);
+          persistComicProgress();
+          if (typeof onWatchedKeysChanged === 'function') {
+            onWatchedKeysChanged(Array.from(watchedMediaKeys));
+          }
+          sendJson(res, 200, { ok: true, done: true, page, pageCount });
+          return;
+        }
+
+        // Back at the start is the same as no bookmark at all.
+        if (page <= 1) {
+          if (comicProgress.delete(progressKey)) {
+            persistComicProgress();
+          }
+          sendJson(res, 200, { ok: true, done: false, page, pageCount });
+          return;
+        }
+
+        comicProgress.set(progressKey, {
+          page,
+          pageCount: pageCount > 0 ? pageCount : null,
+          updatedAt: new Date().toISOString(),
+        });
+        persistComicProgress();
+        sendJson(res, 200, { ok: true, done: false, page, pageCount });
+      } catch (error) {
+        sendJson(res, 500, { ok: false, error: error.message });
+      }
+      return;
+    }
+
+    const bookRouteMatch = /^\/book\/([^/]+)\/(res|cover)$/.exec(parsed.pathname);
+    if (req.method === 'GET' && bookRouteMatch) {
+      try {
+        const media = resolveBookTarget(decodeURIComponent(bookRouteMatch[1]));
+        if (!media) {
+          sendJson(res, 404, { ok: false, error: 'Book not found.' });
+          return;
+        }
+
+        const info = readBookInfo(media.filePath);
+        const wanted = bookRouteMatch[2] === 'cover'
+          ? info.coverHref
+          : String(parsed.searchParams.get('href') || '');
+
+        if (!wanted) {
+          sendJson(res, 404, { ok: false, error: 'No cover in this book.' });
+          return;
+        }
+
+        const resource = readEpubResource(media.filePath, wanted);
+        let payload = resource.data;
+        let contentType = resource.mimeType;
+
+        // Stylesheets point at fonts and images inside the archive.
+        if (/\.css$/i.test(resource.name)) {
+          contentType = 'text/css; charset=utf-8';
+          payload = Buffer.from(prepareStylesheet(
+            payload.toString('utf8'),
+            resource.name,
+            (href) => '/book/' + encodeURIComponent(media.id) + '/res?href=' + encodeURIComponent(href),
+          ), 'utf8');
+        }
+
+        res.writeHead(200, {
+          'Content-Type': contentType,
+          'Content-Length': payload.length,
+          'Cache-Control': 'private, max-age=3600',
+        });
+        res.end(payload);
+      } catch (error) {
+        const status = error.code === 'EPUB_RESOURCE_NOT_FOUND' ? 404 : 500;
+        sendJson(res, status, { ok: false, error: error.message });
       }
       return;
     }
@@ -7388,6 +10640,24 @@ function createCastUiServer({
         const media = mediaServer.getMediaById(requestedId);
         if (!media) {
           sendJson(res, 404, { ok: false, error: 'Media item not found.' });
+          return;
+        }
+
+        // A book is read here, so it is never offered as a stream.
+        if (isBookFile(media.filePath)) {
+          sendJson(res, 200, {
+            ok: true,
+            id: media.id,
+            mediaType: 'book',
+            mediaUrl: null,
+            subtitleUrl: null,
+            audio: [],
+            subtitles: [],
+            hasSidecar: false,
+            hasUserSubtitle: false,
+            canSelectAudio: false,
+            probeError: null,
+          });
           return;
         }
 
@@ -7644,6 +10914,53 @@ function createCastUiServer({
       return;
     }
 
+    if (req.method === 'POST' && parsed.pathname === '/api/group/override') {
+      try {
+        const body = await readRequestBody(req, MAX_COVER_BYTES + 1024 * 64);
+        const payload = JSON.parse(body || '{}');
+        const category = String(payload.category || '').trim();
+        const name = String(payload.group || '').trim();
+
+        if (!groupOverrideKey(category, name)) {
+          sendJson(res, 400, { ok: false, error: 'Missing category or group name.' });
+          return;
+        }
+
+        if (!findCategory(category)) {
+          sendJson(res, 404, { ok: false, error: 'Unknown category.' });
+          return;
+        }
+
+        if (payload.clear === true) {
+          setGroupOverride(category, name, null);
+          metadataVersion += 1;
+          comicPayloadCache = new Map();
+          sendJson(res, 200, { ok: true, cleared: true, override: null });
+          return;
+        }
+
+        let posterUrl = String(payload.posterUrl || '').trim();
+        if (typeof payload.coverDataUrl === 'string' && payload.coverDataUrl.length > 0) {
+          posterUrl = saveCoverImageForKey(groupOverrideKey(category, name), payload.coverDataUrl);
+        }
+
+        const saved = setGroupOverride(category, name, {
+          title: payload.title,
+          year: payload.year,
+          plot: payload.plot,
+          posterUrl,
+        });
+        metadataVersion += 1;
+        // The comic payload is memoised, so it has to be dropped on an edit.
+        comicPayloadCache = new Map();
+
+        sendJson(res, 200, { ok: true, cleared: !saved, override: saved });
+      } catch (error) {
+        sendJson(res, 400, { ok: false, error: error.message });
+      }
+      return;
+    }
+
     if (req.method === 'GET' && parsed.pathname === '/api/categories') {
       sendJson(res, 200, {
         ok: true,
@@ -7849,10 +11166,18 @@ function createCastUiServer({
       }
 
       return new Promise((resolve) => {
-        server.close(() => {
-          server = null;
-          resolve();
-        });
+        const closing = server;
+        server = null;
+        closing.close(() => resolve());
+        // close() only stops new connections and then waits for the open ones.
+        // A browser keeping a socket alive, or a request that never completes,
+        // would otherwise hold shutdown open indefinitely.
+        if (typeof closing.closeIdleConnections === 'function') {
+          closing.closeIdleConnections();
+        }
+        if (typeof closing.closeAllConnections === 'function') {
+          closing.closeAllConnections();
+        }
       });
     },
   };

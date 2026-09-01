@@ -47,6 +47,66 @@ function findEndOfCentralDirectory(fd, fileSize) {
   return null;
 }
 
+/**
+ * Recovers entries by scanning for local file headers. Needed for archives whose
+ * central directory is missing entirely - a truncated download still holds
+ * perfectly readable pages up to the cut, and showing those beats showing none.
+ */
+function scanLocalHeaders(fd, fileSize) {
+  const CHUNK = 1024 * 1024;
+  const signature = Buffer.from([0x50, 0x4b, 0x03, 0x04]);
+  const offsets = [];
+
+  let position = 0;
+  let carry = Buffer.alloc(0);
+  while (position < fileSize) {
+    const chunk = readChunk(fd, position, Math.min(CHUNK, fileSize - position));
+    if (chunk.length === 0) {
+      break;
+    }
+    const haystack = Buffer.concat([carry, chunk]);
+    const base = position - carry.length;
+
+    let at = haystack.indexOf(signature);
+    while (at !== -1) {
+      offsets.push(base + at);
+      at = haystack.indexOf(signature, at + 1);
+    }
+
+    carry = haystack.subarray(Math.max(0, haystack.length - 3));
+    position += chunk.length;
+  }
+
+  const entries = [];
+  for (let index = 0; index < offsets.length; index += 1) {
+    const localOffset = offsets[index];
+    const header = readChunk(fd, localOffset, 30);
+    if (header.length < 30) {
+      continue;
+    }
+
+    const flags = header.readUInt16LE(6);
+    const method = header.readUInt16LE(8);
+    let compressedSize = header.readUInt32LE(18);
+    const nameLength = header.readUInt16LE(26);
+    const extraLength = header.readUInt16LE(28);
+    const name = readChunk(fd, localOffset + 30, nameLength).toString('utf8');
+
+    // With a data descriptor the size is only known after the payload, so fall
+    // back to the gap before the next header.
+    if ((flags & 0x08) !== 0 || compressedSize === 0) {
+      const next = index + 1 < offsets.length ? offsets[index + 1] : fileSize;
+      compressedSize = Math.max(0, next - (localOffset + 30 + nameLength + extraLength));
+    }
+
+    if (name && !name.endsWith('/')) {
+      entries.push({ name, method, compressedSize, uncompressedSize: 0, localOffset });
+    }
+  }
+
+  return entries;
+}
+
 export function readZipEntries(filePath) {
   const fd = fs.openSync(filePath, 'r');
   try {
@@ -57,7 +117,12 @@ export function readZipEntries(filePath) {
 
     const eocd = findEndOfCentralDirectory(fd, fileSize);
     if (!eocd) {
-      throw new Error('No zip end-of-central-directory record found.');
+      const recovered = scanLocalHeaders(fd, fileSize);
+      if (recovered.length > 0) {
+        console.warn(`[Zip] ${filePath}: no central directory; recovered ${recovered.length} entr${recovered.length === 1 ? 'y' : 'ies'} by scanning.`);
+        return recovered;
+      }
+      throw new Error('This archive is damaged: no zip directory could be read.');
     }
 
     // Zip64 uses sentinel values in the classic record. Comic archives are far
@@ -116,7 +181,17 @@ export function readZipEntryData(filePath, entry) {
       return raw;
     }
     if (entry.method === METHOD_DEFLATE) {
-      return zlib.inflateRawSync(raw);
+      try {
+        return zlib.inflateRawSync(raw);
+      } catch (error) {
+        // A recovered entry can run past the end of a truncated file; salvage
+        // whatever decompressed cleanly.
+        const partial = zlib.inflateRawSync(raw, { finishFlush: zlib.constants.Z_SYNC_FLUSH });
+        if (partial && partial.length > 0) {
+          return partial;
+        }
+        throw error;
+      }
     }
 
     throw new Error(`Unsupported zip compression method ${entry.method} for "${entry.name}".`);

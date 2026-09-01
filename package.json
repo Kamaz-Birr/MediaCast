@@ -12,21 +12,20 @@
     "discover": "node src/cli.js discover",
     "formats": "node src/cli.js formats",
     "bundle": "esbuild src/cli.js --bundle --platform=node --format=cjs --external:readline/promises --outfile=dist/cli.bundle.cjs",
-    "package": "npm run bundle && npx @yao-pkg/pkg dist/cli.bundle.cjs",
+    "package": "npm run bundle && npx @yao-pkg/pkg dist/cli.bundle.cjs --config package.json",
     "package:windows": "npm run package -- --targets node18-win-x64 --output dist/MediaCast-Windows-x64.exe",
     "package:mac:x64": "npm run package -- --targets node18-macos-x64 --output dist/MediaCast-macOS-x64",
-    "package:mac:arm64": "npm run package -- --targets node18-macos-arm64 --output dist/MediaCast-macOS-arm64"
+    "package:mac:arm64": "npm run package -- --targets node18-macos-arm64 --output dist/MediaCast-macOS-arm64",
+    "fetch-speech-engine": "node scripts/fetch-speech-engine.mjs"
   },
   "devDependencies": {
     "@yao-pkg/pkg": "^5.15.3",
     "esbuild": "^0.25.8"
   },
   "pkg": {
-    "scripts": [
-      "src/**/*.js"
-    ],
     "assets": [
-      "node_modules/node-unrar-js/esm/js/unrar.wasm"
+      "node_modules/node-unrar-js/esm/js/unrar.wasm",
+      "vendor/speech/**/*"
     ]
   },
   "dependencies": {

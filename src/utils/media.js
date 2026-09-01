@@ -5,6 +5,7 @@ const VIDEO_EXTENSIONS = ['.mp4', '.mkv', '.avi', '.mov', '.m4v', '.ts'];
 const AUDIO_EXTENSIONS = ['.mp3', '.aac', '.m4a', '.wav', '.flac'];
 const IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'];
 const COMIC_EXTENSIONS = ['.cbz', '.cbr'];
+const BOOK_EXTENSIONS = ['.epub'];
 // Plain .zip/.rar are only comics when they sit in a comics tree; indexing every
 // zip on the disk would be worse than useless.
 const AMBIGUOUS_ARCHIVE_EXTENSIONS = ['.zip', '.rar'];
@@ -15,6 +16,7 @@ const SUPPORTED_EXTENSIONS = [
   ...AUDIO_EXTENSIONS,
   ...IMAGE_EXTENSIONS,
   ...COMIC_EXTENSIONS,
+  ...BOOK_EXTENSIONS,
 ];
 
 // Artwork that sits beside a video is not a library item in its own right.
@@ -44,6 +46,10 @@ export function isImageFile(filePath) {
 
 export function isVideoFile(filePath) {
   return VIDEO_EXTENSIONS.includes(path.extname(filePath).toLowerCase());
+}
+
+export function isBookFile(filePath) {
+  return BOOK_EXTENSIONS.includes(path.extname(filePath).toLowerCase());
 }
 
 export function isComicFile(filePath) {
